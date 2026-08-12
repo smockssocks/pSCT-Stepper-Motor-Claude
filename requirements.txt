@@ -1,0 +1,6 @@
+# Only needed to talk to real motors. The simulator, the kinematics, the CLI's
+# offline commands and the whole test suite run on the standard library alone.
+#
+# Any pymodbus from 2.x onward works: transport.py inspects the installed
+# client's signature and adapts to the keyword renames between versions.
+pymodbus>=3.0

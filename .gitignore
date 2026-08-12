@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.coverage
+htmlcov/
+
+# The live machine configuration: calibration, zero points and IP addresses
+# belong to a particular telescope, not to the repository. The committed
+# example under config/psct_motors.example.json is the template.
+config/psct_motors.json
+config/*.tmp

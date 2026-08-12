@@ -1,0 +1,101 @@
+{
+  "actuators": [
+    {
+      "name": "A",
+      "ip": "192.168.0.52",
+      "port": 502,
+      "unit_id": 1,
+      "word_order": "Low-High",
+      "counts_per_mm": null,
+      "counts_per_rev": 409600.0,
+      "gear_ratio": 1.0,
+      "screw_lead_mm": 2.54,
+      "direction": 1,
+      "azimuth_deg": 90.0,
+      "radius_mm": 500.0,
+      "min_travel_mm": 1.0,
+      "max_travel_mm": 49.8,
+      "zero_counts": 0,
+      "velocity_raw": 1000,
+      "acceleration_raw": 1000,
+      "in_position_tol_mm": 0.005,
+      "move_timeout_s": 120.0,
+      "brake": {
+        "mode": "auto",
+        "output_register": 19,
+        "output_bit": 0,
+        "energized_releases": true,
+        "settle_s": 0.35
+      }
+    },
+    {
+      "name": "B",
+      "ip": "192.168.0.53",
+      "port": 502,
+      "unit_id": 1,
+      "word_order": "Low-High",
+      "counts_per_mm": null,
+      "counts_per_rev": 409600.0,
+      "gear_ratio": 1.0,
+      "screw_lead_mm": 2.54,
+      "direction": 1,
+      "azimuth_deg": 210.0,
+      "radius_mm": 500.0,
+      "min_travel_mm": 1.0,
+      "max_travel_mm": 49.8,
+      "zero_counts": 0,
+      "velocity_raw": 1000,
+      "acceleration_raw": 1000,
+      "in_position_tol_mm": 0.005,
+      "move_timeout_s": 120.0,
+      "brake": {
+        "mode": "auto",
+        "output_register": 19,
+        "output_bit": 0,
+        "energized_releases": true,
+        "settle_s": 0.35
+      }
+    },
+    {
+      "name": "C",
+      "ip": "192.168.0.54",
+      "port": 502,
+      "unit_id": 1,
+      "word_order": "Low-High",
+      "counts_per_mm": null,
+      "counts_per_rev": 409600.0,
+      "gear_ratio": 1.0,
+      "screw_lead_mm": 2.54,
+      "direction": 1,
+      "azimuth_deg": 330.0,
+      "radius_mm": 500.0,
+      "min_travel_mm": 1.0,
+      "max_travel_mm": 49.8,
+      "zero_counts": 0,
+      "velocity_raw": 1000,
+      "acceleration_raw": 1000,
+      "in_position_tol_mm": 0.005,
+      "move_timeout_s": 120.0,
+      "brake": {
+        "mode": "auto",
+        "output_register": 19,
+        "output_bit": 0,
+        "energized_releases": true,
+        "settle_s": 0.35
+      }
+    }
+  ],
+  "limits": {
+    "min_focus_mm": 1.0,
+    "max_focus_mm": 49.8,
+    "max_tilt_deg": 1.0,
+    "max_step_mm": 10.0,
+    "max_tilt_step_deg": 0.5
+  },
+  "synchronize_moves": true,
+  "min_velocity_raw": 20,
+  "poll_interval_s": 0.5,
+  "modbus_timeout_s": 2.0,
+  "verify_word_order_on_connect": true,
+  "_comment": "EXAMPLE configuration -- copy to psct_motors.json and edit. IP addresses, radius_mm, azimuth_deg and the brake wiring are placeholders. Run the commissioning steps in README.md before trusting any value here."
+}
