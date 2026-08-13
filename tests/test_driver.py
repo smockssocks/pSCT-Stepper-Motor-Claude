@@ -33,7 +33,7 @@ class TestRegisterEncoding(unittest.TestCase):
     def test_modbus_address_is_double_the_register_number(self):
         self.assertEqual(modbus_address(2), 4)     # MODE_REG
         self.assertEqual(modbus_address(3), 6)     # P_SOLL
-        self.assertEqual(modbus_address(10), 20)   # P_IST
+        self.assertEqual(modbus_address(10), 20)   # P_PROJECTED
         self.assertEqual(modbus_address(35), 70)   # ERR_BITS
 
     def test_word_order_round_trip(self):
@@ -228,7 +228,7 @@ class TestSingleMotor(unittest.TestCase):
 
     def test_read_only_registers_are_rejected(self):
         with self.assertRaises(ModbusError):
-            self.motor.write_register("P_IST", 0)
+            self.motor.write_register("P_ENCODER", 0)
 
 
 # --------------------------------------------------------------------------

@@ -59,6 +59,22 @@ class BrakeConfig:
     (the default, and the normal wiring), driving the output HIGH releases the
     brake. If your brake is wired the other way round, set it to False.
 
+    What the pSCT motor says today
+    ------------------------------
+    MacTalk's register list has register 179, 'Brake Output', which selects
+    WHICH digital output drives the brake -- the same pattern as 137 ('In
+    Position' Output) and 138 ('Error' Output). On the pSCT motor it reads 0,
+    meaning **no output is assigned to the brake function**.
+
+    So the default here is "none". Setting it to "auto" would have the GUI
+    infer a brake state from the drive mode with nothing behind the inference,
+    and "output" would toggle an output the brake is not wired to. Neither is
+    honest until register 179 is set, or until you confirm the brake is wired
+    some other way.
+
+    `check_against_motor` reads register 179 and reports whether the
+    configuration matches what the drive is set up to do.
+
     Verifying
     ---------
     `python -m psct_motors.cli probe-brake --motor A` toggles the configured
@@ -66,8 +82,10 @@ class BrakeConfig:
     brake click. Do that once per motor before trusting the indicator.
     """
 
-    mode: str = "auto"                    # "none" | "auto" | "output"
-    output_register: int = 19             # JVL outputs register -- VERIFY on hardware
+    mode: str = "none"                    # "none" | "auto" | "output"
+    #: JVL register holding the digital output states (register 19, 'Digital
+    #: Outputs'). This is the register software toggles in "output" mode.
+    output_register: int = 19
     output_bit: int = 0
     energized_releases: bool = True
     #: Seconds to wait after commanding the brake before moving. A mechanical
@@ -167,8 +185,21 @@ class ActuatorConfig:
     # --- motion defaults ---------------------------------------------------
     velocity_raw: int = 1000                # V_SOLL for normal moves
     acceleration_raw: int = 1000            # A_SOLL
-    #: Position tolerance for "the move finished", in millimetres.
+    #: Position tolerance for "the move finished", in millimetres. Applied to
+    #: the profile generator's output, so it answers "has the commanded ramp
+    #: completed".
     in_position_tol_mm: float = 0.005
+    #: How far the shaft may lag the profile and still count as arrived, in
+    #: motor counts. This is the condition the projected position cannot
+    #: express: the ramp can finish while the shaft is short of the target.
+    #:
+    #: A settled pSCT motor reads a following error of 231 counts, so a
+    #: standing value is normal and the window has to be comfortably above it.
+    #: The motor's own 'In Position' Window (register 33) is 20000 counts,
+    #: which is far looser than anything a focal plane wants; 2000 counts is
+    #: about 1.8 degrees of shaft, tight enough to catch a stall and loose
+    #: enough not to reject a normal settle.
+    follow_error_window_counts: int = 2000
     #: Maximum time to wait for a move to finish, seconds.
     move_timeout_s: float = 120.0
 
@@ -227,6 +258,10 @@ class ActuatorConfig:
             raise ValueError(f"Actuator {self.name}: radius_mm must be positive")
         if self.in_position_tol_mm <= 0:
             raise ValueError(f"Actuator {self.name}: in_position_tol_mm must be positive")
+        if self.follow_error_window_counts <= 0:
+            raise ValueError(
+                f"Actuator {self.name}: follow_error_window_counts must be positive"
+            )
         if not (0 < self.velocity_raw <= 32767):
             raise ValueError(
                 f"Actuator {self.name}: velocity_raw must be 1..32767, got {self.velocity_raw}"

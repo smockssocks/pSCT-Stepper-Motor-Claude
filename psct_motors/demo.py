@@ -323,6 +323,17 @@ def drill_registers(ctx: DemoContext) -> DrillResult:
             "on this firmware. Compare against MacTalk and correct "
             "psct_motors/registers.py."
         )
+    result.note("")
+    result.note(
+        "Two of these are the only history the motor keeps: Follow Error Max "
+        "(22) and Bus Voltage Min (98) are latched extremes that survive a "
+        "cleared error. There is no event log in the drive -- Errors (35) and "
+        "Warnings (36) are instantaneous only."
+    )
+    mismatch = ctx.motor.check_brake_configuration()
+    if mismatch:
+        result.note("")
+        result.note(mismatch)
     result.verdict = INFO
     return result
 
@@ -765,7 +776,7 @@ def drill_fault_stuck(ctx: DemoContext) -> DrillResult:
         motor.ensure_position_mode()
         with ctx.injector:
             ctx.injector.arm(Fault.STUCK_POSITION)
-            result.note("Injected: P_IST frozen -- the axis appears not to move.")
+            result.note("Injected: every position register frozen -- the axis appears not to move.")
             result.note("This is what a seized screw, an unreleased brake or a "
                         "dead encoder looks like.")
             target = ctx.home_counts + ctx.counts(0.25)
@@ -795,7 +806,7 @@ def drill_fault_stuck(ctx: DemoContext) -> DrillResult:
             "where it is -- correct. If instead the ENCODER is dead while the "
             "shaft still turns, the reported position is stale, and the halt "
             "commands the shaft back to that stale value. That is why the two "
-            "faults look identical here but are not: a frozen P_IST with a "
+            "faults look identical here but are not: a frozen position with a "
             "warm motor and no ERR_BITS deserves a physical look before you "
             "command it again."
         )
@@ -808,7 +819,7 @@ def drill_fault_stuck(ctx: DemoContext) -> DrillResult:
 
 def drill_fault_word_order(ctx: DemoContext) -> DrillResult:
     result = ctx.result()
-    # PROG_VERSION rather than P_IST: the shaft may well be sitting at zero,
+    # PROG_VERSION rather than the position: the shaft may be at zero,
     # and zero is the one value that survives a word swap unchanged, so it
     # would demonstrate nothing.
     good_version = ctx.motor.read_register("PROG_VERSION", signed=False)

@@ -49,8 +49,10 @@ right and had been checked against real hardware:
 - Every access is **two 16-bit words**, even for registers that are natively
   16-bit — a one-word write to `MODE_REG` gets rejected.
 - The word order on these motors is **low word first**.
-- `MODE_REG` = 2, `P_SOLL` = 3, `P_IST` = 10, `V_SOLL` = 5, `ERR_BITS` = 35,
-  and 409600 counts per revolution.
+- `MODE_REG` = 2, `P_SOLL` = 3, `V_SOLL` = 5, `ERR_BITS` = 35, and 409600
+  counts per revolution. (Register 10 carried over too, but as the *actual*
+  position — a MacTalk dump later showed it is the projected one. See
+  [what is verified](#what-is-verified-and-what-is-not).)
 
 Everything else is new.
 
@@ -167,8 +169,8 @@ Be clear about what that proves. It proves your **handling** is right — that a
 fault is noticed, the move is abandoned, the axis is halted, the operator is
 told something useful, and recovery works. That is the part with bugs in it.
 It does **not** prove the motor sets the bit you think it sets; only the
-hardware can tell you that, which is why the bit meanings are marked VERIFY and
-raw hex is always printed next to the decoded text.
+hardware can tell you that, which is why every decoded error prints raw hex
+first with an explicit `[bit names UNVERIFIED]` marker.
 
 Injection only ever tampers with values read back and with whether a
 transaction succeeds. It never invents a write, never changes a target, and
@@ -261,6 +263,39 @@ Motion is blocked: Drive is passive (and 1 more)
 It is read-only apart from one probe: it writes `P_SOLL` with the position the
 motor is **already at**, which cannot cause motion and is the only way to find
 out whether writes are landing at all. `--no-write-probe` turns even that off.
+
+### What the motor itself remembers
+
+Nothing, essentially — and that is worth knowing before you go looking.
+
+A MacTalk dump of the pSCT motor (serial 314852, firmware 6.09.00) shows all
+254 registers. There is **no error history, event log or fault buffer**.
+Registers 35 `Errors` and 36 `Warnings` are instantaneous bit fields: a fault
+that has cleared leaves no trace in the drive at all.
+
+Two registers *are* latched extremes, and they are the closest thing to a
+black box:
+
+| register | what it holds |
+|---|---|
+| 22 `Follow Error Max` | the worst lag ever seen between the commanded profile and the encoder |
+| 98 `Bus Voltage Min` | the lowest supply voltage ever seen |
+
+Both survive a cleared error and a completed move, so after an intermittent
+fault they are often the only evidence left in the motor. Both can be reset by
+writing 0, which turns a value with no timestamp into one with a known
+starting point.
+
+```
+python -m psct_motors.cli motor-report --motor A
+```
+
+prints everything the motor reports, organised by what you would be looking
+for, with those two called out. The GUI has the same under **Motor history**,
+with a button to reset both.
+
+Everything finer-grained has to be recorded externally — which is what the
+event log below is for.
 
 ### The event log
 
@@ -599,36 +634,42 @@ two-word access.
 Documented: `PROG_VERSION` (1), `A_SOLL` (6), `RUN_CURRENT` (7),
 `STANDBY_TIME` (8), `STANDBY_CURRENT` (9), `V_IST` (12).
 
-**Contradicted by the hardware** — these read values on the real pSCT motor
-that do not match what the register name implies, so treat the names as wrong
-until MacTalk says otherwise:
+A MacTalk register dump of the pSCT motor settled every register this
+software uses, so the names in `registers.py` are now JVL's own rather than
+inferences. Three corrections came out of it, all of which had been silently
+wrong:
 
-| register | reads | why that is odd |
+| register | I had it as | it actually is |
 |---|---|---|
-| 1 `PROG_VERSION` | 540777 | needs 20 bits; not a 16-bit version field |
-| 4 `P_NEW` | 0x06080000 | not position-shaped while `P_IST` is 600 |
-| 25 `STATUSBITS` | 0x8A476C14 | on a *passive, stationary* motor |
+| 10 | the actual position | **`Projected Position`** — the profile generator's output |
+| 16 | *(not used)* | **`Actual Encoder Position`** — where the shaft really is |
+| 179 | *(not used)* | **`Brake Output`** — which output drives the brake; reads 0 |
+| 4 | `P_NEW` | unnamed even by JVL — not a position register at all |
 
-Nothing in this package acts on any of the three. Register 25 carries no bit
-names at all now: a guessed layout decoded that value as "Decelerating, Motion
-running" for a motor that was doing nothing, and a confident wrong answer is
-worse than no answer.
+The first one mattered. Register 10 reaches the requested position *by
+construction*, so checking arrival against it can never fail. On the dumped
+motor it read 204800 — exactly the target — while the encoder read 204569, a
+standing following error of 231 counts. Positions now come from register 16,
+arrival requires the following error to be inside a window as well, and
+`stop()` still freezes register 10 because writing the encoder reading as the
+target would command a step equal to that standing error.
 
-**Needs verification before you rely on it:**
+**Still not verified:**
 
-- `P_NEW` (4), `FLWERR` (20), `STATUSBITS` (25), `WARN_BITS` (36), `P_HOME` (38).
-- The **individual bit meanings** in `ERROR_BITS`. The register itself is
-  right — `ERR_BITS` of 0 means healthy on the real motor — but the bit-to-text
-  mapping is unchecked, so every decoded error is printed with raw hex first
-  and an explicit `[bit names UNVERIFIED]` marker.
-- The **brake output register** (19 by default) and its bit and polarity. This
-  is an installation detail; `probe-brake` is how you confirm it.
+- The **individual bit meanings** in `ERROR_BITS`. The register is confirmed —
+  0 means healthy — but MacTalk's list does not publish the bit layout, so
+  every decoded error prints raw hex first with an explicit
+  `[bit names UNVERIFIED]` marker.
+- The **bit layout of `Status Bits`** (25). Confirmed as the status word, but
+  it reads `0x8A47xxxx` on a passive, stationary motor, so no bit names are
+  claimed and the raw value is shown alone. A guessed layout previously decoded
+  that as "Decelerating, Motion running" for a motor doing nothing.
+- The **scale of the voltage registers**. `Bus voltage` reads 1794 while
+  `Acceptance Voltage` reads 2054 on a healthy motor, so they are not on a
+  common scale and the diagnostics deliberately do not compare them. Register
+  98 is only ever compared against register 97 — same quantity, same scale.
 - `screw_lead_mm` and `gear_ratio`. Superseded by `calibrate`.
 - `radius_mm` and `azimuth_deg` — placeholders until read off the drawings.
-
-Run `verify-registers` beside MacTalk and promote the markers as you confirm
-them. Nothing here fails silently on an unverified value: reads that cannot be
-made are reported, not defaulted.
 
 ---
 
@@ -674,7 +715,7 @@ construction and adapts, so this works across pymodbus 2.x, 3.x and 4.x.
 python -m unittest discover -s tests -v
 ```
 
-233 tests, no hardware needed. The GUI tests skip automatically without a
+252 tests, no hardware needed. The GUI tests skip automatically without a
 display; to run them headlessly:
 
 ```
@@ -709,3 +750,8 @@ Coverage worth knowing about:
   unable to move the shaft.
 - The watcher logs changes rather than samples, and flags slow transactions.
 - A recording survives without being closed, and corrupt lines are skipped.
+- Position comes from the encoder, not the profile output, and a large
+  following error is not reported as a completed move.
+- `stop()` freezes the profile output, so a stop cannot itself cause a step.
+- The brake configuration is checked against register 179, so claiming control
+  of a brake no output drives is caught.

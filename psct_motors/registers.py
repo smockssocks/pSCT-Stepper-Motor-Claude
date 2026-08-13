@@ -30,25 +30,55 @@ Word order
 ----------
 Within the 32-bit slot, the two 16-bit Modbus words can be transmitted low
 word first or high word first. On the pSCT motors this was confirmed as
-LOW_HIGH (low word first) by comparing a live read of P_IST against MacTalk's
-own position display. `WordOrder` keeps both options because a firmware or
+LOW_HIGH (low word first): every small configuration register puts its zero
+high word in the second Modbus word. `WordOrder` keeps both options because a firmware or
 module change could flip it, and `jvl_motor.detect_word_order()` can determine
 it empirically at runtime.
 
+Where these names come from
+---------------------------
+Every name and description below was taken from a MacTalk register dump of the
+pSCT motor itself -- serial 314852, firmware 6.09.00, an Ethernet module
+running Modbus TCP -- so the names are JVL's own rather than inferences.
+Observed values are quoted in the descriptions where they are surprising or
+where they contradict what the name suggests.
+
+Two of them are worth reading before anything else:
+
+* Register 10 is 'Projected Position', not the actual position. It is the
+  profile generator's output and reaches the requested position by
+  construction. Register 16, 'Actual Encoder Position', is where the shaft is.
+  On the dumped motor these read 204800 and 204569 -- a settled following
+  error of 231 counts that register 10 gave no hint of.
+* Register 179 is 'Brake Output', which selects WHICH digital output drives
+  the brake, not the brake's state. It reads 0, so no output does.
+
+What the motor does NOT have
+----------------------------
+There is no error history, event log or fault buffer anywhere in the 254
+registers. 35 ('Errors') and 36 ('Warnings') are instantaneous bit fields: a
+fault that has cleared leaves no trace in the drive. Two registers are latched
+extremes and are the closest thing to a black box:
+
+    22  'Follow Error Max'  -- the worst lag ever seen
+    98  'Bus Voltage Min'   -- the lowest supply ever seen
+
+Both survive a cleared error and a completed move, and both can be reset by
+writing 0, which turns a value with no timestamp into one with a known
+starting point. Everything finer-grained has to be recorded externally, which
+is what `eventlog.py` is for.
+
 Confidence markers
 ------------------
-Every register below carries a `confidence` field, because this code was
-written without access to a copy of the JVL manual:
-
-    CONFIRMED : verified against the real pSCT motors and/or MacTalk.
-    DOCUMENTED: taken from JVL's published MIS23x/SMC75 register overview.
-    VERIFY    : plausible from the JVL register conventions but NOT yet
-                checked on hardware. Anything marked VERIFY must be confirmed
-                against MacTalk before it is trusted in an unattended system.
+    CONFIRMED : name taken from MacTalk's register list for this motor, and/or
+                the value verified on the hardware.
+    DOCUMENTED: from JVL's published overview but not seen on this motor.
+    VERIFY    : inferred, not checked. Nothing carries this marker any more --
+                the MacTalk dump settled every register listed here.
 
 `python -m psct_motors.cli verify-registers` prints this table next to live
-values read from a motor, which is the intended way to promote a VERIFY entry
-to CONFIRMED. Please update the markers here as you confirm them.
+values, and `motor-report` gives the same information organised by what you
+would be looking for.
 """
 
 from __future__ import annotations
@@ -142,66 +172,186 @@ class RegisterDef:
 #: ~150-register file rather than a full transcription, so that everything
 #: here can carry an honest confidence marker.
 REGISTERS: Tuple[RegisterDef, ...] = (
-    RegisterDef(1, "PROG_VERSION", 32, False, False, VERIFY,
-                "Believed to be the firmware version, but on the pSCT motor this "
-                "reads 540777 (0x00084069), which needs 20 bits and so cannot be "
-                "the 16-bit version field JVL's overview describes. Register 1 may "
-                "well be something else on this firmware. Not used for anything; "
-                "kept because it is worth comparing against MacTalk's version "
-                "display to settle what it is."),
+    # ---- identity ------------------------------------------------------
+    RegisterDef(1, "PROG_VERSION", 32, False, False, CONFIRMED,
+                "Program Version. Reads 540777 on the pSCT motor -- a packed "
+                "value, not a plain version number, so it is displayed but not "
+                "interpreted."),
+    RegisterDef(151, "MOTOR_TYPE", 32, False, False, CONFIRMED, "Motor Type."),
+    RegisterDef(152, "MOTOR_SERIAL", 32, False, False, CONFIRMED,
+                "Motor Serial Number."),
+    RegisterDef(156, "HARDWARE_REV", 32, False, False, CONFIRMED,
+                "Hardware Revision."),
+    RegisterDef(99, "ENCODER_TYPE", 32, False, False, CONFIRMED,
+                "Encoder Type. 4 = closed-loop absolute multiturn on this motor."),
+
+    # ---- command and mode ----------------------------------------------
     RegisterDef(2, "MODE_REG", 16, True, True, CONFIRMED,
-                "Operating mode. See MotorMode."),
+                "Operating Mode. See MotorMode."),
+    RegisterDef(37, "STARTUP_MODE", 16, True, True, CONFIRMED,
+                "Startup Operating Mode -- the mode the motor enters at power "
+                "on. 2 on the pSCT motor, so it comes up ready to position."),
     RegisterDef(3, "P_SOLL", 32, True, True, CONFIRMED,
-                "Target position. The motor drives towards this in Position mode.",
-                unit="counts"),
-    RegisterDef(4, "P_NEW", 32, True, True, VERIFY,
-                "Believed to redefine the current position without moving. On the "
-                "pSCT motor it reads 101187584 (0x06080000) while P_IST is 600, "
-                "which is not position-shaped, so register 4 is probably not P_NEW "
-                "here. Nothing in this package writes it -- set-zero keeps its "
-                "offset in the config instead.",
+                "Requested Position -- the target the motor drives towards.",
                 unit="counts"),
     RegisterDef(5, "V_SOLL", 16, True, True, CONFIRMED,
-                "Maximum velocity for position moves.", unit="raw"),
-    RegisterDef(6, "A_SOLL", 16, True, True, DOCUMENTED,
-                "Acceleration/deceleration ramp.", unit="raw"),
-    RegisterDef(7, "RUN_CURRENT", 16, True, True, DOCUMENTED,
-                "Motor current while moving.", unit="raw"),
-    RegisterDef(8, "STANDBY_TIME", 16, True, True, DOCUMENTED,
-                "Delay before dropping to standby current.", unit="ms"),
-    RegisterDef(9, "STANDBY_CURRENT", 16, True, True, DOCUMENTED,
-                "Holding current when stationary. On a vertical/loaded axis this "
-                "is what actually holds position when the brake is released.",
+                "Max Velocity for position moves.", unit="raw"),
+    RegisterDef(6, "A_SOLL", 16, True, True, CONFIRMED,
+                "Acceleration.", unit="raw"),
+    RegisterDef(174, "DECELERATION", 32, True, True, CONFIRMED,
+                "Deceleration. 0 means the acceleration value is used for both.",
                 unit="raw"),
-    RegisterDef(10, "P_IST", 32, True, False, CONFIRMED,
-                "Actual position. This is the number the GUI displays and the "
-                "kinematics are driven from.", unit="counts"),
-    RegisterDef(12, "V_IST", 16, True, False, DOCUMENTED,
-                "Actual velocity. Reads ~0 when the axis has settled, which is "
-                "half of the motion-complete test.", unit="raw"),
-    RegisterDef(19, "OUTPUTS", 32, False, True, VERIFY,
-                "Digital output states, one bit per output. This is where a "
-                "brake wired to an output lives (see BrakeConfig). The register "
-                "number, the bit and the polarity are all installation details "
-                "-- confirm them with `cli probe-brake` before relying on the "
-                "brake indicator."),
-    RegisterDef(20, "FLWERR", 32, True, False, VERIFY,
-                "Following error (commanded minus encoder position).", unit="counts"),
-    RegisterDef(25, "STATUSBITS", 32, False, False, VERIFY,
-                "Believed to be a status bit field, but on the pSCT motor it reads "
-                "0x8A476C14 while the drive is passive and the shaft stationary. "
-                "That is not what an idle status word looks like, so either the bit "
-                "layout is nothing like the obvious one or register 25 is not "
-                "STATUSBITS on this firmware. No bit names are claimed for it -- see "
-                "STATUS_BITS. Read but never acted upon."),
-    RegisterDef(35, "ERR_BITS", 32, False, True, CONFIRMED,
-                "Error bit field. 0 means no error. Individual bit meanings in "
-                "ERROR_BITS are VERIFY-level."),
-    RegisterDef(36, "WARN_BITS", 32, False, False, VERIFY,
-                "Warning bit field."),
-    RegisterDef(38, "P_HOME", 32, True, True, VERIFY,
-                "Position value loaded after a homing/zero-search run.",
+    RegisterDef(13, "V_START", 32, True, True, CONFIRMED,
+                "Start Velocity.", unit="raw"),
+    RegisterDef(32, "ERROR_DECELERATION", 32, True, True, CONFIRMED,
+                "Error Deceleration -- the ramp used when a fault stops a move.",
+                unit="raw"),
+
+    # ---- position feedback ---------------------------------------------
+    RegisterDef(10, "P_PROJECTED", 32, True, False, CONFIRMED,
+                "Projected Position: where the profile generator has got to. "
+                "This reaches the requested position by construction, whether or "
+                "not the shaft followed, so it is NOT a measurement of where the "
+                "motor is. Used as the stop-here value, never as the position.",
                 unit="counts"),
+    RegisterDef(16, "P_ENCODER", 32, True, False, CONFIRMED,
+                "Actual Encoder Position -- where the shaft actually is. This is "
+                "the position this software reports and checks arrival against.",
+                unit="counts"),
+    RegisterDef(46, "P_ENCODER_ABS", 32, True, False, CONFIRMED,
+                "Abs Encoder Position, from the absolute multiturn encoder.",
+                unit="counts"),
+    RegisterDef(12, "V_IST", 16, True, False, CONFIRMED,
+                "Actual Velocity. ~0 when the axis has settled.", unit="raw"),
+    RegisterDef(20, "FLWERR", 32, True, False, CONFIRMED,
+                "Follow Error = Projected Position - Actual Encoder Position. "
+                "Reads 231 on a settled pSCT motor, so a small standing value is "
+                "normal and only a large or growing one is a problem.",
+                unit="counts"),
+    RegisterDef(22, "FLWERR_MAX", 32, True, True, CONFIRMED,
+                "Follow Error Max -- the largest following error seen since it "
+                "was last cleared. A latched high-water mark, and one of only two "
+                "pieces of history this motor keeps. Write 0 to reset it.",
+                unit="counts"),
+    RegisterDef(238, "MOTOR_ROTATIONS", 32, True, False, CONFIRMED,
+                "Motor Rotations."),
+
+    # ---- errors and status ---------------------------------------------
+    RegisterDef(35, "ERR_BITS", 32, False, True, CONFIRMED,
+                "Errors. 0 means healthy. Instantaneous only -- the motor keeps "
+                "no error history, which is why this software records its own."),
+    RegisterDef(36, "WARN_BITS", 32, False, False, CONFIRMED,
+                "Warnings. Instantaneous, like Errors."),
+    RegisterDef(25, "STATUSBITS", 32, False, False, CONFIRMED,
+                "Status Bits. Confirmed as the status word, but the bit layout is "
+                "not published in MacTalk's register list, so no bit names are "
+                "claimed. Reads 0x8A47xxxx on the pSCT motor -- including while the "
+                "drive is passive and the shaft stationary -- and does change "
+                "between samples. Displayed raw."),
+
+    # ---- arrival criteria ------------------------------------------------
+    RegisterDef(33, "IN_POSITION_WINDOW", 32, True, True, CONFIRMED,
+                "'In Position' Window, in counts -- the motor's own idea of "
+                "arrival. 20000 on the pSCT motor, which is far wider than the "
+                "tolerance this software applies.", unit="counts"),
+    RegisterDef(34, "IN_POSITION_RETRIES", 32, True, True, CONFIRMED,
+                "'In Position' Retries."),
+    RegisterDef(110, "SETTLING_TIME", 32, True, True, CONFIRMED,
+                "Position Settling Time.", unit="ms"),
+    RegisterDef(177, "IN_TARGET_TIME", 32, True, True, CONFIRMED,
+                "'In Target Position' Time.", unit="ms"),
+
+    # ---- travel limits ---------------------------------------------------
+    RegisterDef(28, "POS_LIMIT_MIN", 32, True, True, CONFIRMED,
+                "Position Limit Min. Both limits 0 on the pSCT motor, which "
+                "means no software travel limit is active in the drive itself.",
+                unit="counts"),
+    RegisterDef(30, "POS_LIMIT_MAX", 32, True, True, CONFIRMED,
+                "Position Limit Max.", unit="counts"),
+    RegisterDef(129, "NEG_LIMIT_INPUT", 32, True, True, CONFIRMED,
+                "Negative Limit Input -- which digital input is the negative "
+                "limit switch. 0 = none assigned."),
+    RegisterDef(130, "POS_LIMIT_INPUT", 32, True, True, CONFIRMED,
+                "Positive Limit Input. 0 = none assigned."),
+
+    # ---- current and load ------------------------------------------------
+    RegisterDef(7, "RUN_CURRENT", 16, True, True, CONFIRMED,
+                "Running Current.", unit="raw"),
+    RegisterDef(8, "STANDBY_TIME", 16, True, True, CONFIRMED,
+                "Standby Time -- delay before dropping to standby current.",
+                unit="ms"),
+    RegisterDef(9, "STANDBY_CURRENT", 16, True, True, CONFIRMED,
+                "Standby Current -- what holds position when stationary.",
+                unit="raw"),
+    RegisterDef(217, "ACTUAL_TORQUE", 32, True, False, CONFIRMED,
+                "Actual Torque. Rising torque at a standstill means the axis is "
+                "fighting something."),
+    RegisterDef(173, "STALL_THRESHOLD", 32, True, True, CONFIRMED,
+                "Threshold Stall Detection.", unit="counts"),
+
+    # ---- supply and temperature -----------------------------------------
+    RegisterDef(97, "BUS_VOLTAGE", 32, True, False, CONFIRMED,
+                "Bus voltage (P+), in raw units.", unit="raw"),
+    RegisterDef(98, "BUS_VOLTAGE_MIN", 32, True, True, CONFIRMED,
+                "Bus Voltage Min -- the lowest supply voltage seen since it was "
+                "last cleared. A latched low-water mark, and the other piece of "
+                "history this motor keeps. A brown-out that caused a fault hours "
+                "ago is still visible here. Write to reset.", unit="raw"),
+    RegisterDef(139, "ACCEPTANCE_VOLTAGE", 32, True, True, CONFIRMED,
+                "Acceptance Voltage -- the supply threshold the drive requires.",
+                unit="raw"),
+    RegisterDef(246, "TEMPERATURE", 32, True, False, CONFIRMED,
+                "Temperature, raw. Register 26 gives a low-resolution degrees "
+                "value (18 C on the pSCT motor)."),
+    RegisterDef(26, "TEMPERATURE_LOW_RES", 32, True, False, CONFIRMED,
+                "Temperature, low resolution.", unit="C"),
+
+    # ---- I/O and brake ---------------------------------------------------
+    RegisterDef(18, "INPUTS", 32, False, False, CONFIRMED, "Digital Inputs."),
+    RegisterDef(19, "OUTPUTS", 32, False, True, CONFIRMED, "Digital Outputs."),
+    RegisterDef(125, "IO_SETUP", 32, False, True, CONFIRMED, "Digital I/O Setup."),
+    RegisterDef(179, "BRAKE_OUTPUT", 32, True, True, CONFIRMED,
+                "Brake Output -- WHICH digital output drives the brake, not the "
+                "brake state. 0 means no output is assigned, so on the pSCT motor "
+                "as configured today the brake is not under output control. Same "
+                "pattern as 'In Position' Output (137) and 'Error' Output (138)."),
+    RegisterDef(137, "IN_POSITION_OUTPUT", 32, True, True, CONFIRMED,
+                "'In Position' Output -- which output signals arrival. 0 = none."),
+    RegisterDef(138, "ERROR_OUTPUT", 32, True, True, CONFIRMED,
+                "'Error' Output -- which output signals a fault. 0 = none."),
+
+    # ---- comms watchdog --------------------------------------------------
+    RegisterDef(199, "MODBUS_TIMEOUT_MS", 32, True, True, CONFIRMED,
+                "ModBus Slave Timeout, ms. If non-zero, the drive takes the "
+                "action in register 200 when it stops being polled -- a way for a "
+                "motor to change mode by itself and appear to stop accepting "
+                "commands. 0 on the pSCT motor, so the watchdog is off.",
+                unit="ms"),
+    RegisterDef(200, "MODBUS_ACTION", 32, True, True, CONFIRMED,
+                "ModBus Slave Action -- what the drive does when the Modbus "
+                "timeout expires."),
+    RegisterDef(121, "MODBUS_SETUP", 32, False, True, CONFIRMED, "Modbus Setup."),
+
+    # ---- homing ----------------------------------------------------------
+    RegisterDef(38, "HOME_OFFSET", 32, True, True, CONFIRMED,
+                "Homing Position Offset.", unit="counts"),
+    RegisterDef(40, "HOME_VELOCITY", 32, True, True, CONFIRMED,
+                "Homing Velocity.", unit="raw"),
+    RegisterDef(42, "HOME_MODE", 32, True, True, CONFIRMED, "Homing Mode."),
+    RegisterDef(132, "HOME_SENSOR_INPUT", 32, True, True, CONFIRMED,
+                "Homing Sensor Input."),
+
+    # ---- gearing ---------------------------------------------------------
+    RegisterDef(14, "GEAR_OUTPUT", 32, True, True, CONFIRMED,
+                "Gear Output. 409600 on the pSCT motor, the same number as the "
+                "counts per revolution."),
+    RegisterDef(15, "GEAR_INPUT", 32, True, True, CONFIRMED,
+                "Gear Input. 2048 on the pSCT motor."),
+
+    # ---- uptime ----------------------------------------------------------
+    RegisterDef(202, "TICKS", 32, True, False, CONFIRMED,
+                "Ticks -- a free-running counter. Useful only to tell whether the "
+                "motor has restarted between two readings."),
 )
 
 REGISTERS_BY_NAME: Dict[str, RegisterDef] = {r.name: r for r in REGISTERS}

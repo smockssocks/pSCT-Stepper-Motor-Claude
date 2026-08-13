@@ -55,7 +55,7 @@ class TestFaultInjection(unittest.TestCase):
 
     def test_pass_through_when_nothing_armed(self):
         self.assertIs(self.injector.fault, Fault.NONE)
-        self.assertEqual(self.motor.read_register("PROG_VERSION"), 1030)
+        self.assertEqual(self.motor.read_register("PROG_VERSION"), 540777)
         self.assertEqual(self.motor.get_position_counts(), 0)
 
     def test_comms_drop_fails_every_transaction(self):
@@ -94,7 +94,7 @@ class TestFaultInjection(unittest.TestCase):
         self.motor.write_register("P_SOLL", 4321)
         self.injector.arm(Fault.ERROR_BITS)
         self.assertEqual(self.motor.get_target_counts(), 4321)
-        self.assertEqual(self.motor.read_register("PROG_VERSION"), 1030)
+        self.assertEqual(self.motor.read_register("PROG_VERSION"), 540777)
 
     def test_mode_revert_makes_a_mode_change_refuse(self):
         self.injector.arm(Fault.MODE_REVERT)
@@ -641,7 +641,7 @@ class TestWordOrderProbe(unittest.TestCase):
     def test_position_registers_are_not_used_as_evidence(self):
         """Register 4 reads 0x06080000 on the real motor and would vote wrong."""
         from psct_motors.jvl_motor import WORD_ORDER_PROBE_REGISTERS
-        for name in ("P_SOLL", "P_IST", "P_NEW", "P_HOME", "STATUSBITS"):
+        for name in ("P_SOLL", "P_PROJECTED", "P_ENCODER", "STATUSBITS"):
             self.assertNotIn(name, WORD_ORDER_PROBE_REGISTERS)
 
 
@@ -757,9 +757,21 @@ class TestUnverifiedDecodings(unittest.TestCase):
         self.assertIn("0x00000002", text)
         self.assertIn("UNVERIFIED", text)
 
-    def test_registers_contradicted_by_hardware_are_marked_verify(self):
-        from psct_motors.registers import REGISTERS_BY_NAME, VERIFY
-        for name in ("PROG_VERSION", "P_NEW", "STATUSBITS"):
-            self.assertEqual(REGISTERS_BY_NAME[name].confidence, VERIFY, name)
+    def test_registers_record_what_the_hardware_actually_read(self):
+        """Names now come from MacTalk's own register list, so they are
+        CONFIRMED -- but the odd readings are still written down."""
+        from psct_motors.registers import CONFIRMED, REGISTERS_BY_NAME
+        for name in ("PROG_VERSION", "STATUSBITS", "FLWERR", "BRAKE_OUTPUT",
+                     "MODBUS_TIMEOUT_MS"):
+            self.assertEqual(REGISTERS_BY_NAME[name].confidence, CONFIRMED, name)
             self.assertIn("pSCT motor", REGISTERS_BY_NAME[name].description,
                           f"{name} should record what the hardware actually read")
+
+    def test_projected_and_encoder_positions_are_distinguished(self):
+        """Conflating them is what hid a 231-count following error."""
+        from psct_motors.registers import REGISTERS_BY_NAME
+        projected = REGISTERS_BY_NAME["P_PROJECTED"]
+        encoder = REGISTERS_BY_NAME["P_ENCODER"]
+        self.assertEqual(projected.number, 10)
+        self.assertEqual(encoder.number, 16)
+        self.assertIn("NOT a measurement", projected.description)

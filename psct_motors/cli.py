@@ -689,6 +689,112 @@ def cmd_demo(args) -> int:
         motor.disconnect()
 
 
+def cmd_motor_report(args) -> int:
+    """Everything the motor will tell you about itself, in one page.
+
+    Includes the only two pieces of history the drive keeps: Follow Error Max
+    and Bus Voltage Min. Both are latched extremes with no timestamp, but they
+    survive an error being cleared and a move completing, so after an
+    intermittent fault they are often the only evidence left.
+    """
+    from .demo import build_motor
+    from .registers import REGISTERS, describe_errors, describe_mode, describe_status
+
+    motor = build_motor(args.config, args.motor, args.simulate)
+    try:
+        motor.connect(verify_word_order=False)
+    except (ModbusError, MotorFault) as exc:
+        out(f"Could not connect to motor {args.motor}: {exc}")
+        return 1
+    try:
+        def value(name, default=None):
+            try:
+                return motor.read_register(name)
+            except (ModbusError, MotorFault):
+                return default
+
+        rule(f"Motor {args.motor}")
+        out(f"  connection        {motor.describe()}")
+        out(f"  serial number     {value('MOTOR_SERIAL', '?')}")
+        out(f"  motor type        {value('MOTOR_TYPE', '?')}")
+        out(f"  hardware revision {value('HARDWARE_REV', '?')}")
+        out(f"  program version   {value('PROG_VERSION', '?')}")
+        out(f"  encoder type      {value('ENCODER_TYPE', '?')}")
+
+        rule("Where it is")
+        encoder = value("P_ENCODER")
+        projected = value("P_PROJECTED")
+        requested = value("P_SOLL")
+        follow = value("FLWERR")
+        out(f"  requested position (reg 3)    {requested}")
+        out(f"  projected position (reg 10)   {projected}   <- profile output, "
+            "reaches the target by construction")
+        out(f"  encoder position   (reg 16)   {encoder}   <- where the shaft is")
+        out(f"  follow error       (reg 20)   {follow}")
+        out(f"  actual velocity    (reg 12)   {value('V_IST')}")
+        out(f"  actual torque      (reg 217)  {value('ACTUAL_TORQUE')}")
+
+        rule("What it is doing")
+        mode = value("MODE_REG")
+        out(f"  operating mode     {describe_mode(mode) if mode is not None else '?'}")
+        out(f"  startup mode       {describe_mode(value('STARTUP_MODE', -1))}")
+        out(f"  max velocity       {value('V_SOLL')}")
+        out(f"  acceleration       {value('A_SOLL')}")
+        out(f"  running current    {value('RUN_CURRENT')}")
+        out(f"  standby current    {value('STANDBY_CURRENT')}")
+
+        rule("Health now")
+        errors = value("ERR_BITS", 0)
+        warnings = value("WARN_BITS", 0)
+        out(f"  errors   (reg 35)  {describe_errors(errors)}")
+        out(f"  warnings (reg 36)  {warnings}")
+        out(f"  status   (reg 25)  {describe_status(value('STATUSBITS', 0))}")
+        out(f"  temperature        {value('TEMPERATURE_LOW_RES')} C "
+            f"(raw {value('TEMPERATURE')})")
+
+        rule("History the motor keeps")
+        out("  These two registers are latched extremes. They have no timestamp,")
+        out("  but they survive a cleared error and a completed move, so after an")
+        out("  intermittent fault they are often the only evidence left.")
+        out("")
+        out(f"  follow error max (reg 22)  {value('FLWERR_MAX')}"
+            "   <- worst lag ever seen")
+        out(f"  bus voltage min  (reg 98)  {value('BUS_VOLTAGE_MIN')}"
+            "   <- lowest supply ever seen")
+        out(f"  bus voltage now  (reg 97)  {value('BUS_VOLTAGE')}")
+        out(f"  ticks            (reg 202) {value('TICKS')}"
+            "   <- resets when the motor restarts")
+        out("")
+        out("  The motor keeps NO error history. Registers 35 and 36 are")
+        out("  instantaneous, so a fault that has cleared leaves no trace in the")
+        out("  drive at all. Use `cli watch` to record one yourself.")
+
+        rule("Things that silently stop motion")
+        out(f"  position limit min/max (28/30)  {value('POS_LIMIT_MIN')} / "
+            f"{value('POS_LIMIT_MAX')}   (0/0 = no drive limit)")
+        out(f"  modbus slave timeout   (199)    {value('MODBUS_TIMEOUT_MS')} ms"
+            "   (0 = watchdog off)")
+        out(f"  modbus slave action    (200)    {value('MODBUS_ACTION')}")
+        out(f"  brake output           (179)    {value('BRAKE_OUTPUT')}"
+            "   (0 = no output drives a brake)")
+        out(f"  in-position window     (33)     {value('IN_POSITION_WINDOW')} counts")
+        out(f"  negative/positive limit inputs  {value('NEG_LIMIT_INPUT')} / "
+            f"{value('POS_LIMIT_INPUT')}   (0 = none assigned)")
+
+        mismatch = motor.check_brake_configuration()
+        if mismatch:
+            out("")
+            out(f"  NOTE: {mismatch}")
+
+        if args.all_registers:
+            rule("Every register this software knows")
+            for reg in REGISTERS:
+                out(f"  {reg.number:>4}  {reg.name:<22} {value(reg.name, '<unreadable>')}")
+        return 0
+    finally:
+        motor.disconnect()
+
+
 def cmd_motor_gui(args) -> int:
     """Bench GUI for a single motor."""
     from .single_gui import main as single_main
@@ -807,6 +913,7 @@ commissioning order
 one motor on a bench
 --------------------
   motor-gui            live GUI: state, errors, fault injection, event log
+  motor-report         one page of everything the motor reports
   demo                 exercise a single motor and deliberately provoke
                        faults, to see the error handling work
   diagnose             explain why a motor is not taking position commands
@@ -933,6 +1040,15 @@ one motor on a bench
     p.add_argument("--motor", default="A", help="actuator name (default A)")
     p.add_argument("--log", help="path for the JSONL event log")
     p.set_defaults(func=cmd_motor_gui)
+
+    p = sub.add_parser(
+        "motor-report",
+        help="one page of everything the motor reports, including its latched history",
+    )
+    p.add_argument("--motor", default="A")
+    p.add_argument("--all-registers", action="store_true",
+                   help="also dump every register this software knows about")
+    p.set_defaults(func=cmd_motor_report)
 
     p = sub.add_parser(
         "diagnose",

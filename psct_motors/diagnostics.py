@@ -121,7 +121,7 @@ def diagnose(motor: JVLMotor, probe_writes: bool = True) -> Diagnosis:
         position = motor.get_position_counts()
         findings.append(Finding(
             OK, "Communications",
-            f"The motor is answering. P_IST = {position} counts.",
+            f"The motor is answering. Encoder position = {position} counts.",
             data={"position": position},
         ))
     except (ModbusError, MotorFault) as exc:
@@ -214,14 +214,14 @@ def diagnose(motor: JVLMotor, probe_writes: bool = True) -> Diagnosis:
         if abs(delta) <= 1:
             findings.append(Finding(
                 OK, "Already at target",
-                f"P_SOLL = {target} and P_IST = {position}. The motor is not "
+                f"Requested = {target} and encoder = {position}. The motor is not "
                 "moving because it has nothing to do.",
                 data={"target": target, "position": position},
             ))
         else:
             findings.append(Finding(
                 OK, "Target differs from position",
-                f"P_SOLL = {target}, P_IST = {position} ({delta:+d} counts away). "
+                f"Requested = {target}, encoder = {position} ({delta:+d} counts away). "
                 "There is a move outstanding.",
                 data={"target": target, "position": position, "delta": delta},
             ))
@@ -236,26 +236,40 @@ def diagnose(motor: JVLMotor, probe_writes: bool = True) -> Diagnosis:
     findings.append(_check_brake(motor))
 
     # ---- 8. Following error ----------------------------------------------
+    window = motor.cfg.follow_error_window_counts
     try:
         follow_error = motor.read_register("FLWERR")
-        if abs(follow_error) > 0:
+        if abs(follow_error) > window:
             findings.append(Finding(
-                SUSPECT, "Following error",
-                f"FLWERR = {follow_error}. The commanded and actual positions "
-                "disagree, which means the motor is being asked for motion it "
-                "is not achieving.",
-                "Check for a mechanical obstruction, an unreleased brake, or a "
-                "run current too low for the load. Note that FLWERR is a "
-                "VERIFY-level register here -- confirm the number means what "
-                "it appears to before acting on it.",
-                data={"flwerr": follow_error},
+                SUSPECT, "Following error is large",
+                f"Follow Error = {follow_error} counts, outside the "
+                f"{window}-count window. The profile generator and the encoder "
+                "disagree, so the motor is being asked for motion it is not "
+                "achieving.",
+                "Check for a mechanical obstruction, a brake that has not "
+                "released, or a run current too low for the load.",
+                data={"follow_error": follow_error, "window": window},
             ))
         else:
-            findings.append(Finding(OK, "Following error", "FLWERR = 0.",
-                                    data={"flwerr": 0}))
+            findings.append(Finding(
+                OK, "Following error",
+                f"Follow Error = {follow_error} counts, inside the "
+                f"{window}-count window. A small standing value is normal -- a "
+                "settled pSCT motor sits at about 231.",
+                data={"follow_error": follow_error},
+            ))
     except (ModbusError, MotorFault):
         findings.append(Finding(UNKNOWN, "Following error",
-                                "FLWERR could not be read on this motor."))
+                                "Follow Error could not be read on this motor."))
+
+    # ---- 9. Drive-side position limits -----------------------------------
+    findings.append(_check_position_limits(motor, position))
+
+    # ---- 10. The comms watchdog ------------------------------------------
+    findings.append(_check_modbus_watchdog(motor))
+
+    # ---- 11. Supply voltage ----------------------------------------------
+    findings.extend(_check_supply(motor))
 
     return Diagnosis(findings)
 
@@ -339,6 +353,108 @@ def _check_brake(motor: JVLMotor) -> Finding:
     return Finding(OK, "Brake",
                    f"{status.state.label}. {status.detail}",
                    data={"brake": status.state.value})
+
+
+def _check_position_limits(motor: JVLMotor, position: int) -> Finding:
+    """Registers 28 and 30 are limits inside the DRIVE, separate from this
+    software's soft limits. Both 0 means no limit is active."""
+    try:
+        low = motor.read_register("POS_LIMIT_MIN")
+        high = motor.read_register("POS_LIMIT_MAX")
+    except (ModbusError, MotorFault) as exc:
+        return Finding(UNKNOWN, "Drive position limits",
+                       f"Could not read Position Limit Min/Max: {exc}")
+    if low == 0 and high == 0:
+        return Finding(OK, "Drive position limits",
+                       "Position Limit Min and Max are both 0, so the drive is "
+                       "applying no travel limit of its own.",
+                       data={"min": 0, "max": 0})
+    if low <= position <= high:
+        return Finding(OK, "Drive position limits",
+                       f"The drive limits travel to {low}..{high} counts and the "
+                       f"encoder reads {position}, which is inside them.",
+                       data={"min": low, "max": high})
+    return Finding(
+        BLOCKING, "Outside the drive's position limits",
+        f"The drive limits travel to {low}..{high} counts but the encoder reads "
+        f"{position}. Moves that leave the allowed range will be refused by the "
+        "drive itself, whatever this software commands.",
+        "Either widen Position Limit Min/Max in MacTalk, or move back inside "
+        "the range. Note these are the DRIVE's limits, not this software's.",
+        data={"min": low, "max": high, "position": position},
+    )
+
+
+def _check_modbus_watchdog(motor: JVLMotor) -> Finding:
+    """Register 199 is a comms watchdog: if the drive stops being polled for
+    that long, it takes the action in register 200. A motor that changes mode
+    by itself, with nothing in the application's log to explain it, is exactly
+    what this produces."""
+    try:
+        timeout_ms = motor.read_register("MODBUS_TIMEOUT_MS")
+        action = motor.read_register("MODBUS_ACTION")
+    except (ModbusError, MotorFault) as exc:
+        return Finding(UNKNOWN, "Modbus watchdog",
+                       f"Could not read ModBus Slave Timeout: {exc}")
+    if timeout_ms == 0:
+        return Finding(OK, "Modbus watchdog",
+                       "ModBus Slave Timeout is 0, so the drive will not change "
+                       "state on its own if polling stops.",
+                       data={"timeout_ms": 0})
+    return Finding(
+        SUSPECT, "Modbus watchdog is armed",
+        f"ModBus Slave Timeout is {timeout_ms} ms with action {action}. If this "
+        "software, MacTalk or anything else stops polling for that long, the "
+        "drive acts on its own -- which can look exactly like the motor "
+        "spontaneously refusing commands.",
+        "If you did not intend a watchdog, set ModBus Slave Timeout to 0 in "
+        "MacTalk. If you did, make sure the poll interval is comfortably "
+        "shorter than the timeout.",
+        data={"timeout_ms": timeout_ms, "action": action},
+    )
+
+
+def _check_supply(motor: JVLMotor) -> List[Finding]:
+    """Bus voltage now, and the lowest it has ever been.
+
+    Register 98 is a latched low-water mark -- one of only two pieces of
+    history this motor keeps. A brown-out that tripped the drive hours ago is
+    still recorded there, long after the error bits have been cleared.
+
+    The comparison made here is register 98 against register 97: the same
+    quantity, so the same scale, whatever that scale is. Register 139
+    ('Acceptance Voltage') is deliberately NOT compared against them -- it
+    reads 2054 while the bus reads 1794 on a perfectly healthy pSCT motor,
+    which means they are not on a common scale, and treating that as a
+    brown-out would be a confident wrong answer.
+    """
+    findings: List[Finding] = []
+    try:
+        voltage = motor.read_register("BUS_VOLTAGE")
+        minimum = motor.read_register("BUS_VOLTAGE_MIN")
+    except (ModbusError, MotorFault) as exc:
+        return [Finding(UNKNOWN, "Supply voltage",
+                        f"Could not read the bus voltage: {exc}")]
+
+    detail = (f"Bus voltage reads {voltage} (raw units), and the lowest value "
+              f"ever latched is {minimum}.")
+    if voltage > 0 and minimum < 0.7 * voltage:
+        findings.append(Finding(
+            SUSPECT, "Supply has been much lower than it is now",
+            detail + " That is a latched record with no timestamp, so it may "
+            "simply be the supply ramping up at power-on -- but if it was a "
+            "dip while running, it is evidence of a brown-out that no error "
+            "bit would still be showing.",
+            "Clear Bus Voltage Min (write 0 to register 98) with the motor "
+            "already powered and running, then check again later. If it drops "
+            "again without a power cycle, the supply or its wiring is the "
+            "problem rather than the motor.",
+            data={"voltage": voltage, "min": minimum},
+        ))
+    else:
+        findings.append(Finding(OK, "Supply voltage", detail,
+                                data={"voltage": voltage, "min": minimum}))
+    return findings
 
 
 __all__ = ["diagnose", "Diagnosis", "Finding",

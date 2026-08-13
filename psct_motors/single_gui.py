@@ -223,6 +223,16 @@ class SingleMotorApp:
         ttk.Label(frame, textvariable=self.vsoll_var, width=18,
                   anchor="w").grid(row=2, column=6, sticky="w", padx=4)
 
+        # Follow error: the number that says whether the SHAFT arrived, as
+        # opposed to whether the profile generator did. Shown beside the
+        # position because the two together are the whole story.
+        self.follow_var = tk.StringVar(value="--")
+        ttk.Label(frame, text="Follow error").grid(row=2, column=0, sticky="e",
+                                                   padx=(8, 2))
+        ttk.Label(frame, textvariable=self.follow_var, width=34, anchor="w",
+                  font=("TkFixedFont", 10)).grid(row=2, column=1, columnspan=3,
+                                                 sticky="w")
+
         # --- the error panel, deliberately prominent ---
         self.error_frame = tk.Frame(frame, bg=COLOR_OK_BG, bd=1, relief="solid")
         self.error_frame.grid(row=3, column=0, columnspan=8, sticky="ew",
@@ -248,6 +258,8 @@ class SingleMotorApp:
                    command=self.on_clear_errors).grid(row=0, column=0, padx=3)
         ttk.Button(buttons, text="Why is it not moving?",
                    command=self.on_diagnose).grid(row=0, column=1, padx=3)
+        ttk.Button(buttons, text="Motor history",
+                   command=self.on_show_history).grid(row=0, column=2, padx=3)
 
     def _build_controls(self) -> None:
         frame = ttk.LabelFrame(self.root, text="Move  (revolutions of motor shaft)")
@@ -468,6 +480,14 @@ class SingleMotorApp:
         self.target_var.set(
             f"{target:>10d} ct   {self.revs(target):+8.4f} rev   "
             f"({position - target:+d} ct away)")
+        try:
+            follow = self.motor.get_follow_error()
+            window = self.motor.cfg.follow_error_window_counts
+            self.follow_var.set(
+                f"{follow:>10d} ct   window {window}"
+                + ("   << OUTSIDE" if abs(follow) > window else ""))
+        except (ModbusError, MotorFault):
+            self.follow_var.set("--")
         self.mode_var.set(describe_mode(snapshot.mode).split(" (")[0]
                           if snapshot.mode is not None else "?")
         self.mode_lamp.set(COLOR_OK if snapshot.mode == int(MotorMode.POSITION)
@@ -707,6 +727,106 @@ class SingleMotorApp:
 
         ttk.Button(window, text="Close", command=window.destroy).grid(
             row=2, column=0, columnspan=2, pady=(0, 12))
+
+    def on_show_history(self) -> None:
+        """The only two things the motor itself remembers."""
+        if not self._require_connection():
+            return
+
+        def work():
+            def read(name):
+                try:
+                    return self.motor.read_register(name)
+                except (ModbusError, MotorFault):
+                    return None
+            values = {
+                "follow_error_max": read("FLWERR_MAX"),
+                "follow_error": read("FLWERR"),
+                "bus_voltage": read("BUS_VOLTAGE"),
+                "bus_voltage_min": read("BUS_VOLTAGE_MIN"),
+                "ticks": read("TICKS"),
+                "errors": read("ERR_BITS"),
+                "warnings": read("WARN_BITS"),
+            }
+            self.log.info("history",
+                          f"Follow Error Max {values['follow_error_max']}, "
+                          f"Bus Voltage Min {values['bus_voltage_min']}, "
+                          f"ticks {values['ticks']}")
+            self.post(lambda: self._show_history(values))
+
+        self.run_async("Motor history", work)
+
+    def _show_history(self, values: dict) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("What the motor remembers")
+        window.geometry("720x430")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+
+        tk.Label(window,
+                 text="This motor keeps no error history.",
+                 anchor="w", justify="left",
+                 font=("TkDefaultFont", 11, "bold")).grid(
+            row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
+
+        text = tk.Text(window, wrap="word", font=("TkFixedFont", 9))
+        text.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
+        text.insert("end",
+                    "Registers 35 (Errors) and 36 (Warnings) are instantaneous "
+                    "bit fields. A fault that has since cleared leaves no trace "
+                    "in the drive at all -- there is no event log to read.\n\n"
+                    "Two registers ARE latched extremes, and they survive both a "
+                    "cleared error and a completed move. After an intermittent "
+                    "fault they are often the only evidence left in the motor:\n\n")
+        text.insert("end", f"  Follow Error Max (reg 22)   {values['follow_error_max']}\n",
+                    "key")
+        text.insert("end",
+                    "      The largest lag between the commanded profile and the\n"
+                    "      encoder since this was last cleared. A large value means\n"
+                    "      the shaft fell behind at some point -- a stall, an\n"
+                    "      obstruction, or a brake that did not release.\n"
+                    f"      Right now the follow error is {values['follow_error']}.\n\n")
+        text.insert("end", f"  Bus Voltage Min (reg 98)    {values['bus_voltage_min']}\n",
+                    "key")
+        text.insert("end",
+                    "      The lowest supply voltage seen since this was last\n"
+                    "      cleared, in the same raw units as the live reading of\n"
+                    f"      {values['bus_voltage']}. A big gap is evidence of a\n"
+                    "      brown-out, though it can also just be the supply ramping\n"
+                    "      up at power-on.\n\n")
+        text.insert("end", f"  Ticks (reg 202)             {values['ticks']}\n", "key")
+        text.insert("end",
+                    "      A free-running counter. If it is lower than last time you\n"
+                    "      looked, the motor restarted in between -- which would\n"
+                    "      explain a mode reverting to its startup value.\n\n")
+        text.insert("end",
+                    "Both extremes are resettable: write 0 to register 22 or 98,\n"
+                    "then watch whether they climb again. That turns a value with no\n"
+                    "timestamp into one with a known starting point.\n\n"
+                    "For anything finer-grained, the event log this application\n"
+                    "records is the history -- the motor has none to give.")
+        text.tag_configure("key", font=("TkFixedFont", 10, "bold"))
+        text.configure(state="disabled")
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=2, column=0, pady=(0, 12))
+        ttk.Button(buttons, text="Reset both extremes",
+                   command=lambda: (self.on_reset_extremes(), window.destroy())
+                   ).grid(row=0, column=0, padx=6)
+        ttk.Button(buttons, text="Close",
+                   command=window.destroy).grid(row=0, column=1, padx=6)
+
+    def on_reset_extremes(self) -> None:
+        """Zero the latched high/low-water marks, so they mean 'since now'."""
+        def work():
+            for name in ("FLWERR_MAX", "BUS_VOLTAGE_MIN"):
+                try:
+                    self.motor.write_register(name, 0)
+                    self.log.info("history", f"{name} reset to 0")
+                except (ModbusError, MotorFault) as exc:
+                    self.log.warning("history", f"Could not reset {name}: {exc}")
+
+        self.run_async("Reset extremes", work)
 
     # ---------------------------------------------------------------- faults
 

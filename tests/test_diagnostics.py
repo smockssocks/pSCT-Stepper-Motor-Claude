@@ -22,6 +22,7 @@ from psct_motors.eventlog import (  # noqa: E402
 from psct_motors.faults import Fault, wrap_motor  # noqa: E402
 from psct_motors.registers import MotorMode  # noqa: E402
 from psct_motors.simulator import simulated_motor  # noqa: E402
+from psct_motors.transport import ModbusError  # noqa: E402
 
 
 def bench_actuator(**kw) -> ActuatorConfig:
@@ -39,7 +40,7 @@ def healthy_motor(**kw):
     motor = simulated_motor(bench_actuator(**kw), start_mm=0.0)
     motor.connect()
     motor.set_mode(MotorMode.POSITION)
-    motor.release_brake()
+    motor.release_brake()          # bench_actuator sets brake.mode="output"
     return motor
 
 
@@ -57,7 +58,80 @@ class TestDiagnose(unittest.TestCase):
             result = diagnose(motor)
             self.assertTrue(result.healthy, result.as_text())
             self.assertEqual(result.blockers, [])
+        finally:
+            motor.disconnect()
+
+    def test_a_latched_supply_dip_is_a_suspect_not_a_blocker(self):
+        """The simulator carries the real motor's Bus Voltage Min of 565
+        against a bus of 1794. That is worth surfacing -- it is the only
+        record of a brown-out once the error bits have been cleared -- but it
+        does not stop the motor moving, so it must not be reported as if it
+        did."""
+        motor = healthy_motor()
+        try:
+            result = diagnose(motor)
+            titles = [f.title for f in result.suspects]
+            self.assertIn("Supply has been much lower than it is now", titles)
+            self.assertTrue(result.healthy)
+        finally:
+            motor.disconnect()
+
+    def test_supply_check_does_not_compare_across_unknown_scales(self):
+        """Register 139 reads 2054 while the bus reads 1794 on a healthy
+        motor, so they are not on a common scale and must not be compared."""
+        motor = healthy_motor()
+        try:
+            motor._transport.registers[98] = motor._transport.registers[97]
+            result = diagnose(motor)
+            titles = [f.title for f in result.suspects]
+            self.assertNotIn("Supply has been much lower than it is now", titles)
+        finally:
+            motor.disconnect()
+
+    def test_a_perfectly_healthy_motor_reports_nothing_at_all(self):
+        motor = healthy_motor()
+        motor._transport.registers[98] = motor._transport.registers[97]
+        try:
+            result = diagnose(motor)
+            self.assertEqual(result.suspects, [], result.as_text())
             self.assertIn("Nothing found", result.summary())
+        finally:
+            motor.disconnect()
+
+    def test_drive_position_limits_block_when_outside(self):
+        motor = healthy_motor()
+        motor._transport.registers[28] = 500000
+        motor._transport.registers[30] = 600000
+        try:
+            self.assertIn("Outside the drive's position limits",
+                          self.titles(diagnose(motor), BLOCKING))
+        finally:
+            motor.disconnect()
+
+    def test_armed_modbus_watchdog_is_flagged(self):
+        """A drive that changes state by itself when polling stops looks
+        exactly like a motor spontaneously refusing commands."""
+        motor = healthy_motor()
+        motor._transport.registers[199] = 500
+        motor._transport.registers[200] = 1
+        try:
+            result = diagnose(motor)
+            self.assertIn("Modbus watchdog is armed",
+                          [f.title for f in result.suspects])
+        finally:
+            motor.disconnect()
+
+    def test_large_follow_error_is_flagged_but_a_normal_one_is_not(self):
+        """231 counts is normal on this motor; flagging any non-zero value
+        would cry wolf on every healthy motor."""
+        motor = healthy_motor()
+        motor._transport.follow_error_counts = 231
+        try:
+            titles = [f.title for f in diagnose(motor).suspects]
+            self.assertNotIn("Following error is large", titles)
+            motor._transport.follow_error_counts = 9000
+            titles = [f.title for f in diagnose(motor).suspects]
+            self.assertIn("Following error is large", titles)
         finally:
             motor.disconnect()
 
@@ -436,3 +510,151 @@ class TestFastFailure(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# --------------------------------------------------------------------------
+# Position semantics, as corrected by MacTalk's register list
+# --------------------------------------------------------------------------
+
+class TestPositionSemantics(unittest.TestCase):
+    """Register 10 is 'Projected Position' -- the profile generator's output,
+    which reaches the requested position by construction. Register 16 is
+    'Actual Encoder Position'. Conflating them meant a settled motor 231
+    counts short of its target reported a perfectly completed move."""
+
+    def setUp(self):
+        self.motor = healthy_motor()
+        self.motor._transport.follow_error_counts = 231
+
+    def tearDown(self):
+        self.motor.disconnect()
+
+    def test_position_comes_from_the_encoder_not_the_profile(self):
+        self.motor.command_position_counts(20000)
+        self.motor.wait_for_in_position(timeout_s=10.0)
+        self.assertEqual(self.motor.get_projected_position_counts(), 20000)
+        self.assertEqual(self.motor.get_position_counts(), 20000 - 231)
+        self.assertEqual(self.motor.get_follow_error(), 231)
+
+    def test_a_normal_standing_follow_error_still_counts_as_arrived(self):
+        self.motor.command_position_counts(20000)
+        self.assertTrue(self.motor.wait_for_in_position(timeout_s=10.0))
+
+    def test_a_large_follow_error_is_not_arrival(self):
+        """The condition the projected position cannot express: profile
+        finished, shaft nowhere near."""
+        self.motor._transport.follow_error_counts = 50000
+        self.motor.command_position_counts(20000)
+        self.assertFalse(self.motor.wait_for_in_position(timeout_s=2.0))
+
+    def test_stop_freezes_the_profile_not_the_encoder(self):
+        """Writing the encoder reading as the target would command a step
+        equal to the standing follow error -- a stop that causes motion."""
+        self.motor.command_position_counts(20000)
+        self.motor.wait_for_in_position(timeout_s=10.0)
+        self.motor.stop()
+        self.assertEqual(self.motor.get_target_counts(),
+                         self.motor.get_projected_position_counts())
+        self.assertNotEqual(self.motor.get_target_counts(),
+                            self.motor.get_position_counts())
+
+    def test_status_reports_both_positions_and_the_follow_error(self):
+        status = self.motor.read_status()
+        self.assertEqual(status.projected_counts - status.position_counts, 231)
+        self.assertEqual(status.follow_error, 231)
+        self.assertIn("follow_error", status.as_dict())
+
+    def test_falls_back_to_projected_when_the_encoder_is_unreadable(self):
+        """An open-loop or differently-configured motor must still work."""
+        from psct_motors.registers import modbus_address
+        transport = self.motor._transport
+        original = transport.read_holding
+        encoder_address = modbus_address(16)
+
+        def without_encoder(address, count):
+            if address == encoder_address:
+                raise ModbusError("register 16 does not exist on this motor")
+            return original(address, count)
+
+        transport.read_holding = without_encoder
+        logged = []
+        self.motor._log = logged.append
+        try:
+            self.assertEqual(self.motor.get_position_counts(),
+                             self.motor.get_projected_position_counts())
+            self.assertTrue(any("Projected Position" in m for m in logged), logged)
+            # And it says so once, not on every read.
+            self.motor.get_position_counts()
+            self.assertEqual(len(logged), 1)
+        finally:
+            transport.read_holding = original
+
+
+class TestBrakeConfiguration(unittest.TestCase):
+    """Register 179 'Brake Output' selects WHICH output drives the brake. It
+    reads 0 on the pSCT motor, so no output does."""
+
+    def test_default_brake_mode_is_none(self):
+        from psct_motors.config import BrakeConfig
+        self.assertEqual(BrakeConfig().mode, "none")
+
+    def test_unassigned_brake_output_contradicts_output_mode(self):
+        from psct_motors.config import BrakeConfig
+        motor = simulated_motor(bench_actuator(brake=BrakeConfig(mode="output")))
+        motor.connect()
+        try:
+            self.assertEqual(motor.read_brake_output_assignment(), 0)
+            message = motor.check_brake_configuration()
+            self.assertIn("register 179", message)
+            self.assertIn("no digital output is assigned", message)
+        finally:
+            motor.disconnect()
+
+    def test_unassigned_brake_output_contradicts_auto_mode(self):
+        from psct_motors.config import BrakeConfig
+        motor = simulated_motor(bench_actuator(brake=BrakeConfig(mode="auto")))
+        motor.connect()
+        try:
+            self.assertIn("guess with nothing behind it",
+                          motor.check_brake_configuration())
+        finally:
+            motor.disconnect()
+
+    def test_assigned_brake_output_contradicts_none_mode(self):
+        from psct_motors.config import BrakeConfig
+        motor = simulated_motor(bench_actuator(brake=BrakeConfig(mode="none")))
+        motor.connect()
+        motor._transport.registers[179] = 2
+        try:
+            self.assertIn("will not show or control it",
+                          motor.check_brake_configuration())
+        finally:
+            motor.disconnect()
+
+    def test_agreement_produces_no_message(self):
+        from psct_motors.config import BrakeConfig
+        motor = simulated_motor(bench_actuator(brake=BrakeConfig(mode="none")))
+        motor.connect()
+        try:
+            self.assertEqual(motor.check_brake_configuration(), "")
+        finally:
+            motor.disconnect()
+
+
+class TestMotorReport(unittest.TestCase):
+    def test_report_runs_and_names_the_latched_history(self):
+        import contextlib
+        import io as _io
+        from psct_motors.cli import main
+        buffer = _io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(["--simulate", "motor-report", "--motor", "A"])
+        body = buffer.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("follow error max (reg 22)", body)
+        self.assertIn("bus voltage min  (reg 98)", body)
+        self.assertIn("keeps NO error history", body)
+        self.assertIn("projected position (reg 10)", body)
+        self.assertIn("encoder position   (reg 16)", body)
+        self.assertIn("brake output           (179)", body)
+        self.assertIn("modbus slave timeout   (199)", body)

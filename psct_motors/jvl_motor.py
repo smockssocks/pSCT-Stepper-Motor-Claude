@@ -103,6 +103,11 @@ class MotorStatus:
     target_counts: int = 0
     target_mm: float = 0.0
     velocity_raw: int = 0
+    #: Where the profile generator got to (register 10). Reaches the target by
+    #: construction, so it is shown beside the encoder position, never instead.
+    projected_counts: int = 0
+    #: Projected minus encoder (register 20). A small standing value is normal.
+    follow_error: int = 0
     mode: int = 0
     mode_text: str = ""
     error_bits: int = 0
@@ -126,6 +131,8 @@ class MotorStatus:
             "target_counts": self.target_counts,
             "target_mm": self.target_mm,
             "velocity_raw": self.velocity_raw,
+            "projected_counts": self.projected_counts,
+            "follow_error": self.follow_error,
             "mode": self.mode,
             "mode_text": self.mode_text,
             "error_bits": self.error_bits,
@@ -161,6 +168,7 @@ class JVLMotor:
         self._lock = threading.RLock()
         self._log = logger or (lambda msg: None)
         self._connected = False
+        self._warned_no_encoder = False
         #: Set by stop()/abort so a move loop waiting for in-position gives up
         #: instead of waiting out its full timeout on a motor that was halted.
         self._cancel = threading.Event()
@@ -396,7 +404,40 @@ class JVLMotor:
     # ------------------------------------------------------------- position
 
     def get_position_counts(self) -> int:
-        return self.read_register("P_IST")
+        """Where the shaft actually is, from the encoder.
+
+        Register 16 ('Actual Encoder Position'), not register 10 ('Projected
+        Position'). Register 10 is the profile generator's output: it arrives
+        at the requested position by construction, whether or not the shaft
+        followed, so checking arrival against it can never fail. On the real
+        pSCT motor register 10 read 204800 -- exactly the requested position --
+        while the encoder read 204569, a standing following error of 231 counts
+        that register 10 gave no hint of.
+
+        Falls back to the projected position if the encoder register cannot be
+        read, so an open-loop or differently-configured motor still works, but
+        says so once.
+        """
+        try:
+            return self.read_register("P_ENCODER")
+        except ModbusError:
+            if not self._warned_no_encoder:
+                self._warned_no_encoder = True
+                self._log(
+                    f"{self.name}: Actual Encoder Position (register 16) could "
+                    "not be read; falling back to Projected Position (register "
+                    "10). Positions will show where the profile generator got "
+                    "to, not where the shaft is."
+                )
+            return self.read_register("P_PROJECTED")
+
+    def get_projected_position_counts(self) -> int:
+        """The profile generator's output -- what to freeze on a stop."""
+        return self.read_register("P_PROJECTED")
+
+    def get_follow_error(self) -> int:
+        """Projected minus actual, straight from the motor (register 20)."""
+        return self.read_register("FLWERR")
 
     def get_position_mm(self) -> float:
         return self.cfg.counts_to_mm(self.get_position_counts())
@@ -433,29 +474,52 @@ class JVLMotor:
     # ------------------------------------------------------------ motion end
 
     def is_in_position(self, tol_mm: Optional[float] = None) -> bool:
-        """True when the actuator has reached its target and stopped.
+        """True when the move has finished AND the shaft is really there.
 
-        Both halves matter. Position alone can pass momentarily as the axis
-        overshoots through the target; velocity alone can pass before the move
-        has been picked up at all. Requiring both avoids each failure.
+        Three conditions, because each catches a different lie:
+
+        1. The profile generator has reached the target. Register 10 is what
+           says so, and on its own it says nothing about the shaft -- it
+           arrives by construction.
+        2. The following error is inside its window. This is the condition
+           register 10 cannot express: profile finished, shaft 231 counts
+           short. Without it, a stalled axis reports a completed move.
+        3. Velocity has settled, so a sample taken while coasting through the
+           target does not count as arrival.
         """
-        tol = self.cfg.in_position_tol_mm if tol_mm is None else tol_mm
+        tol_counts = self._tolerance_counts(tol_mm)
         try:
-            error_mm = abs(self.get_position_mm() - self.get_target_mm())
+            projected = self.get_projected_position_counts()
+            target = self.get_target_counts()
         except ModbusError:
             return False
-        if error_mm > tol:
+        if abs(projected - target) > tol_counts:
             return False
+
+        try:
+            follow_error = self.get_follow_error()
+            if abs(follow_error) > self.cfg.follow_error_window_counts:
+                return False
+        except ModbusError:
+            pass          # not fatal; the other two conditions still apply
+
         try:
             return abs(self.read_register("V_IST")) <= 1
         except ModbusError:
-            # V_IST is DOCUMENTED rather than CONFIRMED on this hardware. If
-            # it cannot be read, fall back to the position test alone rather
-            # than blocking the move -- but say so, once.
             self._log(
-                f"{self.name}: V_IST unreadable, using position-only settle test."
+                f"{self.name}: Actual Velocity unreadable, using position-only "
+                "settle test."
             )
             return True
+
+    def _tolerance_counts(self, tol_mm: Optional[float] = None) -> float:
+        tol = self.cfg.in_position_tol_mm if tol_mm is None else tol_mm
+        try:
+            return abs(tol * self.cfg.resolved_counts_per_mm)
+        except ValueError:
+            # No usable millimetre scale (a bare motor on a bench). Fall back
+            # to the following-error window, which is already in counts.
+            return float(self.cfg.follow_error_window_counts)
 
     def wait_for_in_position(self, timeout_s: Optional[float] = None,
                              poll_s: float = 0.1,
@@ -511,9 +575,13 @@ class JVLMotor:
         when you genuinely want the drive off.
         """
         self._cancel.set()
-        actual = self.get_position_counts()
-        self.command_position_counts(actual)
-        self._log(f"{self.name}: STOP -- holding at {actual} counts.")
+        # The PROJECTED position, deliberately. Writing the encoder reading
+        # instead would command a small step equal to the standing following
+        # error -- a stop that produces motion. The profile output is where the
+        # generator currently is, so freezing it is what actually stops.
+        frozen = self.get_projected_position_counts()
+        self.command_position_counts(frozen)
+        self._log(f"{self.name}: STOP -- holding at {frozen} counts.")
 
     def stop_quietly(self, reason: str) -> bool:
         """Stop, swallowing any failure. For use on an error path.
@@ -576,6 +644,47 @@ class JVLMotor:
         return self.get_errors()
 
     # ----------------------------------------------------------------- brake
+
+    def read_brake_output_assignment(self) -> Optional[int]:
+        """Which digital output the drive drives the brake from (register 179).
+
+        0 means none is assigned, so nothing software does to the outputs will
+        move a brake. Returns None if the register cannot be read.
+        """
+        try:
+            return self.read_register("BRAKE_OUTPUT")
+        except (ModbusError, MotorFault):
+            return None
+
+    def check_brake_configuration(self) -> str:
+        """Compare the configured brake mode against what the drive is set up
+        to do. Returns "" when they agree, otherwise an explanation."""
+        assignment = self.read_brake_output_assignment()
+        if assignment is None:
+            return ""
+        mode = self.cfg.brake.mode
+        if assignment == 0 and mode == "output":
+            return (
+                f"{self.name}: brake.mode is 'output', but the drive's Brake "
+                "Output (register 179) is 0, meaning no digital output is "
+                "assigned to the brake. Toggling an output will not move a "
+                "brake. Assign one in MacTalk, or set brake.mode to 'none'."
+            )
+        if assignment == 0 and mode == "auto":
+            return (
+                f"{self.name}: brake.mode is 'auto', but the drive's Brake "
+                "Output (register 179) is 0, so the drive is not driving a "
+                "brake from any output. The inferred brake state would be a "
+                "guess with nothing behind it -- set brake.mode to 'none' "
+                "unless the brake is wired some other way."
+            )
+        if assignment != 0 and mode == "none":
+            return (
+                f"{self.name}: the drive has Brake Output (register 179) set to "
+                f"{assignment}, so it IS driving a brake, but brake.mode is "
+                "'none' so this software will not show or control it."
+            )
+        return ""
 
     def get_brake_status(self) -> BrakeStatus:
         cfg = self.cfg.brake
@@ -668,9 +777,11 @@ class JVLMotor:
 
         Nothing is written to the motor: the offset lives in this software's
         config as `zero_counts`. That is deliberate. The alternative, writing
-        P_NEW to renumber the motor's own position, changes state inside the
-        drive that MacTalk and any other client would then disagree with, and
-        P_NEW is only VERIFY-level confidence here anyway.
+        the motor's own position registers, changes state inside the drive
+        that MacTalk and any other client would then disagree with. MacTalk's
+        register list has no documented 'set position' register on this
+        firmware anyway -- register 4, the obvious candidate, is unnamed even
+        by JVL.
         """
         counts = self.get_position_counts()
         self.cfg.zero_counts = counts
@@ -694,6 +805,14 @@ class JVLMotor:
                 velocity = self.read_register("V_IST")
             except ModbusError:
                 velocity = 0
+            try:
+                projected = self.get_projected_position_counts()
+            except ModbusError:
+                projected = counts
+            try:
+                follow_error = self.get_follow_error()
+            except ModbusError:
+                follow_error = 0
             brake = self.get_brake_status()
             position_mm = self.cfg.counts_to_mm(counts)
             target_mm = self.cfg.counts_to_mm(target)
@@ -705,13 +824,18 @@ class JVLMotor:
                 target_counts=target,
                 target_mm=target_mm,
                 velocity_raw=velocity,
+                projected_counts=projected,
+                follow_error=follow_error,
                 mode=mode,
                 mode_text=describe_mode(mode),
                 error_bits=errors,
                 error_text=describe_errors(errors),
                 brake=brake,
-                in_position=(abs(position_mm - target_mm) <= self.cfg.in_position_tol_mm
-                             and abs(velocity) <= 1),
+                in_position=(
+                    abs(projected - target) <= self._tolerance_counts()
+                    and abs(follow_error) <= self.cfg.follow_error_window_counts
+                    and abs(velocity) <= 1
+                ),
             )
         except (ModbusError, MotorFault) as exc:
             return MotorStatus(name=self.name, connected=True, comms_error=str(exc))

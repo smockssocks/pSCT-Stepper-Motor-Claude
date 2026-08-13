@@ -65,7 +65,7 @@ class Fault(str, Enum):
     #: MODE_REG reads back Passive however it is written, which is what a
     #: second client (MacTalk) holding the motor looks like.
     MODE_REVERT = "mode-revert"
-    #: P_IST stops changing, as if the shaft were held or the encoder dead.
+    #: Every position register stops changing, as if the shaft were seized.
     STUCK_POSITION = "stuck-position"
     #: The two 16-bit words come back swapped, which is what a wrong word-order
     #: setting looks like.
@@ -107,7 +107,6 @@ class FaultInjectingTransport:
         self.error_bits_value: int = 1 << 1     # "follow error" by default
         self.delay_s: float = 2.0
         self.failure_rate: float = 0.5
-        self._frozen_position: Optional[int] = None
 
         #: Counts of what the fault actually did, so a drill can assert that
         #: injection was really exercised rather than silently doing nothing.
@@ -117,7 +116,14 @@ class FaultInjectingTransport:
         # Addresses we may need to intercept, resolved once.
         self._addr_err_bits = modbus_address(register("ERR_BITS").number)
         self._addr_mode = modbus_address(register("MODE_REG").number)
-        self._addr_p_ist = modbus_address(register("P_IST").number)
+        #: Every register that reports where the axis is. A stuck axis has to
+        #: freeze all of them: freezing only the encoder while the profile
+        #: generator kept advancing would model a dead encoder instead, and
+        #: freezing only the profile output would not stop the position moving.
+        self._position_addresses = {
+            modbus_address(register(name).number): None
+            for name in ("P_PROJECTED", "P_ENCODER", "P_ENCODER_ABS")
+        }
 
     # ------------------------------------------------------------- arming
 
@@ -133,7 +139,7 @@ class FaultInjectingTransport:
                 if not hasattr(self, key):
                     raise ValueError(f"Unknown fault parameter {key!r}")
                 setattr(self, key, value)
-            self._frozen_position = None
+            self._position_addresses = dict.fromkeys(self._position_addresses)
             self.injected_reads = 0
             self.injected_failures = 0
 
@@ -141,7 +147,7 @@ class FaultInjectingTransport:
         """Disarm. The next transaction behaves normally again."""
         with self._lock:
             self._fault = Fault.NONE
-            self._frozen_position = None
+            self._position_addresses = dict.fromkeys(self._position_addresses)
 
     def __enter__(self) -> "FaultInjectingTransport":
         return self
@@ -235,11 +241,11 @@ class FaultInjectingTransport:
             self.injected_reads += 1
             return self._as_words(0)            # Passive, whatever was written
 
-        if fault is Fault.STUCK_POSITION and address == self._addr_p_ist:
+        if fault is Fault.STUCK_POSITION and address in self._position_addresses:
             self.injected_reads += 1
-            if self._frozen_position is None:
-                self._frozen_position = list(words)
-            return list(self._frozen_position)
+            if self._position_addresses[address] is None:
+                self._position_addresses[address] = list(words)
+            return list(self._position_addresses[address])
 
         return words
 

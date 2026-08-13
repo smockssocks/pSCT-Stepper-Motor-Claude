@@ -13,8 +13,10 @@ driver: the same register doubling, the same word-order handling, the same
 What it models
 --------------
 * The JVL register file, addressed the way the real motor addresses it.
-* Position mode: P_IST ramps towards P_SOLL at a rate set by V_SOLL, and
-  V_IST reports non-zero while it moves.
+* Position mode: the projected position ramps towards the requested
+  position at a rate set by Max Velocity, the encoder follows it with a
+  realistic standing lag, and Actual Velocity reports non-zero while it
+  moves.
 * Passive mode: the axis does not move, and if `gravity_counts_per_s` is set
   it drifts, which is how you check that your brake interlocks actually work.
 * A digital output register, so brake mode "output" can be tested.
@@ -47,11 +49,20 @@ class SimulatedJVLTransport:
     COUNTS_PER_SECOND_PER_VSOLL = 100.0
 
     def __init__(self, name: str = "SIM", word_order: WordOrder = WordOrder.LOW_HIGH,
-                 start_counts: int = 0, firmware_version: int = 1030,
-                 gravity_counts_per_s: float = 0.0):
+                 start_counts: int = 0, firmware_version: int = 540777,
+                 gravity_counts_per_s: float = 0.0,
+                 follow_error_counts: int = 0):
         self.name = name
         self.word_order = word_order
         self.gravity_counts_per_s = gravity_counts_per_s
+        #: Standing lag of the encoder behind the profile output, in counts.
+        #:
+        #: Zero by default, so the simulator is an ideal motor and a test that
+        #: asserts an exact position is testing the thing it means to. Set it
+        #: to model a real one -- the pSCT motor sits at 231 counts when
+        #: settled -- which is how the in-position logic's following-error
+        #: condition gets exercised.
+        self.follow_error_counts = follow_error_counts
         self._lock = threading.RLock()
         self._open = False
         self._offline = False
@@ -64,23 +75,63 @@ class SimulatedJVLTransport:
         # un-status-like values actually observed on the hardware, so anything
         # that tries to interpret them meets the same difficulty here.
         self.registers: Dict[int, int] = {
-            1: firmware_version,      # register 1 -- identity unconfirmed
+            1: firmware_version,      # Program Version
             2: int(MotorMode.PASSIVE),
-            3: int(start_counts),     # P_SOLL
-            4: 0x06080000,            # as observed; not position-shaped
-            5: 1000,                  # V_SOLL
-            6: 100,                   # A_SOLL
-            7: 511,                   # RUN_CURRENT
-            8: 500,                   # STANDBY_TIME
-            9: 128,                   # STANDBY_CURRENT
-            10: int(start_counts),    # P_IST
-            12: 0,                    # V_IST
-            19: 0,                    # outputs (brake lives here in output mode)
-            20: 0,                    # FLWERR
-            25: 0x8A476C14,           # as observed on a passive, idle motor
-            35: 0,                    # ERR_BITS
-            36: 0,                    # WARN_BITS
-            38: -100000,              # P_HOME
+            3: int(start_counts),     # Requested Position
+            5: 1000,                  # Max Velocity
+            6: 100,                   # Acceleration
+            7: 511,                   # Running Current
+            8: 500,                   # Standby Time
+            9: 128,                   # Standby Current
+            10: int(start_counts),    # Projected Position
+            12: 0,                    # Actual Velocity
+            13: 1000,                 # Start Velocity
+            14: 409600,               # Gear Output
+            15: 2048,                 # Gear Input
+            16: int(start_counts),    # Actual Encoder Position
+            18: 0,                    # Digital Inputs
+            19: 0,                    # Digital Outputs
+            20: 0,                    # Follow Error
+            22: 0,                    # Follow Error Max
+            25: 0x8A472C14,           # Status Bits, as observed
+            26: 18,                   # Temperature, low res
+            28: 0,                    # Position Limit Min
+            30: 0,                    # Position Limit Max
+            32: 10000,                # Error Deceleration
+            33: 20000,                # 'In Position' Window
+            34: 2,                    # 'In Position' Retries
+            35: 0,                    # Errors
+            36: 0,                    # Warnings
+            37: 2,                    # Startup Operating Mode
+            38: -100000,              # Homing Position Offset
+            40: -5000,                # Homing Velocity
+            42: 0,                    # Homing Mode
+            46: int(start_counts),    # Abs Encoder Position
+            97: 1794,                 # Bus voltage
+            98: 565,                  # Bus Voltage Min
+            99: 4,                    # Encoder Type
+            110: 100,                 # Position Settling Time
+            121: 6168,                # Modbus Setup
+            125: 255,                 # Digital I/O Setup
+            129: 0,                   # Negative Limit Input
+            130: 0,                   # Positive Limit Input
+            132: 8,                   # Homing Sensor Input
+            137: 0,                   # 'In Position' Output
+            138: 0,                   # 'Error' Output
+            139: 2054,                # Acceptance Voltage
+            151: 153,                 # Motor Type
+            152: 314852,              # Motor Serial Number
+            156: 21,                  # Hardware Revision
+            173: 100000,              # Threshold Stall Detection
+            174: 0,                   # Deceleration
+            177: 10,                  # 'In Target Position' Time
+            179: 0,                   # Brake Output -- unassigned, as observed
+            199: 0,                   # ModBus Slave Timeout
+            200: 0,                   # ModBus Slave Action
+            202: 6674785,             # Ticks
+            217: 337,                 # Actual Torque
+            238: 21,                  # Motor Rotations
+            246: 41687,               # Temperature
         }
 
     # ------------------------------------------------------------- test hooks
@@ -130,7 +181,16 @@ class SimulatedJVLTransport:
             if self.gravity_counts_per_s and not self._brake_output_engaged():
                 self._position -= self.gravity_counts_per_s * dt
 
-        self.registers[10] = int(round(self._position))
+        projected = int(round(self._position))
+        self.registers[10] = projected
+        # The encoder lags the profile by a small standing amount, as the real
+        # motor does (231 counts when settled), so anything that reads the
+        # encoder or the following error meets realistic numbers.
+        encoder = projected - self.follow_error_counts
+        self.registers[16] = encoder
+        self.registers[46] = encoder
+        self.registers[20] = projected - encoder
+        self.registers[22] = max(self.registers.get(22, 0), abs(projected - encoder))
 
     def _brake_output_engaged(self) -> bool:
         """True when output bit 0 is low, i.e. a fail-safe brake is holding."""
@@ -203,7 +263,7 @@ class SimulatedJVLTransport:
                 raise ModbusError(
                     f"{self.name}: JVL register {number} does not exist on this motor"
                 )
-            if number in (1, 10, 12, 20):  # read-only on the real hardware
+            if number in (1, 10, 12, 16, 20, 46, 202, 217):  # read-only
                 raise ModbusError(
                     f"{self.name}: JVL register {number} is read-only"
                 )
