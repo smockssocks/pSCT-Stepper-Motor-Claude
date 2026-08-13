@@ -151,12 +151,12 @@ class JVLMotor:
     """
 
     def __init__(self, cfg: ActuatorConfig, transport: Optional[Transport] = None,
-                 timeout_s: float = 2.0,
+                 timeout_s: float = 2.0, retries: int = 1,
                  logger: Optional[Callable[[str], None]] = None):
         self.cfg = cfg
         self.word_order = WordOrder.parse(cfg.word_order)
         self._transport = transport or PymodbusTransport(
-            cfg.ip, cfg.port, cfg.unit_id, timeout_s=timeout_s
+            cfg.ip, cfg.port, cfg.unit_id, timeout_s=timeout_s, retries=retries
         )
         self._lock = threading.RLock()
         self._log = logger or (lambda msg: None)

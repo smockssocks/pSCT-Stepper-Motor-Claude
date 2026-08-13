@@ -41,11 +41,21 @@ class PymodbusTransport:
     """Modbus TCP over pymodbus, version differences absorbed."""
 
     def __init__(self, host: str, port: int = 502, unit_id: int = 1,
-                 timeout_s: float = 2.0):
+                 timeout_s: float = 2.0, retries: int = 1):
         self.host = host
         self.port = int(port)
         self.unit_id = int(unit_id)
         self.timeout_s = float(timeout_s)
+        #: Attempts per transaction. pymodbus defaults this to 3, which means a
+        #: single failing read can block for timeout x 4 -- eight seconds here,
+        #: twelve with pymodbus's own default timeout. A poll loop that hits
+        #: that does not look like an error, it looks like the application has
+        #: hung, which is exactly the symptom that is hardest to diagnose.
+        #:
+        #: Failing fast and reporting is better: the caller can retry when it
+        #: chooses, and the log shows one clear failure per attempt instead of
+        #: one mysterious multi-second stall.
+        self.retries = max(1, int(retries))
         self._client = None
         self._unit_kw: Optional[str] = None
         self._count_is_kw: bool = True
@@ -64,13 +74,19 @@ class PymodbusTransport:
                     "pymodbus is not installed. Run:  pip install pymodbus"
                 ) from exc
 
-        # `timeout` has been accepted by every 2.x/3.x/4.x constructor, but
-        # guard anyway so a future rename degrades to the default rather than
-        # refusing to connect at all.
-        try:
-            return ModbusTcpClient(self.host, port=self.port, timeout=self.timeout_s)
-        except TypeError:
-            return ModbusTcpClient(self.host, port=self.port)
+        # `timeout` and `retries` have been accepted by every 2.x/3.x/4.x
+        # constructor, but degrade gracefully rather than refusing to connect
+        # if a future version renames one of them.
+        for kwargs in (
+            {"port": self.port, "timeout": self.timeout_s, "retries": self.retries},
+            {"port": self.port, "timeout": self.timeout_s},
+            {"port": self.port},
+        ):
+            try:
+                return ModbusTcpClient(self.host, **kwargs)
+            except TypeError:
+                continue
+        return ModbusTcpClient(self.host)
 
     def _detect_call_convention(self) -> None:
         """Work out this pymodbus version's keyword names, once."""
@@ -141,7 +157,19 @@ class PymodbusTransport:
             return socket_obj is not None
 
     def describe(self) -> str:
-        return f"modbus-tcp://{self.host}:{self.port} (unit {self.unit_id})"
+        return (f"modbus-tcp://{self.host}:{self.port} (unit {self.unit_id}, "
+                f"timeout {self.timeout_s:g}s, {self.retries} attempt"
+                f"{'s' if self.retries != 1 else ''})")
+
+    @property
+    def worst_case_transaction_s(self) -> float:
+        """Longest a single transaction can block before it gives up.
+
+        Worth knowing when choosing a poll interval: if this exceeds the poll
+        period, a failing link makes the poller fall behind rather than report
+        promptly.
+        """
+        return self.timeout_s * self.retries
 
     # --------------------------------------------------------------- access
 

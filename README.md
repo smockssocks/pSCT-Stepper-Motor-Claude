@@ -20,6 +20,7 @@ python -m psct_motors.cli gui --simulate      # try it, no hardware needed
 - [Install](#install)
 - [Quick start](#quick-start)
 - [One motor on the bench](#one-motor-on-the-bench)
+- [When it stops taking commands](#when-it-stops-taking-commands)
 - [Commissioning](#commissioning-do-this-before-trusting-anything)
 - [Using it](#using-it)
 - [LabVIEW](#labview)
@@ -196,6 +197,117 @@ python -m psct_motors.cli demo --simulate --allow-motion  # no hardware at all
 
 `--simulate` runs the whole thing against a fake motor, which is the way to see
 what the output looks like before pointing it at hardware.
+
+---
+
+## When it stops taking commands
+
+A motor that works and then quietly stops responding to position commands is
+the hardest kind of fault to chase, because **the drive almost never refuses
+the command**. It accepts the write, returns success, and does nothing. From
+the application's side these all look identical:
+
+- the drive is Passive, so the output is off
+- an error is latched
+- `V_SOLL` is 0, so it approaches the target at zero speed
+- `RUN_CURRENT` is 0, so there is no torque
+- something else is overwriting `P_SOLL`
+
+Nothing in the Modbus response distinguishes them. Three tools here do.
+
+### The bench GUI
+
+```
+python -m psct_motors.cli motor-gui --motor A
+python -m psct_motors.cli motor-gui --simulate      # no hardware
+```
+
+One motor, in revolutions and counts, no calibration needed. Live position,
+target, mode, `V_SOLL` and brake; a prominent error panel that turns red and
+decodes `ERR_BITS`, with **Clear errors** next to it; move and jog controls;
+a **STOP** that works while anything else is running; and a fault-injection
+panel that arms any of the simulated faults against the live link so you can
+watch the error handling do its job.
+
+Underneath it runs the event log, recording to disk from the moment it opens.
+
+### "Why is it not moving?"
+
+The button in the GUI, or from the command line:
+
+```
+python -m psct_motors.cli diagnose --motor A
+```
+
+Runs every check that could independently stop the motor, in the order they
+occur, and classifies each **BLOCKING / SUSPECT / OK / UNKNOWN** with a
+concrete remedy:
+
+```
+Motion is blocked: Drive is passive (and 1 more)
+
+[BLOCKING] Drive is passive
+           MODE_REG = 0 (Passive). The drive output is off. Writes to P_SOLL
+           succeed and are ignored, which is the single most common reason a
+           motor 'stops taking position commands'.
+           -> Enable Position mode. If it will not stick, something else is
+              writing the register -- MacTalk still being connected is the
+              usual cause.
+[BLOCKING] Velocity limit is zero
+           V_SOLL = 0. The motor will accept a target and approach it at zero
+           speed -- that is, never move. Nothing reports an error.
+```
+
+It is read-only apart from one probe: it writes `P_SOLL` with the position the
+motor is **already at**, which cannot cause motion and is the only way to find
+out whether writes are landing at all. `--no-write-probe` turns even that off.
+
+### The event log
+
+The catch with a stall is that you notice it minutes after it started. The log
+records **changes**, not samples, so a quiet motor produces a quiet file and
+the interesting moment stands out:
+
+```
+python -m psct_motors.cli watch --motor A          # record until Ctrl-C
+python -m psct_motors.cli show-log logs/motor-A-20260813-190000.jsonl
+```
+
+```
+[19:22:14.595] INFO    mode     MODE_REG Passive (drive off) -> Position
+[19:22:15.596] INFO    motion   P_SOLL 0 -> 204800
+[19:22:18.598] ERROR   error    ERR_BITS set: 0x00000002: Follow error ...
+[19:22:22.100] ERROR   mode     MODE_REG Position -> Passive (drive off) --
+                                the drive went passive on its own. Position
+                                commands will be accepted and do nothing.
+[19:22:23.601] ERROR   config   V_SOLL is 0. Position commands will be
+                                accepted and the motor will never move.
+```
+
+It also times every poll and flags any that ran long:
+
+```
+[19:31:02.114] WARNING timing   Poll took 4.02s (threshold 1s). A stalled-but-
+                                successful transaction is what an application
+                                hang usually is.
+```
+
+That line matters because a slow-but-successful transaction leaves **no error
+behind at all** — there is nothing to find afterwards except the timing.
+
+Events go to a JSONL file, line-buffered, so a recording survives the process
+being killed. Leave `watch` running next to whatever you are testing and the
+answer is usually already in the file, above the point where you noticed.
+
+### One fix already made from this
+
+`pymodbus` defaults to `retries=3`, so **one** failed read blocks for
+`timeout x 4` before it reports — eight seconds at our old settings, twelve at
+pymodbus's own defaults. A poll loop that hits that does not look like an
+error, it looks like the application has frozen. Attempts are now capped at 1
+by default (`modbus_retries` in the config), so failures are reported promptly
+instead of stalling. If the previous script hung rather than erroring, this is
+a strong candidate for why.
 
 ---
 
@@ -532,8 +644,11 @@ psct_motors/
   config.py       the configuration model, loaded from one JSON file
   simulator.py    a fake motor at the transport boundary
   faults.py       fault injection over a live link, for testing error handling
+  eventlog.py     timestamped change recorder, for explaining a later hang
+  diagnostics.py  "why is it not moving" -- ordered checks with remedies
   demo.py         single-motor exerciser and fault drills
-  gui.py          desktop application
+  gui.py          three-motor focal-plane application
+  single_gui.py   one-motor bench GUI: errors, fault injection, live log
   cli.py          commissioning, calibration and scripted moves
   server.py       JSON-over-TCP bridge
   labview_api.py  flat function API for LabVIEW's Python node
@@ -559,7 +674,7 @@ construction and adapts, so this works across pymodbus 2.x, 3.x and 4.x.
 python -m unittest discover -s tests -v
 ```
 
-183 tests, no hardware needed. The GUI tests skip automatically without a
+233 tests, no hardware needed. The GUI tests skip automatically without a
 display; to run them headlessly:
 
 ```
@@ -587,3 +702,10 @@ Coverage worth knowing about:
   including the register-1 reading that broke the previous heuristic.
 - An inconclusive word-order probe does not block connecting.
 - `reconnect()` builds a fresh client, so a link that comes back is usable.
+- Every cause of a silent stall -- passive drive, zero V_SOLL/A_SOLL/
+  RUN_CURRENT, latched errors, engaged brake, an overwritten target -- is set
+  up in turn and the diagnosis must name it.
+- The diagnosis write-probe commands only the current position, and is proven
+  unable to move the shaft.
+- The watcher logs changes rather than samples, and flags slow transactions.
+- A recording survives without being closed, and corrupt lines are skipped.

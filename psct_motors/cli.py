@@ -689,6 +689,89 @@ def cmd_demo(args) -> int:
         motor.disconnect()
 
 
+def cmd_motor_gui(args) -> int:
+    """Bench GUI for a single motor."""
+    from .single_gui import main as single_main
+    return single_main(motor_name=args.motor, config_path=args.config,
+                       simulate=args.simulate, log_path=args.log)
+
+
+def cmd_diagnose(args) -> int:
+    """Answer 'why is this motor not taking position commands?'"""
+    from .demo import build_motor
+    from .diagnostics import diagnose
+
+    motor = build_motor(args.config, args.motor, args.simulate)
+    try:
+        motor.connect(verify_word_order=False)
+    except (ModbusError, MotorFault) as exc:
+        out(f"Could not connect to motor {args.motor}: {exc}")
+        return 1
+    try:
+        result = diagnose(motor, probe_writes=not args.no_write_probe)
+        rule(f"Diagnosis for motor {args.motor}")
+        out(result.as_text())
+        out("")
+        if result.blockers:
+            out(f"{len(result.blockers)} thing(s) would stop this motor moving.")
+            return 1
+        out("Nothing found that would stop this motor moving.")
+        return 0
+    finally:
+        motor.disconnect()
+
+
+def cmd_watch(args) -> int:
+    """Record what the motor does, so a later hang can be explained."""
+    from .demo import build_motor
+    from .eventlog import EventLog, MotorWatcher, default_log_path
+
+    path = args.log or default_log_path(args.motor)
+    motor = build_motor(args.config, args.motor, args.simulate)
+    try:
+        motor.connect(verify_word_order=False)
+    except (ModbusError, MotorFault) as exc:
+        out(f"Could not connect to motor {args.motor}: {exc}")
+        return 1
+
+    log = EventLog(path=path, on_event=lambda e: out(e.as_line()))
+    watcher = MotorWatcher(motor, log, interval_s=args.interval,
+                           slow_transaction_s=args.slow_threshold)
+    out(f"Recording motor {args.motor} to {path}")
+    out("Only changes are logged, not every poll. Press Ctrl-C to stop.")
+    out("")
+    watcher.start()
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        out("")
+    finally:
+        watcher.stop()
+        log.close()
+        motor.disconnect()
+        out(f"Recording saved to {path}")
+    return 0
+
+
+def cmd_show_log(args) -> int:
+    """Replay a recorded log, newest last."""
+    from .eventlog import read_log
+    events = read_log(args.file)
+    if not events:
+        out(f"No events in {args.file}")
+        return 1
+    from .eventlog import _SEVERITY_ORDER
+    floor = _SEVERITY_ORDER.get(args.severity, 0)
+    shown = [e for e in events if _SEVERITY_ORDER.get(e.severity, 0) >= floor]
+    rule(f"{args.file}  ({len(shown)} of {len(events)} events)")
+    for event in shown:
+        out(event.as_line())
+        for key, value in event.data.items():
+            out(f"{'':>12}{key} = {value}")
+    return 0
+
+
 def cmd_gui(args) -> int:
     from .gui import main as gui_main
     return gui_main(config_path=args.config, simulate=args.simulate)
@@ -723,8 +806,12 @@ commissioning order
 
 one motor on a bench
 --------------------
+  motor-gui            live GUI: state, errors, fault injection, event log
   demo                 exercise a single motor and deliberately provoke
                        faults, to see the error handling work
+  diagnose             explain why a motor is not taking position commands
+  watch                record changes to a log file, to explain a later hang
+  show-log             replay a recording
 """,
     )
     parser.add_argument("--config", help="path to the configuration JSON")
@@ -835,7 +922,47 @@ one motor on a bench
     p.add_argument("--list", action="store_true", help="list the drills and exit")
     p.set_defaults(func=cmd_demo)
 
-    p = sub.add_parser("gui", help="launch the desktop application")
+    p = sub.add_parser(
+        "motor-gui",
+        help="bench GUI for ONE motor: live state, errors, fault injection, log",
+        description=(
+            "Single-motor bench GUI. Works in revolutions, needs no "
+            "calibration, records an event log to disk as it runs."
+        ),
+    )
+    p.add_argument("--motor", default="A", help="actuator name (default A)")
+    p.add_argument("--log", help="path for the JSONL event log")
+    p.set_defaults(func=cmd_motor_gui)
+
+    p = sub.add_parser(
+        "diagnose",
+        help="explain why a motor is not taking position commands",
+    )
+    p.add_argument("--motor", default="A")
+    p.add_argument("--no-write-probe", action="store_true",
+                   help="skip the P_SOLL readback probe (which commands the "
+                        "position the motor is already at, so cannot move it)")
+    p.set_defaults(func=cmd_diagnose)
+
+    p = sub.add_parser(
+        "watch",
+        help="record mode, error, target and timing changes to a log file",
+    )
+    p.add_argument("--motor", default="A")
+    p.add_argument("--log", help="path for the JSONL event log")
+    p.add_argument("--interval", type=float, default=0.5,
+                   help="seconds between polls (default 0.5)")
+    p.add_argument("--slow-threshold", type=float, default=1.0,
+                   help="log any poll slower than this many seconds (default 1)")
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("show-log", help="replay a recorded event log")
+    p.add_argument("file")
+    p.add_argument("--severity", default="DEBUG",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.set_defaults(func=cmd_show_log)
+
+    p = sub.add_parser("gui", help="launch the three-motor focal-plane application")
     p.set_defaults(func=cmd_gui)
 
     p = sub.add_parser("server", help="run the JSON-over-TCP bridge (for LabVIEW)")

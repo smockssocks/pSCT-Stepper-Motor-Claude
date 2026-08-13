@@ -282,6 +282,12 @@ class PlatformConfig:
     poll_interval_s: float = 0.5
     #: Modbus socket timeout, seconds.
     modbus_timeout_s: float = 2.0
+    #: Attempts per Modbus transaction. Keep this at 1 unless you have a
+    #: specific reason: pymodbus defaults to 3, which turns one failed read
+    #: into a multi-second stall that presents as the application hanging
+    #: rather than as an error. Worst-case block is
+    #: modbus_timeout_s x modbus_retries.
+    modbus_retries: int = 1
 
     #: If true, connecting checks each motor's word order against PROG_VERSION
     #: and complains rather than silently reading garbage.

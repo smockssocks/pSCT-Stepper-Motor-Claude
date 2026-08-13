@@ -108,7 +108,8 @@ class FocalPlanePlatform:
             ]
         else:
             self.motors = [
-                JVLMotor(a, timeout_s=self.cfg.modbus_timeout_s, logger=self._log)
+                JVLMotor(a, timeout_s=self.cfg.modbus_timeout_s,
+                         retries=self.cfg.modbus_retries, logger=self._log)
                 for a in self.cfg.actuators
             ]
 
