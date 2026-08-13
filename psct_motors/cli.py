@@ -617,6 +617,78 @@ def cmd_clear_errors(args) -> int:
         platform.disconnect()
 
 
+def cmd_demo(args) -> int:
+    """Exercise ONE motor: capabilities, then deliberate faults.
+
+    Deliberately does not use the platform or the kinematics -- it works on a
+    single motor in counts and revolutions, so it is useful on a bench with one
+    motor and no calibration done.
+    """
+    from .demo import DemoRunner, all_drills, build_motor, select_drills
+
+    if args.list:
+        rule("Available drills")
+        out(f"{'name':<22}{'category':<12}{'flags':<22}summary")
+        for drill in all_drills():
+            flags = []
+            if drill.needs_motion:
+                flags.append("moves")
+            if drill.needs_operator:
+                flags.append("needs you")
+            out(f"{drill.name:<22}{drill.category:<12}{','.join(flags):<22}"
+                f"{drill.summary}")
+        out("")
+        out("Run a subset with:  --only identity,fault-comms")
+        out("Or a whole category with:  --category fault")
+        return 0
+
+    try:
+        drills = select_drills(
+            only=[n.strip() for n in args.only.split(",")] if args.only else None,
+            categories=[c.strip() for c in args.category.split(",")] if args.category else None,
+            include_operator=not args.no_operator,
+        )
+    except ValueError as exc:
+        out(str(exc))
+        return 2
+    if not drills:
+        out("No drills matched that selection. Use --list to see what exists.")
+        return 2
+
+    motor = build_motor(args.config, args.motor, args.simulate)
+    try:
+        motor.connect(verify_word_order=False)
+    except (ModbusError, MotorFault) as exc:
+        out(f"Could not connect to motor {args.motor}: {exc}")
+        out("")
+        out("Check the IP address for this actuator in the config, that the motor")
+        out("is powered, and that MacTalk is not holding the connection.")
+        out("To try the demo with no hardware at all, add --simulate.")
+        return 1
+
+    def ask(prompt: str) -> bool:
+        return confirm(prompt, args.yes)
+
+    runner = DemoRunner(motor, out=out, ask=ask,
+                        allow_motion=args.allow_motion,
+                        range_revs=args.range_revs)
+    try:
+        return runner.run(drills)
+    except KeyboardInterrupt:
+        out("")
+        out("Interrupted. Stopping the motor and leaving it passive.")
+        try:
+            runner.injector.clear()
+            motor.stop()
+            motor.passivate()
+        except (ModbusError, MotorFault) as exc:
+            out(f"Could not stop cleanly: {exc}")
+            out("If the shaft is still turning, remove drive power.")
+        return 130
+    finally:
+        motor.disconnect()
+
+
 def cmd_gui(args) -> int:
     from .gui import main as gui_main
     return gui_main(config_path=args.config, simulate=args.simulate)
@@ -648,6 +720,11 @@ commissioning order
   probe-brake          confirm brake control and polarity      (per motor)
   set-zero             define the reference orientation
   status / move        normal operation
+
+one motor on a bench
+--------------------
+  demo                 exercise a single motor and deliberately provoke
+                       faults, to see the error handling work
 """,
     )
     parser.add_argument("--config", help="path to the configuration JSON")
@@ -734,6 +811,29 @@ commissioning order
 
     p = sub.add_parser("clear-errors", help="best-effort error clear on all motors")
     p.set_defaults(func=cmd_clear_errors)
+
+    p = sub.add_parser(
+        "demo",
+        help="exercise ONE motor: capabilities and deliberate faults",
+        description=(
+            "Single-motor demo and fault drills. Works on a bench with one "
+            "motor, in counts and revolutions, with no calibration needed. "
+            "Nothing turns the shaft unless you pass --allow-motion."
+        ),
+    )
+    p.add_argument("--motor", default="A", help="actuator name from the config (default A)")
+    p.add_argument("--allow-motion", action="store_true",
+                   help="permit drills that turn the shaft")
+    p.add_argument("--range-revs", type=float, default=2.0,
+                   help="how far the shaft may turn either way, in revolutions "
+                        "(default 2)")
+    p.add_argument("--only", help="comma-separated drill names to run")
+    p.add_argument("--category", help="comma-separated categories: capability, "
+                                      "fault, real-fault")
+    p.add_argument("--no-operator", action="store_true",
+                   help="skip drills that ask you to unplug things")
+    p.add_argument("--list", action="store_true", help="list the drills and exit")
+    p.set_defaults(func=cmd_demo)
 
     p = sub.add_parser("gui", help="launch the desktop application")
     p.set_defaults(func=cmd_gui)

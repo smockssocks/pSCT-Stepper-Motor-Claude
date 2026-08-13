@@ -333,9 +333,11 @@ class FocalPlanePlatform:
             motor.command_position_mm(target)
             self._log(f"{motor.name}: single-axis move to {target:.4f} mm.")
             if wait and not motor.wait_for_in_position():
+                # wait_for_in_position has already halted this axis.
                 raise PlatformError(
                     f"{motor.name} did not reach {target:.4f} mm within "
-                    f"{motor.cfg.move_timeout_s:.0f} s."
+                    f"{motor.cfg.move_timeout_s:.0f} s, and has been halted where "
+                    "it got to."
                 )
             return motor.read_status()
 
@@ -417,8 +419,17 @@ class FocalPlanePlatform:
                     )
                 errors = motor.get_errors()
                 if errors:
+                    # One axis faulting does not stop the other two, and two
+                    # actuators continuing to a target the third will never
+                    # reach is precisely how the plate gets racked about its
+                    # ball joints. Halt everything, then report.
+                    text = motor.error_text()
+                    self._halt_all_quietly(f"{motor.name} faulted mid-move")
                     raise PlatformError(
-                        f"{motor.name} faulted during the move: {motor.error_text()}"
+                        f"{motor.name} faulted during the move: {text}. All three "
+                        "actuators have been halted where they were, so the focal "
+                        "plane is at neither the old orientation nor the requested "
+                        "one -- read the current orientation before continuing."
                     )
                 if not motor.is_in_position():
                     still_pending.append(motor)
@@ -427,10 +438,20 @@ class FocalPlanePlatform:
             pending = still_pending
             time.sleep(0.1)
         if pending:
+            names = ", ".join(m.name for m in pending)
+            self._halt_all_quietly(f"{names} did not reach position in time")
             raise PlatformError(
-                "Timed out waiting for actuator(s) "
-                f"{', '.join(m.name for m in pending)} to reach position."
+                f"Timed out waiting for actuator(s) {names} to reach position. "
+                "All three actuators have been halted. Check for a mechanical "
+                "obstruction, a brake that did not release, or a velocity set "
+                "so low the move could not finish inside the timeout."
             )
+
+    def _halt_all_quietly(self, reason: str) -> None:
+        """Stop every axis on an error path, without masking the original fault."""
+        self._abort.set()
+        for motor in self.motors:
+            motor.stop_quietly(reason)
 
     # -------------------------------------------------------------- stopping
 

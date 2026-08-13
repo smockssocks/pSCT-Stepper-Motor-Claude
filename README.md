@@ -19,6 +19,7 @@ python -m psct_motors.cli gui --simulate      # try it, no hardware needed
 - [The mechanism](#the-mechanism)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [One motor on the bench](#one-motor-on-the-bench)
 - [Commissioning](#commissioning-do-this-before-trusting-anything)
 - [Using it](#using-it)
 - [LabVIEW](#labview)
@@ -116,6 +117,85 @@ python -m psct_motors.cli status
 
 Every command takes `--simulate`. Get comfortable there first; nothing can move
 until you drop the flag.
+
+---
+
+## One motor on the bench
+
+You do not need all three motors to make progress. The demo exercises **one**
+motor on its own — no kinematics, no platform, no calibration — and then breaks
+things on purpose so you can watch the error handling work.
+
+```
+python -m psct_motors.cli demo --list                    # what it will do
+python -m psct_motors.cli demo --motor A                 # read-only drills
+python -m psct_motors.cli demo --motor A --allow-motion  # include moving ones
+```
+
+It reports in **counts, revolutions and degrees of motor shaft** — never
+millimetres. On a bare shaft there is nothing to convert millimetres to, so
+inventing a number would be worse than leaving it out. That is also why this
+works before you have measured anything.
+
+### What it runs
+
+**Capability drills** — firmware and word order, a full register dump with
+confidence markers, position noise floor, mode changes, a quarter-turn move,
+four-cycle repeatability, a timed speed comparison, STOP mid-move, an
+out-of-range refusal, and the brake with its interlock.
+
+**Fault drills** — a nonexistent register, comms loss, a drive fault injected
+*during* a move, another client overriding the mode, an axis that will not
+move, swapped register words, and a link losing packets at random.
+
+**Real-fault drills** — these ask you to physically unplug the Ethernet cable,
+or to open MacTalk alongside this software. Skip them with `--no-operator`, or
+decline individually at the prompt.
+
+Each drill prints what it is about to do, what the software is *supposed* to
+do, what actually happened, and what to do if you meet it for real on the
+telescope. It exits non-zero if anything failed.
+
+### How the faults are made
+
+Most are injected: `faults.py` wraps the live connection and tampers with the
+register traffic on the way past, so the motor *appears* to have faulted and
+everything above reacts exactly as it would in the field.
+
+Be clear about what that proves. It proves your **handling** is right — that a
+fault is noticed, the move is abandoned, the axis is halted, the operator is
+told something useful, and recovery works. That is the part with bugs in it.
+It does **not** prove the motor sets the bit you think it sets; only the
+hardware can tell you that, which is why the bit meanings are marked VERIFY and
+raw hex is always printed next to the decoded text.
+
+Injection only ever tampers with values read back and with whether a
+transaction succeeds. It never invents a write, never changes a target, and
+never enables a drive.
+
+### Safety on the bench
+
+- Nothing turns the shaft without `--allow-motion` **and** a typed confirmation.
+- Every motion drill stays inside a band around wherever the shaft starts,
+  `--range-revs` wide (2 revolutions by default), fixed once at the start.
+- Drills that interrupt a move wait on *observed progress*, not a fixed delay,
+  so they work whatever speed your motor runs at — and say so plainly if the
+  move finished too quickly to interrupt, rather than passing without having
+  tested anything.
+- The shaft is returned to where it started and left passive at the end,
+  including after a failure or Ctrl-C.
+
+### Running a subset
+
+```
+python -m psct_motors.cli demo --category fault           # just the fault drills
+python -m psct_motors.cli demo --only identity,fault-comms
+python -m psct_motors.cli demo --no-operator              # nothing to unplug
+python -m psct_motors.cli demo --simulate --allow-motion  # no hardware at all
+```
+
+`--simulate` runs the whole thing against a fake motor, which is the way to see
+what the output looks like before pointing it at hardware.
 
 ---
 
@@ -321,6 +401,20 @@ All problems are reported at once, and if there is any problem, **nothing is
 commanded**. A partially executed combined move is exactly the state that racks
 the ball joints.
 
+### A fault stops every axis, not just the faulty one
+
+When one motor faults or times out mid-move, the other two are halted as well
+before the error is reported. Two actuators continuing to a target the third
+will never reach is precisely how the plate gets racked about its ball joints.
+
+Halting means commanding each motor to hold the position it reports, so the
+drives stay enabled and keep holding. There is one case this cannot cover
+honestly: if an *encoder* dies while its shaft still turns, the reported
+position is stale and the halt commands that axis back to it. Nothing readable
+over Modbus distinguishes that from a genuinely seized axis, so the demo says
+so explicitly rather than pretending otherwise, and a frozen position with no
+error bits is worth a physical look before you command it again.
+
 ### The three axes arrive together
 
 Velocities are scaled by distance so all three finish at the same moment.
@@ -409,6 +503,8 @@ psct_motors/
   platform.py     all three driven together, with limits and interlocks
   config.py       the configuration model, loaded from one JSON file
   simulator.py    a fake motor at the transport boundary
+  faults.py       fault injection over a live link, for testing error handling
+  demo.py         single-motor exerciser and fault drills
   gui.py          desktop application
   cli.py          commissioning, calibration and scripted moves
   server.py       JSON-over-TCP bridge
@@ -435,7 +531,7 @@ construction and adapts, so this works across pymodbus 2.x, 3.x and 4.x.
 python -m unittest discover -s tests -v
 ```
 
-120 tests, no hardware needed. The GUI tests skip automatically without a
+165 tests, no hardware needed. The GUI tests skip automatically without a
 display; to run them headlessly:
 
 ```
@@ -454,3 +550,8 @@ Coverage worth knowing about:
 - Brake polarity, both ways round, plus the passive-drive interlock.
 - Losing a motor mid-poll withholds the orientation instead of guessing it.
 - Malformed JSON on the bridge gets an error reply and the connection survives.
+- A fault detected mid-move halts **all three** axes, not just the faulting one.
+- Injected fault values are encoded in the motor's own word order, so a drill
+  exercises the error bit it claims to.
+- The demo fails, rather than passing, when the software or config is actually
+  wrong -- e.g. a broken word order makes the `identity` drill FAIL.

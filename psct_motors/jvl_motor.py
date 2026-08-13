@@ -350,12 +350,19 @@ class JVLMotor:
 
     def wait_for_in_position(self, timeout_s: Optional[float] = None,
                              poll_s: float = 0.1,
-                             stable_polls: int = 3) -> bool:
+                             stable_polls: int = 3,
+                             halt_on_failure: bool = True) -> bool:
         """Block until the move finishes. Returns False on timeout or cancel.
 
         `stable_polls` consecutive in-position reads are required, so a single
         sample taken as the axis coasts through its target does not count as
         arrival.
+
+        With `halt_on_failure` (the default), a fault or a timeout halts this
+        axis before reporting. Noticing that something has gone wrong and then
+        leaving the drive commanded to a target it is not reaching is the worst
+        of both worlds: the operator has been told the move failed while the
+        motor is still trying to complete it.
         """
         timeout = self.cfg.move_timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout
@@ -365,6 +372,8 @@ class JVLMotor:
                 return False
             errors = self.get_errors()
             if errors:
+                if halt_on_failure:
+                    self.stop_quietly("an error was reported during the move")
                 raise MotorFault(
                     f"{self.name}: motor reported an error during the move -- "
                     f"{describe_errors(errors)}"
@@ -376,6 +385,8 @@ class JVLMotor:
             else:
                 stable = 0
             time.sleep(poll_s)
+        if halt_on_failure:
+            self.stop_quietly(f"the move did not complete within {timeout:.0f} s")
         return False
 
     # ------------------------------------------------------------- stopping
@@ -394,6 +405,26 @@ class JVLMotor:
         actual = self.get_position_counts()
         self.command_position_counts(actual)
         self._log(f"{self.name}: STOP -- holding at {actual} counts.")
+
+    def stop_quietly(self, reason: str) -> bool:
+        """Stop, swallowing any failure. For use on an error path.
+
+        The situation this exists for is a fault that is itself a comms
+        failure: the stop will not get through either, and letting that second
+        failure replace the first would hide the thing that actually went
+        wrong. Returns whether the stop was delivered.
+        """
+        try:
+            self.stop()
+            self._log(f"{self.name}: halted because {reason}.")
+            return True
+        except (ModbusError, MotorFault) as exc:
+            self._log(
+                f"{self.name}: tried to halt because {reason}, but the stop "
+                f"could not be delivered either ({exc}). If the motor is still "
+                "powered and moving, use MacTalk or remove drive power."
+            )
+            return False
 
     def passivate(self, engage_brake_first: bool = True) -> None:
         """Drive off. Engages the brake first when the brake is controllable."""
