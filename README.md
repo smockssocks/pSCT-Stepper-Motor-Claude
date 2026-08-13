@@ -211,11 +211,24 @@ otherwise silent.
 python -m psct_motors.cli detect
 ```
 
-Reads `PROG_VERSION` from each motor both ways. The wrong word order turns a
-firmware version into a huge number, which is unmistakable. If a motor
-mismatches, fix `word_order` in the config — until you do, every position from
-that motor is wrong. Connecting checks this automatically and refuses to
-proceed on a mismatch.
+Several JVL registers hold small, non-negative configuration values — currents,
+ramp times, the velocity limit. Any value below 65536 has a high word of zero,
+so whichever of the two Modbus words comes back consistently zero *is* the high
+word. That fixes the order from the structure of the data rather than from a
+guess about what any value should be, and several registers vote so that one
+that happens to be zero or unexpectedly large cannot mislead it.
+
+If a motor contradicts the config, fix `word_order` — until you do, every
+position from that motor is wrong, and connecting refuses to proceed. An
+*inconclusive* probe is reported and allowed through: a diagnostic that cannot
+reach a verdict must not become the reason you cannot connect.
+
+> An earlier version of this compared register 1 against a "looks like a
+> firmware version" range. On the real pSCT motor register 1 reads 540777,
+> which needs 20 bits and so is not the 16-bit version field JVL's overview
+> describes — probably that register is something else on this firmware. The
+> check then declared it could not determine the word order on a motor whose
+> word order was provably correct.
 
 ### 2. Check the register map
 
@@ -474,13 +487,28 @@ two-word access.
 Documented: `PROG_VERSION` (1), `A_SOLL` (6), `RUN_CURRENT` (7),
 `STANDBY_TIME` (8), `STANDBY_CURRENT` (9), `V_IST` (12).
 
+**Contradicted by the hardware** — these read values on the real pSCT motor
+that do not match what the register name implies, so treat the names as wrong
+until MacTalk says otherwise:
+
+| register | reads | why that is odd |
+|---|---|---|
+| 1 `PROG_VERSION` | 540777 | needs 20 bits; not a 16-bit version field |
+| 4 `P_NEW` | 0x06080000 | not position-shaped while `P_IST` is 600 |
+| 25 `STATUSBITS` | 0x8A476C14 | on a *passive, stationary* motor |
+
+Nothing in this package acts on any of the three. Register 25 carries no bit
+names at all now: a guessed layout decoded that value as "Decelerating, Motion
+running" for a motor that was doing nothing, and a confident wrong answer is
+worse than no answer.
+
 **Needs verification before you rely on it:**
 
 - `P_NEW` (4), `FLWERR` (20), `STATUSBITS` (25), `WARN_BITS` (36), `P_HOME` (38).
-- The **individual bit meanings** in `ERROR_BITS` and `STATUS_BITS`. The
-  registers themselves are right — `ERR_BITS` of 0 means healthy — but the
-  bit-to-text mapping is unchecked. Raw hex is always shown next to the decoded
-  text so a mis-mapped bit is still visible.
+- The **individual bit meanings** in `ERROR_BITS`. The register itself is
+  right — `ERR_BITS` of 0 means healthy on the real motor — but the bit-to-text
+  mapping is unchecked, so every decoded error is printed with raw hex first
+  and an explicit `[bit names UNVERIFIED]` marker.
 - The **brake output register** (19 by default) and its bit and polarity. This
   is an installation detail; `probe-brake` is how you confirm it.
 - `screw_lead_mm` and `gear_ratio`. Superseded by `calibrate`.
@@ -531,7 +559,7 @@ construction and adapts, so this works across pymodbus 2.x, 3.x and 4.x.
 python -m unittest discover -s tests -v
 ```
 
-165 tests, no hardware needed. The GUI tests skip automatically without a
+183 tests, no hardware needed. The GUI tests skip automatically without a
 display; to run them headlessly:
 
 ```
@@ -555,3 +583,7 @@ Coverage worth knowing about:
   exercises the error bit it claims to.
 - The demo fails, rather than passing, when the software or config is actually
   wrong -- e.g. a broken word order makes the `identity` drill FAIL.
+- Word-order detection is pinned against the real motor's register values,
+  including the register-1 reading that broke the previous heuristic.
+- An inconclusive word-order probe does not block connecting.
+- `reconnect()` builds a fresh client, so a link that comes back is usable.

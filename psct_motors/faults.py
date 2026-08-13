@@ -160,6 +160,14 @@ class FaultInjectingTransport:
     def close(self) -> None:
         self.inner.close()
 
+    def reconnect(self) -> bool:
+        # A reconnect while a comms fault is armed must still fail, or the
+        # drill would appear to recover from a fault that is still injected.
+        if self._fault in (Fault.COMMS_DROP, Fault.COMMS_TIMEOUT):
+            self.injected_failures += 1
+            return False
+        return self.inner.reconnect()
+
     def is_open(self) -> bool:
         if self._fault is Fault.COMMS_DROP:
             return False

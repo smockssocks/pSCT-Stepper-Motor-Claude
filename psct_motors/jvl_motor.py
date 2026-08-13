@@ -29,6 +29,37 @@ class MotorFault(RuntimeError):
     """The motor is reachable but refused to do what was asked."""
 
 
+#: Registers used to determine the word order. Each holds a small,
+#: non-negative configuration value on a healthy motor, so its high word is
+#: zero -- which is what makes the two Modbus words distinguishable. Values
+#: observed on the pSCT motor: V_SOLL 10000, A_SOLL 100, RUN_CURRENT 511,
+#: STANDBY_TIME 500, STANDBY_CURRENT 128.
+#:
+#: Deliberately excludes position registers (which are legitimately large or
+#: negative) and register 4, which reads 0x06080000 on the real motor and
+#: would vote the wrong way.
+WORD_ORDER_PROBE_REGISTERS = (
+    "V_SOLL", "A_SOLL", "RUN_CURRENT", "STANDBY_TIME", "STANDBY_CURRENT",
+)
+
+
+@dataclass(frozen=True)
+class WordOrderProbe:
+    """What the word-order probe concluded, and what it saw.
+
+    `detected` is None when the probe could not reach a verdict, which is a
+    different thing from finding a mismatch and must not be treated as one.
+    """
+
+    detected: Optional[WordOrder]
+    evidence: List[str]
+    reason: str = ""
+
+    @property
+    def conclusive(self) -> bool:
+        return self.detected is not None
+
+
 # --------------------------------------------------------------------------
 # Brake
 # --------------------------------------------------------------------------
@@ -167,6 +198,24 @@ class JVLMotor:
             self._connected = False
             self._transport.close()
 
+    def reconnect(self, verify_word_order: bool = False) -> None:
+        """Rebuild the connection after the link has failed.
+
+        Not the same as calling connect() again. When a TCP connection is
+        reset -- a pulled cable, a power-cycled switch, the motor rebooting --
+        the client is left holding a socket it still believes is usable.
+        connect() on it then succeeds while every transaction that follows
+        fails, so a retry loop spins until it gives up on a link that has
+        actually come back. This tears the connection down first.
+        """
+        with self._lock:
+            self._connected = False
+            self._transport.reconnect()
+            self._connected = True
+            self._cancel.clear()
+        if verify_word_order:
+            self._check_word_order()
+
     def __enter__(self) -> "JVLMotor":
         self.connect()
         return self
@@ -209,46 +258,106 @@ class JVLMotor:
 
     # ------------------------------------------------------------ word order
 
-    def detect_word_order(self) -> WordOrder:
+    def probe_word_order(self) -> WordOrderProbe:
         """Work out the word order empirically, without moving the motor.
 
-        PROG_VERSION is a small positive firmware version number. Read with
-        the wrong word order it comes back as a huge value, because what
-        should be the zero high word lands in the low half. Whichever order
-        yields a plausible version number is the right one.
+        How it works
+        ------------
+        Several JVL registers hold small, non-negative configuration values --
+        currents, ramp times, velocity limits. Any value below 65536 has a
+        high word of zero, so of the two 16-bit Modbus words that come back,
+        the one that is consistently zero *is* the high word. That fixes the
+        order, and it does so from the structure of the data rather than from
+        a guess about what any particular value should be.
+
+        Several registers are used and their votes compared, because any one
+        of them might legitimately be zero (an idle MODE_REG) or unexpectedly
+        large, and either would make a single-register test useless.
+
+        Why not just read the firmware version
+        --------------------------------------
+        An earlier version of this compared a firmware-version read against a
+        "looks like a version number" range. On the real pSCT motor register 1
+        reads 540777, which needs 20 bits and so cannot be the 16-bit version
+        field it was assumed to be -- probably that register is not
+        PROG_VERSION on this firmware at all. The check then reported it could
+        not determine the word order on a motor whose word order was provably
+        correct. Structure beats plausibility.
+
+        Returns a probe result rather than raising, because "I could not tell"
+        and "the config is wrong" call for very different responses and the
+        caller has to be able to tell them apart.
         """
-        number = register("PROG_VERSION").number
-        with self._lock:
-            words = self._transport.read_holding(modbus_address(number), 2)
-        candidates = {}
-        for order in (WordOrder.LOW_HIGH, WordOrder.HIGH_LOW):
-            candidates[order] = words_to_int32(words, order, signed=False)
-        plausible = [o for o, v in candidates.items() if 0 < v < 100000]
-        if len(plausible) == 1:
-            return plausible[0]
-        if not plausible:
-            raise MotorFault(
-                f"{self.name}: could not detect word order. PROG_VERSION read as "
-                f"{candidates} in both orders, neither of which looks like a "
-                "firmware version. Check that the register numbers and the unit "
-                "id are right for this motor."
+        evidence: List[str] = []
+        votes = {WordOrder.LOW_HIGH: 0, WordOrder.HIGH_LOW: 0}
+
+        for name in WORD_ORDER_PROBE_REGISTERS:
+            try:
+                number = register(name).number
+                with self._lock:
+                    words = self._transport.read_holding(modbus_address(number), 2)
+            except (ModbusError, MotorFault, KeyError):
+                continue                       # absent on this firmware; skip
+            first, second = words[0], words[1]
+            if second == 0 and first != 0:
+                votes[WordOrder.LOW_HIGH] += 1
+                evidence.append(f"{name}: [0x{first:04X}, 0x{second:04X}] "
+                                "-- second word zero, so it is the high word")
+            elif first == 0 and second != 0:
+                votes[WordOrder.HIGH_LOW] += 1
+                evidence.append(f"{name}: [0x{first:04X}, 0x{second:04X}] "
+                                "-- first word zero, so it is the high word")
+            # Both zero, or both non-zero: carries no information either way.
+
+        low, high = votes[WordOrder.LOW_HIGH], votes[WordOrder.HIGH_LOW]
+        if low and high:
+            return WordOrderProbe(
+                None, evidence,
+                f"Contradictory evidence ({low} for Low-High, {high} for "
+                "High-Low). That usually means one of the probe registers is "
+                "not what this software thinks it is on this firmware. Compare "
+                "the register numbers against MacTalk.",
             )
-        # Both plausible happens only when the raw words are symmetric, e.g.
-        # both zero. Nothing to distinguish them, so keep what is configured.
-        return self.word_order
+        if not low and not high:
+            return WordOrderProbe(
+                None, evidence,
+                "No register carried usable evidence -- every probe register "
+                "read as zero, or none had a zero word. Nothing is necessarily "
+                "wrong; there was just nothing to go on.",
+            )
+        detected = WordOrder.LOW_HIGH if low else WordOrder.HIGH_LOW
+        return WordOrderProbe(detected, evidence, "")
+
+    def detect_word_order(self) -> WordOrder:
+        """The word order, raising if it cannot be determined."""
+        probe = self.probe_word_order()
+        if probe.detected is None:
+            raise MotorFault(f"{self.name}: could not detect word order. {probe.reason}")
+        return probe.detected
 
     def _check_word_order(self) -> None:
+        """Refuse to run with a demonstrably wrong word order.
+
+        Only a positive contradiction is fatal. An inconclusive probe is
+        logged and allowed through: refusing to connect because a check could
+        not reach a verdict would make a diagnostic tool the reason you cannot
+        diagnose anything.
+        """
         try:
-            detected = self.detect_word_order()
+            probe = self.probe_word_order()
         except (ModbusError, MotorFault) as exc:
             self._log(f"{self.name}: word-order check skipped: {exc}")
             return
-        if detected is not self.word_order:
+        if probe.detected is None:
+            self._log(f"{self.name}: word order not confirmed -- {probe.reason}")
+            return
+        if probe.detected is not self.word_order:
             raise MotorFault(
-                f"{self.name}: configured word order is {self.word_order.value} but "
-                f"the motor's firmware version register only makes sense as "
-                f"{detected.value}. Every position you read would be wrong. Fix "
-                f"'word_order' in the config for this actuator."
+                f"{self.name}: configured word order is {self.word_order.value}, but "
+                f"the motor's registers only make sense as {probe.detected.value}. "
+                "Every position you read would be wrong. Fix 'word_order' for this "
+                "actuator in the config.\n  Evidence:\n    "
+                + "\n    ".join(probe.evidence)
             )
 
     # ----------------------------------------------------------------- mode

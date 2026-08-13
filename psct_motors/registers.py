@@ -142,17 +142,24 @@ class RegisterDef:
 #: ~150-register file rather than a full transcription, so that everything
 #: here can carry an honest confidence marker.
 REGISTERS: Tuple[RegisterDef, ...] = (
-    RegisterDef(1, "PROG_VERSION", 16, False, False, DOCUMENTED,
-                "Firmware version. Small positive number, which makes it a good "
-                "probe for auto-detecting word order."),
+    RegisterDef(1, "PROG_VERSION", 32, False, False, VERIFY,
+                "Believed to be the firmware version, but on the pSCT motor this "
+                "reads 540777 (0x00084069), which needs 20 bits and so cannot be "
+                "the 16-bit version field JVL's overview describes. Register 1 may "
+                "well be something else on this firmware. Not used for anything; "
+                "kept because it is worth comparing against MacTalk's version "
+                "display to settle what it is."),
     RegisterDef(2, "MODE_REG", 16, True, True, CONFIRMED,
                 "Operating mode. See MotorMode."),
     RegisterDef(3, "P_SOLL", 32, True, True, CONFIRMED,
                 "Target position. The motor drives towards this in Position mode.",
                 unit="counts"),
     RegisterDef(4, "P_NEW", 32, True, True, VERIFY,
-                "Write here to redefine the current position without moving "
-                "(used by set-zero). VERIFY before relying on it.",
+                "Believed to redefine the current position without moving. On the "
+                "pSCT motor it reads 101187584 (0x06080000) while P_IST is 600, "
+                "which is not position-shaped, so register 4 is probably not P_NEW "
+                "here. Nothing in this package writes it -- set-zero keeps its "
+                "offset in the config instead.",
                 unit="counts"),
     RegisterDef(5, "V_SOLL", 16, True, True, CONFIRMED,
                 "Maximum velocity for position moves.", unit="raw"),
@@ -181,8 +188,12 @@ REGISTERS: Tuple[RegisterDef, ...] = (
     RegisterDef(20, "FLWERR", 32, True, False, VERIFY,
                 "Following error (commanded minus encoder position).", unit="counts"),
     RegisterDef(25, "STATUSBITS", 32, False, False, VERIFY,
-                "Status bit field. Bit meanings in STATUS_BITS are unverified -- "
-                "confirm against MacTalk's status panel before trusting them."),
+                "Believed to be a status bit field, but on the pSCT motor it reads "
+                "0x8A476C14 while the drive is passive and the shaft stationary. "
+                "That is not what an idle status word looks like, so either the bit "
+                "layout is nothing like the obvious one or register 25 is not "
+                "STATUSBITS on this firmware. No bit names are claimed for it -- see "
+                "STATUS_BITS. Read but never acted upon."),
     RegisterDef(35, "ERR_BITS", 32, False, True, CONFIRMED,
                 "Error bit field. 0 means no error. Individual bit meanings in "
                 "ERROR_BITS are VERIFY-level."),
@@ -269,14 +280,19 @@ ERROR_BITS: Dict[int, str] = {
     10: "Communication error",
 }
 
-#: Bit meanings for STATUSBITS. VERIFY-level in full -- see RegisterDef above.
-STATUS_BITS: Dict[int, str] = {
-    0: "In position",
-    1: "Accelerating",
-    2: "Decelerating",
-    3: "At maximum velocity",
-    4: "Motion running",
-}
+#: Bit meanings for STATUSBITS -- deliberately empty.
+#:
+#: This used to hold a guessed layout (bit 0 "In position", bit 2
+#: "Decelerating", and so on). On the real pSCT motor register 25 reads
+#: 0x8A476C14 while the drive is passive and the shaft is stationary, and that
+#: guess decoded it as "Decelerating, Motion running" -- a confident, wrong
+#: statement about a motor that was doing nothing at all.
+#:
+#: A plausible-looking wrong answer is worse than no answer, so the names are
+#: gone and `describe_status` now reports the raw value only. Fill this in from
+#: the JVL manual or by watching the bits change in MacTalk, and nothing else
+#: needs to change.
+STATUS_BITS: Dict[int, str] = {}
 
 
 def decode_bits(value: int, meanings: Dict[int, str]) -> List[str]:
@@ -292,15 +308,27 @@ def decode_bits(value: int, meanings: Dict[int, str]) -> List[str]:
 
 
 def describe_errors(value: int) -> str:
+    """Decode ERR_BITS.
+
+    The raw hex always leads, and the decoded names are explicitly marked as
+    unverified. That the register means "error" is confirmed -- 0 is healthy on
+    the real motor -- but which bit means what has not been checked against a
+    real fault, and an operator reading a fault message deserves to know which
+    half of it is solid.
+    """
     if value == 0:
         return "No errors"
     names = decode_bits(value, ERROR_BITS)
-    return f"0x{int(value) & 0xFFFFFFFF:08X}: " + ", ".join(names)
+    return (f"0x{int(value) & 0xFFFFFFFF:08X}: " + ", ".join(names)
+            + " [bit names UNVERIFIED -- check against MacTalk]")
 
 
 def describe_status(value: int) -> str:
+    raw = f"0x{int(value) & 0xFFFFFFFF:08X}"
+    if not STATUS_BITS:
+        return f"{raw} (no verified bit meanings for this register)"
     names = decode_bits(value, STATUS_BITS)
-    return f"0x{int(value) & 0xFFFFFFFF:08X}" + (": " + ", ".join(names) if names else "")
+    return raw + (": " + ", ".join(names) if names else "")
 
 
 __all__ = [

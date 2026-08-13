@@ -272,18 +272,36 @@ def drill_identity(ctx: DemoContext) -> DrillResult:
     result = ctx.result()
     motor = ctx.motor
     result.note(f"Connection: {motor.describe()}")
-    try:
-        version = motor.read_register("PROG_VERSION", signed=False)
-        result.note(f"PROG_VERSION (firmware): {version}")
-    except (ModbusError, MotorFault) as exc:
-        return result.bad(f"Could not read PROG_VERSION: {exc}")
     result.note(f"Configured word order: {motor.word_order.value}")
-    detected = motor.detect_word_order()
-    if detected is motor.word_order:
-        return result.ok(f"Word order confirmed empirically as {detected.value}.")
+
+    probe = motor.probe_word_order()
+    for line in probe.evidence:
+        result.note(f"  {line}")
+
+    if probe.detected is None:
+        # Inconclusive is not a failure. It means the probe found nothing to
+        # go on -- which says nothing at all about whether the configured
+        # order is right, so reporting it as a fault would be a false alarm.
+        result.note("")
+        result.note(f"Word order not determined: {probe.reason}")
+        result.note("This is not evidence of a problem. Confirm it the direct "
+                    "way instead: command a known move with the `small-move` "
+                    "drill and check the shaft turns the expected quarter turn, "
+                    "or compare a position read against MacTalk's display.")
+        result.verdict = INFO
+        return result
+
+    if probe.detected is motor.word_order:
+        result.note("")
+        return result.ok(
+            f"Word order confirmed as {probe.detected.value} from the register "
+            "values themselves: every small configuration value has its high "
+            "word where this setting says it should be."
+        )
     return result.bad(
-        f"Word order MISMATCH: configured {motor.word_order.value}, "
-        f"the firmware version register only makes sense as {detected.value}."
+        f"Word order MISMATCH: the config says {motor.word_order.value}, but the "
+        f"registers only make sense as {probe.detected.value}. Every position "
+        "read from this motor is wrong until you fix it."
     )
 
 
@@ -899,7 +917,10 @@ def drill_real_unplug(ctx: DemoContext) -> DrillResult:
 
     for attempt in range(30):
         try:
-            ctx.motor.connect(verify_word_order=False)
+            # reconnect(), not connect(): after a reset the client can hold a
+            # socket it still believes is usable, so connect() succeeds and
+            # every read then fails against the dead socket.
+            ctx.motor.reconnect()
             position = ctx.motor.get_position_counts()
             result.note(f"Reconnected after {attempt + 1} attempt(s); "
                         f"position {position} counts.")
@@ -968,9 +989,11 @@ def all_drills() -> List[Drill]:
     return [
         # ---- capability -------------------------------------------------
         Drill("identity", "capability",
-              "Read the firmware version and confirm the word order.",
-              "PROG_VERSION reads as a small number, and the empirically "
-              "detected word order matches the configured one.",
+              "Confirm the Modbus word order from the register values themselves.",
+              "Small configuration values (currents, ramps, velocity limit) all "
+              "put their zero high word on the side the configured order says, "
+              "confirming it. An inconclusive result is informational, not a "
+              "failure -- only a contradiction is a problem.",
               drill_identity,
               remediation="If the word order mismatches, fix 'word_order' for "
                           "this actuator in the config. Every position read is "
@@ -1204,6 +1227,17 @@ class DemoRunner:
         self.out("-" * 74)
         self.injector.clear()
         try:
+            if not self.motor.connected or not self._link_alive():
+                self.out("  Link is down; trying to reconnect so the motor can "
+                         "be left in a known state.")
+                try:
+                    self.motor.reconnect()
+                    self.out("  Reconnected.")
+                except (ModbusError, MotorFault) as exc:
+                    self.out(f"  Could not reconnect: {exc}")
+                    self.out("  The motor has NOT been returned or passivated. "
+                             "Check it before leaving it.")
+                    return
             if self.ctx.allow_motion:
                 self.ctx.return_home()
                 self.out(f"  Returned to {self.motor.get_position_counts()} counts "
@@ -1212,6 +1246,13 @@ class DemoRunner:
             self.out("  Motor left in Passive mode.")
         except (ModbusError, MotorFault) as exc:
             self.out(f"  Cleanup could not complete: {exc}")
+
+    def _link_alive(self) -> bool:
+        try:
+            self.motor.get_mode()
+            return True
+        except (ModbusError, MotorFault):
+            return False
 
     def _summary(self) -> int:
         counts = {PASS: 0, FAIL: 0, INFO: 0, SKIP: 0}

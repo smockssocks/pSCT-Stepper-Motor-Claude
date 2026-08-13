@@ -58,21 +58,29 @@ class SimulatedJVLTransport:
         self._last_update = time.monotonic()
         self._position = float(start_counts)
 
+        # Values chosen to match what the real pSCT motor returns, so the
+        # simulator is a fair rehearsal rather than an idealised one. In
+        # particular registers 4 and 25 hold the large, un-position-like and
+        # un-status-like values actually observed on the hardware, so anything
+        # that tries to interpret them meets the same difficulty here.
         self.registers: Dict[int, int] = {
-            1: firmware_version,      # PROG_VERSION
+            1: firmware_version,      # register 1 -- identity unconfirmed
             2: int(MotorMode.PASSIVE),
             3: int(start_counts),     # P_SOLL
+            4: 0x06080000,            # as observed; not position-shaped
             5: 1000,                  # V_SOLL
-            6: 1000,                  # A_SOLL
-            7: 500,                   # RUN_CURRENT
-            9: 200,                   # STANDBY_CURRENT
+            6: 100,                   # A_SOLL
+            7: 511,                   # RUN_CURRENT
+            8: 500,                   # STANDBY_TIME
+            9: 128,                   # STANDBY_CURRENT
             10: int(start_counts),    # P_IST
             12: 0,                    # V_IST
             19: 0,                    # outputs (brake lives here in output mode)
             20: 0,                    # FLWERR
-            25: 1,                    # STATUSBITS: in position
+            25: 0x8A476C14,           # as observed on a passive, idle motor
             35: 0,                    # ERR_BITS
             36: 0,                    # WARN_BITS
+            38: -100000,              # P_HOME
         }
 
     # ------------------------------------------------------------- test hooks
@@ -110,12 +118,10 @@ class SimulatedJVLTransport:
             if abs(delta) <= step:
                 self._position = target
                 self.registers[12] = 0
-                self.registers[25] = self.registers.get(25, 0) | 1
             else:
                 direction = 1.0 if delta > 0 else -1.0
                 self._position += direction * step
                 self.registers[12] = int(direction * speed / self.COUNTS_PER_SECOND_PER_VSOLL)
-                self.registers[25] = self.registers.get(25, 0) & ~1
         else:
             # Drive off. If a load is configured and the brake output is not
             # holding, the axis creeps -- the failure mode the interlocks exist
@@ -141,6 +147,10 @@ class SimulatedJVLTransport:
 
     def close(self) -> None:
         self._open = False
+
+    def reconnect(self) -> bool:
+        self.close()
+        return self.connect()
 
     def is_open(self) -> bool:
         return self._open and not self._offline

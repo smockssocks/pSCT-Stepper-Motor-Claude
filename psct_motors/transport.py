@@ -30,6 +30,7 @@ class Transport(Protocol):
 
     def connect(self) -> bool: ...
     def close(self) -> None: ...
+    def reconnect(self) -> bool: ...
     def is_open(self) -> bool: ...
     def read_holding(self, address: int, count: int) -> List[int]: ...
     def write_holding(self, address: int, values: List[int]) -> None: ...
@@ -107,6 +108,25 @@ class PymodbusTransport:
                     self._client.close()
                 except Exception:
                     pass
+
+    def reconnect(self) -> bool:
+        """Discard the client entirely and build a fresh one.
+
+        After a connection reset (WinError 10054 and friends) pymodbus can be
+        left holding a socket it still reports as connected, so connect() is a
+        no-op and every subsequent transaction fails against the dead socket.
+        Closing is not always enough either -- the surest recovery is a new
+        client object, which costs one construction and removes a whole class
+        of "it says it reconnected but nothing works" failures.
+        """
+        with self._lock:
+            if self._client is not None:
+                try:
+                    self._client.close()
+                except Exception:
+                    pass
+            self._client = None
+            return self.connect()
 
     def is_open(self) -> bool:
         with self._lock:

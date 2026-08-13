@@ -20,7 +20,7 @@ from psct_motors.config import (  # noqa: E402
 from psct_motors.demo import (  # noqa: E402
     DemoRunner, FAIL, INFO, PASS, SKIP, all_drills, build_motor, select_drills,
 )
-from psct_motors.faults import Fault, FaultInjectingTransport, wrap_motor  # noqa: E402
+from psct_motors.faults import Fault, FaultInjectingTransport, wrap_motor  # noqa: E402,F401
 from psct_motors.jvl_motor import MotorFault  # noqa: E402
 from psct_motors.kinematics import Orientation  # noqa: E402
 from psct_motors.platform import FocalPlanePlatform, PlatformError  # noqa: E402
@@ -540,3 +540,226 @@ class TestDemoCli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# --------------------------------------------------------------------------
+# Word order, as learned from the real motor
+# --------------------------------------------------------------------------
+
+class TestWordOrderProbe(unittest.TestCase):
+    """Regression tests for the detection rewrite.
+
+    The first version compared register 1 against a "looks like a firmware
+    version" range. On the real pSCT motor register 1 reads 540777, which
+    needs 20 bits, so the check reported it could not determine the word order
+    on a motor whose word order was provably correct -- the moves landed
+    exactly on target. These tests pin the replacement.
+    """
+
+    #: What the pSCT motor actually returned, so the regression is concrete.
+    REAL_MOTOR_REGISTERS = {
+        1: 540777, 2: 0, 3: 600, 4: 0x06080000, 5: 10000, 6: 100, 7: 511,
+        8: 500, 9: 128, 10: 600, 12: 0, 19: 0, 20: 0, 25: 0x8A476C14,
+        35: 0, 36: 0, 38: -100000,
+    }
+
+    def _motor(self, word_order=WordOrder.LOW_HIGH, registers=None):
+        motor = simulated_motor(bench_actuator(word_order=word_order.value))
+        motor._transport.registers = dict(registers or self.REAL_MOTOR_REGISTERS)
+        motor.connect(verify_word_order=False)
+        return motor
+
+    def test_real_motor_registers_give_a_confident_low_high_verdict(self):
+        motor = self._motor()
+        try:
+            probe = motor.probe_word_order()
+            self.assertIs(probe.detected, WordOrder.LOW_HIGH)
+            self.assertTrue(probe.evidence)
+            self.assertEqual(probe.reason, "")
+        finally:
+            motor.disconnect()
+
+    def test_register_one_no_longer_influences_the_verdict(self):
+        """540777 in register 1 must not derail detection."""
+        registers = dict(self.REAL_MOTOR_REGISTERS)
+        for value in (540777, 0, 1030, 0xDEADBEEF):
+            with self.subTest(register_1=value):
+                registers[1] = value
+                motor = self._motor(registers=registers)
+                try:
+                    self.assertIs(motor.probe_word_order().detected,
+                                  WordOrder.LOW_HIGH)
+                finally:
+                    motor.disconnect()
+
+    def test_a_high_low_motor_is_detected_as_high_low(self):
+        motor = self._motor(word_order=WordOrder.HIGH_LOW)
+        try:
+            self.assertIs(motor.probe_word_order().detected, WordOrder.HIGH_LOW)
+        finally:
+            motor.disconnect()
+
+    def test_a_genuine_mismatch_is_still_caught_on_connect(self):
+        motor = simulated_motor(bench_actuator(word_order=WordOrder.HIGH_LOW.value))
+        motor._transport.registers = dict(self.REAL_MOTOR_REGISTERS)
+        motor._transport.word_order = WordOrder.LOW_HIGH      # motor disagrees
+        with self.assertRaises(MotorFault) as ctx:
+            motor.connect(verify_word_order=True)
+        self.assertIn("MISMATCH".lower(), str(ctx.exception).lower() + "mismatch")
+        self.assertIn("Low-High", str(ctx.exception))
+
+    def test_all_zero_registers_are_inconclusive_not_a_fault(self):
+        """No evidence must not be reported as bad evidence."""
+        motor = self._motor(registers={n: 0 for n in self.REAL_MOTOR_REGISTERS})
+        try:
+            probe = motor.probe_word_order()
+            self.assertIsNone(probe.detected)
+            self.assertFalse(probe.conclusive)
+            self.assertIn("nothing to go on", probe.reason)
+        finally:
+            motor.disconnect()
+
+    def test_inconclusive_probe_does_not_block_connect(self):
+        """A diagnostic that cannot decide must not stop you connecting."""
+        motor = simulated_motor(bench_actuator())
+        motor._transport.registers = {n: 0 for n in self.REAL_MOTOR_REGISTERS}
+        motor.connect(verify_word_order=True)          # must not raise
+        self.assertTrue(motor.connected)
+        motor.disconnect()
+
+    def test_contradictory_evidence_is_reported_as_such(self):
+        registers = dict(self.REAL_MOTOR_REGISTERS)
+        registers[5] = 0x27100000        # one probe register votes the other way
+        motor = self._motor(registers=registers)
+        try:
+            probe = motor.probe_word_order()
+            self.assertIsNone(probe.detected)
+            self.assertIn("Contradictory", probe.reason)
+        finally:
+            motor.disconnect()
+
+    def test_position_registers_are_not_used_as_evidence(self):
+        """Register 4 reads 0x06080000 on the real motor and would vote wrong."""
+        from psct_motors.jvl_motor import WORD_ORDER_PROBE_REGISTERS
+        for name in ("P_SOLL", "P_IST", "P_NEW", "P_HOME", "STATUSBITS"):
+            self.assertNotIn(name, WORD_ORDER_PROBE_REGISTERS)
+
+
+class TestIdentityDrillVerdicts(unittest.TestCase):
+    def _run_identity(self, word_order=WordOrder.LOW_HIGH, registers=None):
+        harness = DemoHarness(allow_motion=False, word_order=word_order.value)
+        if registers is not None:
+            # .inner, not ._transport: DemoRunner has already wrapped the motor
+            # in a fault injector, so ._transport is that wrapper and setting
+            # registers on it would just create an unused attribute.
+            harness.motor._transport.inner.registers = dict(registers)
+        harness.run(["identity"])
+        return harness
+
+    def test_matching_word_order_passes(self):
+        harness = self._run_identity(
+            registers=TestWordOrderProbe.REAL_MOTOR_REGISTERS)
+        self.assertEqual(harness.verdict("identity"), PASS)
+
+    def test_inconclusive_is_informational_not_a_failure(self):
+        harness = self._run_identity(
+            registers={n: 0 for n in TestWordOrderProbe.REAL_MOTOR_REGISTERS})
+        self.assertEqual(harness.verdict("identity"), INFO)
+        self.assertIn("not evidence of a problem", harness.text.lower())
+
+    def test_mismatch_still_fails(self):
+        harness = DemoHarness(allow_motion=False,
+                              word_order=WordOrder.HIGH_LOW.value)
+        harness.motor._transport.inner.registers = dict(
+            TestWordOrderProbe.REAL_MOTOR_REGISTERS)
+        harness.motor._transport.inner.word_order = WordOrder.LOW_HIGH
+        harness.run(["identity"])
+        self.assertEqual(harness.verdict("identity"), FAIL)
+        self.assertIn("MISMATCH", harness.text)
+
+
+# --------------------------------------------------------------------------
+# Reconnecting after a link failure
+# --------------------------------------------------------------------------
+
+class TestReconnect(unittest.TestCase):
+    """The real unplug drill could not recover: after a WinError 10054 the
+    client held a dead socket, connect() was a no-op, and every read failed."""
+
+    def test_reconnect_recovers_a_dropped_link(self):
+        motor = simulated_motor(bench_actuator(), start_mm=0.0)
+        motor.connect()
+        transport = motor._transport
+        transport.set_offline(True)
+        with self.assertRaises(ModbusError):
+            motor.get_position_counts()
+        transport.set_offline(False)
+        motor.reconnect()
+        self.assertTrue(motor.connected)
+        self.assertEqual(motor.get_position_counts(), 0)
+
+    def test_reconnect_rebuilds_the_pymodbus_client(self):
+        """The fix is a fresh client, not just close-then-connect."""
+        from psct_motors.transport import PymodbusTransport
+        transport = PymodbusTransport("192.0.2.1", 502)
+        built = []
+        transport._build_client = lambda: built.append(1) or _FakeClient()
+        transport._detect_call_convention = lambda: None
+        transport.connect()
+        self.assertEqual(len(built), 1)
+        transport.reconnect()
+        self.assertEqual(len(built), 2, "reconnect must build a new client")
+
+    def test_reconnect_still_fails_while_a_comms_fault_is_armed(self):
+        motor = simulated_motor(bench_actuator(), start_mm=0.0)
+        injector = wrap_motor(motor)
+        motor.connect()
+        injector.arm(Fault.COMMS_DROP)
+        self.assertFalse(motor._transport.reconnect())
+        injector.clear()
+        self.assertTrue(motor._transport.reconnect())
+
+    def test_every_transport_implements_reconnect(self):
+        from psct_motors.simulator import SimulatedJVLTransport
+        from psct_motors.transport import PymodbusTransport
+        for cls in (PymodbusTransport, SimulatedJVLTransport, FaultInjectingTransport):
+            self.assertTrue(callable(getattr(cls, "reconnect", None)), cls.__name__)
+
+
+class _FakeClient:
+    connected = True
+    def connect(self):
+        return True
+    def close(self):
+        pass
+
+
+# --------------------------------------------------------------------------
+# Honest reporting of unverified decodings
+# --------------------------------------------------------------------------
+
+class TestUnverifiedDecodings(unittest.TestCase):
+    def test_status_register_claims_no_bit_meanings(self):
+        """It used to decode a passive, stationary motor's 0x8A476C14 as
+        'Decelerating, Motion running'."""
+        from psct_motors.registers import STATUS_BITS, describe_status
+        self.assertEqual(STATUS_BITS, {})
+        text = describe_status(0x8A476C14)
+        self.assertIn("0x8A476C14", text)
+        self.assertIn("no verified bit meanings", text)
+        for wrong in ("Decelerating", "Motion running", "In position"):
+            self.assertNotIn(wrong, text)
+
+    def test_error_names_are_marked_unverified(self):
+        from psct_motors.registers import describe_errors
+        self.assertEqual(describe_errors(0), "No errors")
+        text = describe_errors(1 << 1)
+        self.assertIn("0x00000002", text)
+        self.assertIn("UNVERIFIED", text)
+
+    def test_registers_contradicted_by_hardware_are_marked_verify(self):
+        from psct_motors.registers import REGISTERS_BY_NAME, VERIFY
+        for name in ("PROG_VERSION", "P_NEW", "STATUSBITS"):
+            self.assertEqual(REGISTERS_BY_NAME[name].confidence, VERIFY, name)
+            self.assertIn("pSCT motor", REGISTERS_BY_NAME[name].description,
+                          f"{name} should record what the hardware actually read")
