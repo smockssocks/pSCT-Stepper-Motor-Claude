@@ -35,11 +35,13 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import traceback
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
 from .config import load_config, save_config, default_config_path
@@ -71,15 +73,39 @@ class Lamp(tk.Canvas):
         self.itemconfigure(self._circle, fill=color)
 
 
+def pixels_for(font_spec, *samples: str) -> int:
+    """Widest of `samples` in `font_spec`, in pixels, with a little slack.
+
+    Widths given to a label are counted in *characters*, and Tk sizes a
+    character as the width of "0" in that font. A four-character string of
+    wide glyphs is therefore wider than four "characters" and gets clipped --
+    which is why `width=4` showed "Top" and "East" but cut "West" off at the
+    T. Reserving space in pixels, measured from the strings that will
+    actually appear, is the only way to get this right for a proportional
+    font, and it keeps working if an actuator is renamed in the config.
+    """
+    font = tkfont.Font(font=font_spec)
+    return max(font.measure(s) for s in samples) + 8
+
+
 class MotorRow:
     """One actuator's line in the actuator table."""
+
+    #: Everything `mode_var` and `brake_var` show in normal operation. The
+    #: columns are sized to hold these without moving; a rare long mode name
+    #: ("Zero-search / internal mode 15") widens the column rather than being
+    #: silently cut in half.
+    MODE_SAMPLES = ("Passive", "Velocity", "Position", "Gear", "no comms", "--")
+    BRAKE_SAMPLES = ("engaged (inferred)", "released (inferred)", "unknown")
+    NAME_FONT = ("TkDefaultFont", 11, "bold")
 
     def __init__(self, parent, name: str, row: int, app: "MotorApp"):
         self.name = name
         self.app = app
 
-        ttk.Label(parent, text=name, width=4,
-                  font=("TkDefaultFont", 11, "bold")).grid(row=row, column=0, padx=(6, 2))
+        self.name_label = ttk.Label(parent, text=name, anchor="w",
+                                    font=self.NAME_FONT)
+        self.name_label.grid(row=row, column=0, padx=(6, 2), sticky="w")
 
         self.position_var = tk.StringVar(value="--")
         ttk.Label(parent, textvariable=self.position_var, width=14, anchor="e",
@@ -92,14 +118,14 @@ class MotorRow:
         self.mode_lamp = Lamp(parent)
         self.mode_lamp.grid(row=row, column=3, padx=(8, 2))
         self.mode_var = tk.StringVar(value="--")
-        ttk.Label(parent, textvariable=self.mode_var, width=16,
-                  anchor="w").grid(row=row, column=4, padx=2)
+        ttk.Label(parent, textvariable=self.mode_var,
+                  anchor="w").grid(row=row, column=4, padx=2, sticky="w")
 
         self.brake_lamp = Lamp(parent)
         self.brake_lamp.grid(row=row, column=5, padx=(8, 2))
         self.brake_var = tk.StringVar(value="unknown")
-        ttk.Label(parent, textvariable=self.brake_var, width=15,
-                  anchor="w").grid(row=row, column=6, padx=2)
+        ttk.Label(parent, textvariable=self.brake_var,
+                  anchor="w").grid(row=row, column=6, padx=2, sticky="w")
 
         self.release_btn = ttk.Button(
             parent, text="Release", width=8,
@@ -278,9 +304,22 @@ class MotorApp:
         tk.Label(
             bar,
             text="STOP decelerates and holds position with the drives still on. "
-                 "EMERGENCY cuts drive power -- the load is then held by the brakes alone.",
+                 "EMERGENCY cuts drive power -- the load is then held by the brakes alone. "
+                 "Neither asks for confirmation.",
             bg=COLOR_STOP_DARK, fg="#ffd7d7", font=("TkDefaultFont", 8),
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 4))
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2))
+
+        # What the last STOP or EMERGENCY actually did. These controls act
+        # without asking, so the result has to be visible without going to
+        # look for it in the log.
+        self.action_var = tk.StringVar(value="")
+        self.action_label = tk.Label(
+            bar, textvariable=self.action_var, bg=COLOR_STOP_DARK, fg="white",
+            font=("TkDefaultFont", 9, "bold"), anchor="w", justify="left",
+            wraplength=900,
+        )
+        self.action_label.grid(row=2, column=0, columnspan=2, sticky="ew",
+                               padx=8, pady=(0, 4))
 
     def _build_connection(self) -> None:
         frame = ttk.LabelFrame(self.root, text="Connection")
@@ -381,6 +420,7 @@ class MotorApp:
 
     def _build_actuators(self, parent) -> None:
         frame = ttk.LabelFrame(parent, text="Actuators")
+        self.actuator_frame = frame
         frame.grid(row=1, column=0, sticky="nsew", pady=3)
 
         headers = ["", "position", "counts", "", "mode", "", "brake",
@@ -393,6 +433,16 @@ class MotorApp:
         self.rows = {}
         for i, actuator in enumerate(self.cfg.actuators):
             self.rows[actuator.name] = MotorRow(frame, actuator.name, i + 1, self)
+
+        # Reserve room for the widest text each of the proportional-font
+        # columns will hold, so nothing is clipped and nothing shifts sideways
+        # as a value changes.
+        frame.columnconfigure(0, minsize=pixels_for(
+            MotorRow.NAME_FONT, *(a.name for a in self.cfg.actuators)))
+        frame.columnconfigure(4, minsize=pixels_for(
+            "TkDefaultFont", *MotorRow.MODE_SAMPLES))
+        frame.columnconfigure(6, minsize=pixels_for(
+            "TkDefaultFont", *MotorRow.BRAKE_SAMPLES))
 
         footer = ttk.Frame(frame)
         footer.grid(row=len(self.cfg.actuators) + 1, column=0, columnspan=12,
@@ -600,46 +650,136 @@ class MotorApp:
 
     # ----------------------------------------------------------------- stop
 
+    def _announce(self, message: str, colour: str = "white") -> None:
+        """Say what a safety control just did, on the red bar. UI thread."""
+        self.action_var.set(message)
+        self.action_label.configure(bg=colour, fg="white")
+
+    def _announce_threadsafe(self, message: str, colour: str = "white") -> None:
+        self.post(lambda: self._announce(message, colour))
+
     def on_stop(self) -> None:
-        """Always runs, busy or not, on its own thread."""
-        if not self.platform.connected:
-            self.log("STOP pressed, but nothing is connected.")
+        """Always runs, busy or not, on its own thread.
+
+        Guarded on `any_connected`, not `connected`: with one motor off the
+        network the other two can still be running, and they are the ones that
+        need stopping."""
+        if not self.platform.any_connected:
+            self.log("STOP pressed, but no motor is reachable.")
+            self._announce("STOP pressed, but no motor is reachable.", COLOR_BAD)
             return
         self.log("STOP pressed.")
+        self._announce("STOP: decelerating all three axes...", COLOR_WARN)
         threading.Thread(target=self._stop_worker, name="stop", daemon=True).start()
 
     def _stop_worker(self) -> None:
+        stamp = time.strftime("%H:%M:%S")
         try:
-            self.platform.stop()
+            problems = self.platform.stop()
         except Exception as exc:  # noqa: BLE001
             self.log_threadsafe(f"STOP had trouble: {exc}")
-        finally:
+            self._announce_threadsafe(f"{stamp}  STOP did not complete: {exc}",
+                                      COLOR_BAD)
             self.post(lambda: self._set_busy(False))
+            return
+
+        for line in self._stop_report(stamp, problems):
+            self.log_threadsafe(line)
+        if problems:
+            self._announce_threadsafe(
+                f"{stamp}  STOP incomplete -- {len(problems)} motor(s) did not "
+                f"answer and may still be moving. See the log.", COLOR_BAD)
+        else:
+            self._announce_threadsafe(
+                f"{stamp}  STOP done: motion halted, drives still on and "
+                f"holding position.", COLOR_STOP)
+        self.post(lambda: self._set_busy(False))
+
+    def _stop_report(self, stamp: str, problems: List[str]) -> List[str]:
+        """Where each axis actually came to rest."""
+        lines = [f"STOP at {stamp}: motion halted, drives still holding."]
+        for problem in problems:
+            lines.append(f"  ** could NOT stop {problem}")
+        try:
+            state = self.platform.read_state()
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"  (could not read back the result: {exc})")
+            return lines
+        for motor in state.motors:
+            if motor.comms_error:
+                lines.append(f"  {motor.name:<5} no comms -- state unknown: "
+                             f"{motor.comms_error}")
+            else:
+                lines.append(f"  {motor.name:<5} holding at "
+                             f"{motor.position_mm:+8.4f} mm  {motor.mode_text}")
+        return lines
 
     def on_passivate(self) -> None:
-        if not self.platform.connected:
-            self.log("EMERGENCY pressed, but nothing is connected.")
+        """No confirmation. An emergency control that stops to ask a question
+        is not an emergency control -- it acts, then reports what it did."""
+        if not self.platform.any_connected:
+            self.log("EMERGENCY pressed, but no motor is reachable.")
+            self._announce("EMERGENCY pressed, but no motor is reachable -- "
+                           "nothing could be turned off.", COLOR_BAD)
             return
-        if not messagebox.askyesno(
-            "Turn the drives off?",
-            "This engages the brakes and removes drive power from all three "
-            "motors.\n\nWith the drives off the motors hold nothing: the load "
-            "rests on the brakes and screw friction alone.\n\nIf you just want "
-            "motion to stop, use STOP instead -- it holds position under power."
-            "\n\nTurn the drives off?",
-        ):
-            return
-        self.log("EMERGENCY passivate pressed.")
+        self.log("EMERGENCY pressed: engaging brakes and turning the drives off.")
+        self._announce("EMERGENCY: engaging brakes, turning drives off...",
+                       COLOR_WARN)
         threading.Thread(target=self._passivate_worker, name="passivate",
                          daemon=True).start()
 
     def _passivate_worker(self) -> None:
+        stamp = time.strftime("%H:%M:%S")
         try:
-            self.platform.emergency_passivate()
+            problems = self.platform.emergency_passivate()
         except Exception as exc:  # noqa: BLE001
-            self.log_threadsafe(f"Passivate had trouble: {exc}")
-        finally:
+            self.log_threadsafe(f"EMERGENCY had trouble: {exc}")
+            self._announce_threadsafe(
+                f"{stamp}  EMERGENCY did not complete: {exc}", COLOR_BAD)
             self.post(lambda: self._set_busy(False))
+            return
+
+        # Report what is true now, read back from the motors, rather than what
+        # was commanded. On an emergency control the difference matters.
+        for line in self._passivate_report(stamp, problems):
+            self.log_threadsafe(line)
+        if problems:
+            self._announce_threadsafe(
+                f"{stamp}  EMERGENCY incomplete -- {len(problems)} motor(s) did "
+                f"not answer. See the log.", COLOR_BAD)
+        else:
+            self._announce_threadsafe(
+                f"{stamp}  EMERGENCY done: brakes engaged, drives off. The load "
+                f"is on the brakes now. A move command re-enables the drives.",
+                COLOR_BAD)
+        self.post(lambda: self._set_busy(False))
+
+    def _passivate_report(self, stamp: str, problems: List[str]) -> List[str]:
+        """The lines that go in the log after an emergency stop."""
+        lines = [f"EMERGENCY at {stamp}: brakes engaged, drives off."]
+        for problem in problems:
+            lines.append(f"  ** could NOT passivate {problem}")
+        try:
+            state = self.platform.read_state()
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"  (could not read back the result: {exc})")
+            return lines
+        for motor in state.motors:
+            if motor.comms_error:
+                lines.append(f"  {motor.name:<5} no comms -- state unknown: "
+                             f"{motor.comms_error}")
+                continue
+            lines.append(
+                f"  {motor.name:<5} stopped at {motor.position_mm:+8.4f} mm  "
+                f"({motor.position_counts} ct)  {motor.mode_text}  "
+                f"brake {motor.brake.state.value}"
+                + ("  [inferred]" if motor.brake.inferred else "")
+            )
+        lines.append("  The drives are no longer holding position: the load rests "
+                     "on the brakes and screw friction.")
+        lines.append("  To resume, command a move -- that re-enables the drives "
+                     "and releases the brakes.")
+        return lines
 
     # ----------------------------------------------------------------- moves
 

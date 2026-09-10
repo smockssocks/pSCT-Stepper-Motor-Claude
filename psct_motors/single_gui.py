@@ -628,18 +628,30 @@ class SingleMotorApp:
             self.post(lambda: self._set_busy(False))
 
     def on_passivate(self) -> None:
+        """Acts first and reports afterwards: a safety control that stops to
+        ask a question is not a safety control."""
         if not self._require_connection():
-            return
-        if not messagebox.askyesno(
-            "Turn the drive off?",
-            "This sets MODE_REG = 0. The drive stops holding: on a loaded axis "
-            "the load rests on the brake and friction alone.\n\nContinue?",
-        ):
             return
 
         def work():
             self.motor.passivate()
-            self.log.warning("command", "Drive passivated by operator")
+            # Report the state that is true afterwards, read back from the
+            # motor, not the state that was commanded.
+            try:
+                mode = describe_mode(self.motor.get_mode())
+                counts = self.motor.get_position_counts()
+            except (ModbusError, MotorFault) as exc:
+                self.log.error("command",
+                               f"Drive passivated, but the result could not be "
+                               f"read back: {exc}")
+                return
+            self.log.warning(
+                "command",
+                f"Drive passivated by operator: MODE_REG = 0, {mode}. The drive "
+                f"is no longer holding -- on a loaded axis the load now rests on "
+                f"the brake and friction. Enable position mode to resume.",
+                position=counts,
+            )
 
         self.run_async("Passivate", work)
 

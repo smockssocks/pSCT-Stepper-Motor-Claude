@@ -242,6 +242,110 @@ class TestGui(unittest.TestCase):
                         "the move should have been cut short")
         self.assertIn("STOP", self.app.log_text.get("1.0", "end"))
 
+    def test_emergency_acts_without_asking_and_reports_afterwards(self):
+        """A safety control that opens a modal is not a safety control. It has
+        to act first and say what it did after."""
+        from psct_motors import gui
+
+        class NoDialogs:
+            @staticmethod
+            def askyesno(*a, **k):
+                raise AssertionError("EMERGENCY must not ask for confirmation")
+            @staticmethod
+            def showerror(*a, **k): return None
+            @staticmethod
+            def showwarning(*a, **k): return None
+            @staticmethod
+            def showinfo(*a, **k): return None
+
+        original = gui.messagebox
+        gui.messagebox = NoDialogs()
+        try:
+            self.app._start_polling()
+            self.app.on_passivate()
+            self.pump(1.2)
+        finally:
+            gui.messagebox = original
+
+        # It did the thing.
+        for motor in self.app.platform.motors:
+            self.assertEqual(motor.get_mode(), 0)
+        # ...and then said so, both on the red bar and in the log.
+        self.assertIn("EMERGENCY done", self.app.action_var.get())
+        log = self.app.log_text.get("1.0", "end")
+        self.assertIn("brakes engaged, drives off", log)
+        self.assertIn("The drives are no longer holding position", log)
+        # The report names every actuator and where it came to rest, read back
+        # from the motors rather than assumed.
+        for name in ("Top", "East", "West"):
+            self.assertIn(f"{name:<5} stopped at", log)
+
+    def test_emergency_report_says_which_motor_did_not_answer(self):
+        self.app._start_polling()
+        self.pump(0.3)
+        self.app.platform.motors[1]._transport.set_offline(True)
+        self.app.on_passivate()
+        self.pump(1.2)
+        log = self.app.log_text.get("1.0", "end")
+        self.assertIn("could NOT passivate East", log)
+        self.assertIn("EMERGENCY incomplete", self.app.action_var.get())
+
+    def test_stop_reports_where_it_stopped(self):
+        self.app._start_polling()
+        self.app.on_stop()
+        self.pump(1.0)
+        self.assertIn("STOP done", self.app.action_var.get())
+        self.assertIn("drives still on", self.app.action_var.get())
+        self.assertIn("Top   holding at", self.app.log_text.get("1.0", "end"))
+
+    def test_safety_controls_still_act_when_one_motor_is_lost(self):
+        """`connected` is all-three. If STOP keyed off that, losing one motor
+        would disarm the button for the two that are still running."""
+        self.app._start_polling()
+        self.pump(0.3)
+        self.app.platform.motors[1]._transport.set_offline(True)
+        self.assertFalse(self.app.platform.connected)
+        self.assertTrue(self.app.platform.any_connected)
+        self.app.on_stop()
+        self.pump(1.0)
+        log = self.app.log_text.get("1.0", "end")
+        self.assertNotIn("no motor is reachable", log)
+        self.assertIn("could NOT stop East", log)
+        self.assertIn("STOP incomplete", self.app.action_var.get())
+        # The two that are still there were stopped and reported; the missing
+        # one is named rather than passed over in silence.
+        self.assertIn("Top   holding at", log)
+        self.assertIn("West  holding at", log)
+        self.assertIn("East  no comms", log)
+
+    def test_actuator_names_are_not_clipped(self):
+        """`width=4` fits "Top" and "East" but cuts "West" off at the T, because
+        a label's width is counted in "0"-widths, not glyphs."""
+        import tkinter.font as tkfont
+        from psct_motors.gui import MotorRow
+
+        font = tkfont.Font(font=MotorRow.NAME_FONT)
+        self.pump(0.2)
+        for name, row in self.app.rows.items():
+            needed = font.measure(name)
+            self.assertGreaterEqual(
+                row.name_label.winfo_reqwidth(), needed,
+                f"the {name} label is narrower than the word {name}")
+        # The column reserves room for the longest name, so the table does not
+        # shift about, and "West" -- the widest of the three -- fits.
+        reserved = self.app.actuator_frame.grid_columnconfigure(0)["minsize"]
+        self.assertGreaterEqual(int(reserved), font.measure("West"))
+
+    def test_brake_column_fits_its_longest_label(self):
+        """"released (inferred)" is the widest thing that column ever holds."""
+        import tkinter.font as tkfont
+        from psct_motors.gui import MotorRow
+
+        font = tkfont.Font(font="TkDefaultFont")
+        reserved = int(self.app.actuator_frame.grid_columnconfigure(6)["minsize"])
+        for sample in MotorRow.BRAKE_SAMPLES:
+            self.assertGreaterEqual(reserved, font.measure(sample), sample)
+
     def test_stop_works_even_while_the_ui_thinks_it_is_busy(self):
         """A queued command must never be able to block the stop button."""
         self.app._set_busy(True)

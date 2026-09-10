@@ -177,6 +177,17 @@ class FocalPlanePlatform:
         return all(m.connected for m in self.motors)
 
     @property
+    def any_connected(self) -> bool:
+        """True while at least one motor is still reachable.
+
+        The safety controls key off this rather than `connected`. If one motor
+        drops off the network mid-move, `connected` goes false -- and a STOP
+        button that refuses to act because one of three motors is unreachable
+        would leave the other two running.
+        """
+        return any(m.connected for m in self.motors)
+
+    @property
     def names(self) -> List[str]:
         return [m.name for m in self.motors]
 
@@ -505,12 +516,15 @@ class FocalPlanePlatform:
 
     # -------------------------------------------------------------- stopping
 
-    def stop(self) -> None:
+    def stop(self) -> List[str]:
         """Controlled stop of all three axes: decelerate and hold.
 
         The motors keep their drive current and keep holding position, which
         is what you want for a loaded vertical axis. This is the big red
         button's action.
+
+        Returns the motors it could not stop, one string each, so a caller can
+        report what actually happened. An empty list means all three stopped.
         """
         self._abort.set()
         problems = []
@@ -523,13 +537,18 @@ class FocalPlanePlatform:
             self._log("STOP had trouble on: " + "; ".join(problems))
         else:
             self._log("STOP: all three actuators holding position.")
+        return problems
 
-    def emergency_passivate(self) -> None:
+    def emergency_passivate(self) -> List[str]:
         """Brakes on, drive off. The last resort.
 
         Note what this gives up: with the drive passive the motor is not
         holding anything. If the brakes are not actually wired and working,
         the load is then held only by screw friction. Prefer `stop()`.
+
+        Returns the motors it could not passivate, one string each, so a
+        caller can report what actually happened rather than assuming it
+        worked. An empty list means every motor was passivated.
         """
         self._abort.set()
         problems = []
@@ -542,6 +561,7 @@ class FocalPlanePlatform:
             self._log("EMERGENCY PASSIVATE had trouble on: " + "; ".join(problems))
         else:
             self._log("EMERGENCY PASSIVATE: brakes engaged, drives off.")
+        return problems
 
     # ---------------------------------------------------------------- brakes
 
