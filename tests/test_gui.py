@@ -104,18 +104,90 @@ class TestGui(unittest.TestCase):
 
     def test_readout_tracks_the_platform(self):
         self.app._start_polling()
-        self.app.platform.move_to_orientation(Orientation(28.0, 0.1, -0.05))
+        self.app.platform.move_to_orientation(Orientation(2.0, 0.1, -0.05))
         self.pump(0.6)
-        text = self.app.orientation_var.get()
-        self.assertIn("28.0", text)
-        self.assertIn("0.10000", text)
-        detail = self.app.orientation_detail_var.get()
-        self.assertIn("arcmin", detail)
+        # Focus has its own readout now; the window is built around it.
+        focus = self.app.focus_readout_var.get()
+        self.assertIn("2.0", focus)
+        self.assertIn("um", focus)
+        self.assertIn("towards M1", focus)
+        # The tilts are still shown, just smaller and secondary.
+        self.assertIn("0.10000", self.app.orientation_var.get())
+        self.assertIn("arcmin", self.app.orientation_detail_var.get())
+
+    def test_gauge_follows_the_focus(self):
+        self.app._start_polling()
+        self.app.platform.move_to_orientation(Orientation(3.0, 0.0, 0.0))
+        self.pump(0.6)
+        self.assertAlmostEqual(self.app.gauge._position_mm, 3.0, places=2)
+        self.assertTrue(self.app.gauge._valid)
+
+    def test_gauge_blanks_when_a_motor_is_lost(self):
+        self.app._start_polling()
+        self.pump(0.4)
+        self.app.platform.motors[0]._transport.set_offline(True)
+        self.pump(0.6)
+        self.assertFalse(self.app.gauge._valid)
+
+    def test_tip_and_tilt_are_behind_a_menu(self):
+        """The main window is about focus; the tilts are one menu away."""
+        labels = []
+        for index in range(self.app.menubar.index("end") + 1):
+            try:
+                labels.append(self.app.menubar.entrycget(index, "label"))
+            except Exception:
+                pass
+        self.assertIn("Motion", labels)
+        self.assertIn("View", labels)
+        self.assertIn("Tools", labels)
+        # The variables exist whether or not the dialog is open, so a move
+        # command can always read them.
+        self.assertEqual(self.app.tip_var.get(), "0.0")
+        self.assertIsNone(self.app._tilt_window)
+        self.app.on_open_tilt()
+        self.pump(0.3)
+        self.assertTrue(self.app._tilt_window.winfo_exists())
+        self.app._tilt_window.destroy()
+
+    def test_focal_plane_picture_shows_each_actuator(self):
+        self.app._start_polling()
+        self.app.on_open_plane_view()
+        self.pump(0.3)
+        self.app.platform.move_to_orientation(Orientation(1.0, 0.1, -0.05))
+        self.pump(0.6)
+        self.assertIsNotNone(self.app.plane_view)
+        self.assertEqual(len(self.app.plane_view._z), 3)
+        # A tip means the actuators are not all at the same height.
+        self.assertGreater(max(self.app.plane_view._z) - min(self.app.plane_view._z),
+                           0.1)
+        self.app._plane_window.destroy()
+        self.pump(0.2)
+        self.assertIsNone(self.app.plane_view)
+
+    def test_picture_refuses_to_draw_a_stale_plane(self):
+        self.app._start_polling()
+        self.app.on_open_plane_view()
+        self.pump(0.4)
+        self.app.platform.motors[1]._transport.set_offline(True)
+        self.pump(0.6)
+        self.assertIsNone(self.app.plane_view._z)
+        self.assertIn("East", self.app.plane_view._message)
+        self.app._plane_window.destroy()
+
+    def test_connection_settings_apply_and_rebuild(self):
+        """Editing an address has to rebuild the motors, or only the label
+        would change."""
+        self.app.cfg.actuators[0].ip = "10.1.2.3"
+        self.app._refresh_addresses()
+        self.assertIn("10.1.2.3", self.app.addresses_var.get())
+        self.app._rebuild_platform()
+        self.assertEqual(self.app.platform.motors[0].cfg.ip, "10.1.2.3")
+        self.assertFalse(self.app.platform.connected)
 
     def test_rows_show_each_actuator(self):
         self.app._start_polling()
         self.pump(0.5)
-        self.assertEqual(set(self.app.rows), {"A", "B", "C"})
+        self.assertEqual(set(self.app.rows), {"Top", "East", "West"})
         for name, row in self.app.rows.items():
             self.assertIn("mm", row.position_var.get())
             self.assertIn("ct", row.counts_var.get())
@@ -125,17 +197,17 @@ class TestGui(unittest.TestCase):
         self.pump(0.4)
         self.app.platform.motors[0]._transport.set_offline(True)
         self.pump(0.6)
-        self.assertIn("no comms", self.app.rows["A"].mode_var.get())
+        self.assertIn("no comms", self.app.rows["Top"].mode_var.get())
         self.assertIn("unavailable", self.app.orientation_var.get())
 
     def test_brake_lamp_follows_the_brake(self):
         self.app._start_polling()
         self.app.platform.set_all_brakes(engaged=True)
         self.pump(0.5)
-        self.assertIn("engaged", self.app.rows["A"].brake_var.get())
+        self.assertIn("engaged", self.app.rows["Top"].brake_var.get())
         self.app.platform.move_to_orientation(Orientation(26.0, 0.0, 0.0))
         self.pump(0.5)
-        self.assertIn("released", self.app.rows["A"].brake_var.get())
+        self.assertIn("released", self.app.rows["Top"].brake_var.get())
 
     # ---- the property that matters ---------------------------------------
 

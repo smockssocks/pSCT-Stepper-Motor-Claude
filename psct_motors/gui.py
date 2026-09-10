@@ -42,7 +42,9 @@ from typing import Callable, Optional
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from .config import load_config, default_config_path
+from .config import load_config, save_config, default_config_path
+from .focus_gauge import FocusGauge
+from .plane_view import FocalPlaneView
 from .jvl_motor import BrakeState
 from .kinematics import Orientation
 from .platform import FocalPlanePlatform, PlatformError, PlatformState
@@ -198,13 +200,62 @@ class MotorApp:
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(4, weight=1)
+        self.root.rowconfigure(2, weight=1)
 
+        self._build_menu()
         self._build_stop_bar()
         self._build_connection()
-        self._build_focal_plane()
-        self._build_actuators()
+
+        # The working area: focus on the left, the gauge on the right.
+        body = ttk.Frame(self.root)
+        body.grid(row=2, column=0, sticky="nsew", padx=6, pady=3)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+
+        self._build_focal_plane(body)
+        self._build_actuators(body)
+        self._build_gauge(body)
         self._build_log()
+
+    def _build_menu(self) -> None:
+        """Tip and tilt live here rather than on the main panel.
+
+        Day to day this mechanism is a focus drive: the site's own procedure
+        motorises only the optical axis, and the two tilts exist to correct
+        the focal plane's orientation, not to be set routinely. Keeping them
+        one menu item away means the main window says what the job is, while
+        the capability is still there for whoever needs it.
+        """
+        menubar = tk.Menu(self.root)
+
+        motion = tk.Menu(menubar, tearoff=0)
+        motion.add_command(label="Tip and tilt...", command=self.on_open_tilt)
+        motion.add_separator()
+        motion.add_command(label="Set zero here", command=self.on_set_zero)
+        motion.add_command(label="Copy current orientation into the boxes",
+                           command=self.on_copy_current)
+        menubar.add_cascade(label="Motion", menu=motion)
+
+        view = tk.Menu(menubar, tearoff=0)
+        view.add_command(label="Focal plane picture...",
+                         command=self.on_open_plane_view)
+        menubar.add_cascade(label="View", menu=view)
+
+        tools = tk.Menu(menubar, tearoff=0)
+        tools.add_command(label="Connection settings...",
+                          command=self.on_edit_connection)
+        tools.add_command(label="Find hard stop (calibration)...",
+                          command=self.on_find_hard_stop)
+        tools.add_separator()
+        tools.add_command(label="Clear errors", command=self.on_clear_errors)
+        tools.add_command(label="Release all brakes",
+                          command=lambda: self.on_brake(None, engage=False))
+        tools.add_command(label="Engage all brakes",
+                          command=lambda: self.on_brake(None, engage=True))
+        menubar.add_cascade(label="Tools", menu=tools)
+
+        self.root.config(menu=menubar)
+        self.menubar = menubar
 
     def _build_stop_bar(self) -> None:
         bar = tk.Frame(self.root, bg=COLOR_STOP_DARK)
@@ -248,81 +299,89 @@ class MotorApp:
         ttk.Button(frame, text="Set zero here",
                    command=self.on_set_zero).grid(row=0, column=4, padx=6)
 
-        addresses = ", ".join(f"{a.name}:{a.ip}" for a in self.cfg.actuators)
-        ttk.Label(frame, text=addresses, foreground="#555").grid(
-            row=0, column=5, padx=10, sticky="w")
+        self.addresses_var = tk.StringVar()
+        ttk.Label(frame, textvariable=self.addresses_var,
+                  foreground="#555").grid(row=0, column=5, padx=10, sticky="w")
+        ttk.Button(frame, text="Edit...",
+                   command=self.on_edit_connection).grid(row=0, column=6, padx=4)
+        self._refresh_addresses()
 
-    def _build_focal_plane(self) -> None:
-        frame = ttk.LabelFrame(self.root, text="Focal plane")
-        frame.grid(row=2, column=0, sticky="ew", padx=6, pady=3)
+    def _refresh_addresses(self) -> None:
+        self.addresses_var.set(
+            "   ".join(f"{a.name} {a.ip}:{a.port}" for a in self.cfg.actuators))
+
+    def _build_focal_plane(self, parent) -> None:
+        frame = ttk.LabelFrame(parent, text="Focus  (along the optical axis)")
+        frame.grid(row=0, column=0, sticky="ew", pady=(0, 3))
+        frame.columnconfigure(9, weight=1)
 
         # --- live readout ---
         readout = ttk.Frame(frame)
-        readout.grid(row=0, column=0, columnspan=8, sticky="ew", padx=6, pady=(6, 2))
+        readout.grid(row=0, column=0, columnspan=10, sticky="ew", padx=6, pady=(6, 2))
 
+        self.focus_readout_var = tk.StringVar(value="not connected")
+        ttk.Label(readout, textvariable=self.focus_readout_var,
+                  font=("TkFixedFont", 15, "bold")).grid(row=0, column=0, sticky="w")
+
+        # Kept under its original name: other code and the tests read it, and
+        # it is still the full orientation in one line.
         self.orientation_var = tk.StringVar(value="not connected")
         ttk.Label(readout, textvariable=self.orientation_var,
-                  font=("TkFixedFont", 12, "bold")).grid(row=0, column=0, sticky="w")
+                  foreground="#555",
+                  font=("TkFixedFont", 9)).grid(row=1, column=0, sticky="w")
         self.orientation_detail_var = tk.StringVar(value="")
         ttk.Label(readout, textvariable=self.orientation_detail_var,
-                  foreground="#555").grid(row=1, column=0, sticky="w")
+                  foreground="#777").grid(row=2, column=0, sticky="w")
 
         ttk.Separator(frame, orient="horizontal").grid(
-            row=1, column=0, columnspan=8, sticky="ew", padx=6, pady=4)
+            row=1, column=0, columnspan=10, sticky="ew", padx=6, pady=6)
 
-        # --- absolute command ---
-        ttk.Label(frame, text="Go to:").grid(row=2, column=0, padx=(6, 2), sticky="e")
-
-        ttk.Label(frame, text="focus (mm)").grid(row=2, column=1, sticky="e", padx=2)
-        self.focus_var = tk.StringVar(value="25.0")
-        ttk.Entry(frame, textvariable=self.focus_var, width=10).grid(row=2, column=2, padx=2)
-
-        ttk.Label(frame, text="tip (deg, about +x)").grid(row=2, column=3, sticky="e", padx=2)
-        self.tip_var = tk.StringVar(value="0.0")
-        ttk.Entry(frame, textvariable=self.tip_var, width=10).grid(row=2, column=4, padx=2)
-
-        ttk.Label(frame, text="tilt (deg, about +y)").grid(row=2, column=5, sticky="e", padx=2)
-        self.tilt_var = tk.StringVar(value="0.0")
-        ttk.Entry(frame, textvariable=self.tilt_var, width=10).grid(row=2, column=6, padx=2)
-
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=2, column=7, padx=6)
-        ttk.Button(buttons, text="Preview", command=self.on_preview).grid(row=0, column=0, padx=2)
-        self.move_btn = ttk.Button(buttons, text="Move", command=self.on_move)
-        self.move_btn.grid(row=0, column=1, padx=2)
-        ttk.Button(buttons, text="Copy current",
-                   command=self.on_copy_current).grid(row=0, column=2, padx=2)
+        # --- absolute focus command ---
+        ttk.Label(frame, text="Go to focus (mm):").grid(row=2, column=0, padx=(8, 2),
+                                                        sticky="e")
+        self.focus_var = tk.StringVar(value="0.0")
+        ttk.Entry(frame, textvariable=self.focus_var, width=12,
+                  font=("TkDefaultFont", 11)).grid(row=2, column=1, padx=2, pady=4)
+        ttk.Button(frame, text="Preview",
+                   command=self.on_preview).grid(row=2, column=2, padx=(6, 2))
+        self.move_btn = ttk.Button(frame, text="Move", command=self.on_move)
+        self.move_btn.grid(row=2, column=3, padx=2)
+        ttk.Label(frame, text="+ towards M1,  − towards M2",
+                  foreground="#777").grid(row=2, column=4, padx=(12, 4), sticky="w")
 
         # --- relative nudges ---
         nudge = ttk.Frame(frame)
-        nudge.grid(row=3, column=0, columnspan=8, sticky="w", padx=6, pady=(8, 8))
+        nudge.grid(row=3, column=0, columnspan=10, sticky="w", padx=8, pady=(6, 10))
+        ttk.Label(nudge, text="Nudge focus by (mm):").grid(row=0, column=0, padx=(0, 6))
+        self.focus_step_var = tk.StringVar(value="0.010")
+        ttk.Entry(nudge, textvariable=self.focus_step_var,
+                  width=10).grid(row=0, column=1, padx=2)
+        tk.Button(nudge, text="−", width=4, font=("TkDefaultFont", 12, "bold"),
+                  command=lambda: self.on_nudge("focus", -1)).grid(row=0, column=2, padx=3)
+        tk.Button(nudge, text="+", width=4, font=("TkDefaultFont", 12, "bold"),
+                  command=lambda: self.on_nudge("focus", +1)).grid(row=0, column=3, padx=3)
 
-        ttk.Label(nudge, text="Nudge:").grid(row=0, column=0, padx=(0, 6))
-        ttk.Label(nudge, text="focus step (mm)").grid(row=0, column=1, padx=2)
-        self.focus_step_var = tk.StringVar(value="0.100")
-        ttk.Entry(nudge, textvariable=self.focus_step_var, width=8).grid(row=0, column=2, padx=2)
-        ttk.Button(nudge, text="−", width=3,
-                   command=lambda: self.on_nudge("focus", -1)).grid(row=0, column=3, padx=1)
-        ttk.Button(nudge, text="+", width=3,
-                   command=lambda: self.on_nudge("focus", +1)).grid(row=0, column=4, padx=(1, 12))
+        for label, step in (("1 um", 0.001), ("10 um", 0.010),
+                            ("50 um", 0.050), ("0.5 mm", 0.500)):
+            ttk.Button(nudge, text=label, width=7,
+                       command=lambda v=step: self.focus_step_var.set(f"{v:.3f}")
+                       ).grid(row=0, column=4 + list(
+                           ("1 um", "10 um", "50 um", "0.5 mm")).index(label),
+                              padx=2)
 
-        ttk.Label(nudge, text="angle step (deg)").grid(row=0, column=5, padx=2)
+        # --- tip/tilt entries exist here but are shown in the dialog --------
+        # They live on the app so the dialog, the tests and the move code can
+        # all reach them whether or not the dialog is currently open.
+        self.tip_var = tk.StringVar(value="0.0")
+        self.tilt_var = tk.StringVar(value="0.0")
         self.angle_step_var = tk.StringVar(value="0.010")
-        ttk.Entry(nudge, textvariable=self.angle_step_var, width=8).grid(row=0, column=6, padx=2)
-        ttk.Label(nudge, text="tip").grid(row=0, column=7, padx=(8, 1))
-        ttk.Button(nudge, text="−", width=3,
-                   command=lambda: self.on_nudge("tip", -1)).grid(row=0, column=8, padx=1)
-        ttk.Button(nudge, text="+", width=3,
-                   command=lambda: self.on_nudge("tip", +1)).grid(row=0, column=9, padx=1)
-        ttk.Label(nudge, text="tilt").grid(row=0, column=10, padx=(8, 1))
-        ttk.Button(nudge, text="−", width=3,
-                   command=lambda: self.on_nudge("tilt", -1)).grid(row=0, column=11, padx=1)
-        ttk.Button(nudge, text="+", width=3,
-                   command=lambda: self.on_nudge("tilt", +1)).grid(row=0, column=12, padx=1)
+        self._tilt_window = None
+        self._plane_window = None
+        self.plane_view = None
 
-    def _build_actuators(self) -> None:
-        frame = ttk.LabelFrame(self.root, text="Actuators")
-        frame.grid(row=3, column=0, sticky="ew", padx=6, pady=3)
+    def _build_actuators(self, parent) -> None:
+        frame = ttk.LabelFrame(parent, text="Actuators")
+        frame.grid(row=1, column=0, sticky="nsew", pady=3)
 
         headers = ["", "position", "counts", "", "mode", "", "brake",
                    "", "", "", "jog", ""]
@@ -353,13 +412,22 @@ class MotorApp:
         ttk.Button(footer, text="Engage all brakes",
                    command=lambda: self.on_brake(None, engage=True)).grid(row=0, column=4, padx=4)
 
+    def _build_gauge(self, parent) -> None:
+        frame = ttk.LabelFrame(parent, text="Distance from zero")
+        frame.grid(row=0, column=1, rowspan=3, sticky="ns", padx=(6, 0))
+        frame.rowconfigure(0, weight=1)
+        self.gauge = FocusGauge(frame,
+                                min_mm=self.cfg.limits.min_focus_mm,
+                                max_mm=self.cfg.limits.max_focus_mm)
+        self.gauge.grid(row=0, column=0, sticky="ns", padx=8, pady=8)
+
     def _build_log(self) -> None:
         frame = ttk.LabelFrame(self.root, text="Log")
-        frame.grid(row=4, column=0, sticky="nsew", padx=6, pady=(3, 6))
+        frame.grid(row=3, column=0, sticky="nsew", padx=6, pady=(3, 6))
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
-        self.log_text = tk.Text(frame, height=12, wrap="word", state="disabled",
+        self.log_text = tk.Text(frame, height=9, wrap="word", state="disabled",
                                 font=("TkFixedFont", 9))
         self.log_text.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=6)
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
@@ -490,19 +558,40 @@ class MotorApp:
 
         if state.orientation_valid and state.orientation:
             o = state.orientation
+            towards = ("towards M1" if o.focus_mm > 0
+                       else "towards M2" if o.focus_mm < 0 else "at zero")
+            self.focus_readout_var.set(
+                f"focus  {o.focus_mm:+9.4f} mm   ({o.focus_mm * 1000:+.0f} um, {towards})"
+                + ("   [MOVING]" if state.moving else "")
+            )
             self.orientation_var.set(
-                f"focus {o.focus_mm:+9.4f} mm   "
                 f"tip {o.tip_deg:+8.5f} deg   tilt {o.tilt_deg:+8.5f} deg"
             )
             self.orientation_detail_var.set(
                 f"total tilt {o.total_tilt_arcmin:.3f} arcmin "
                 f"({o.total_tilt_arcsec:.1f} arcsec) towards azimuth "
                 f"{o.tilt_azimuth_deg:.1f} deg"
-                + ("     [MOVING]" if state.moving else "")
             )
+            target = None
+            if state.all_connected:
+                try:
+                    target = self.platform.geometry.orientation_from_actuators(
+                        [m.target_mm for m in state.motors]).focus_mm
+                except Exception:      # a UI hint, never worth an exception
+                    target = None
+            self.gauge.update_position(o.focus_mm, target, valid=True)
+            if self.plane_view is not None:
+                self.plane_view.update_plane(
+                    [m.position_mm for m in state.motors],
+                    focus_mm=o.focus_mm, tip_deg=o.tip_deg, tilt_deg=o.tilt_deg)
         else:
+            self.focus_readout_var.set("focus unavailable")
             self.orientation_var.set("orientation unavailable")
             self.orientation_detail_var.set(state.message)
+            self.gauge.update_position(None, None, valid=False)
+            if self.plane_view is not None:
+                self.plane_view.update_plane(None, message=state.message
+                                             or "no reading")
 
         if state.any_error:
             self.conn_lamp.set(COLOR_BAD)
@@ -705,6 +794,347 @@ class MotorApp:
                 )
 
         self.run_async(f"Brake {who}", work)
+
+    # ---------------------------------------------------- focal plane picture
+
+    def on_open_plane_view(self) -> None:
+        """A live picture of the plate on its three actuators.
+
+        Separate from the main window on purpose: it is for watching, and it
+        wants room. It updates from the same poll as everything else, so it
+        costs no extra traffic to the motors.
+        """
+        if self._plane_window is not None and self._plane_window.winfo_exists():
+            self._plane_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        self._plane_window = window
+        window.title("Focal plane" + ("  [SIMULATION]" if self.simulate else ""))
+        window.geometry("520x460")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        self.plane_view = FocalPlaneView(
+            window,
+            points_xy_mm=[a.position_xy_mm for a in self.cfg.actuators],
+            names=[a.name for a in self.cfg.actuators],
+            focus_span_mm=max(abs(self.cfg.limits.min_focus_mm),
+                              abs(self.cfg.limits.max_focus_mm)),
+        )
+        self.plane_view.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+
+        tk.Label(
+            window, justify="left", anchor="w", fg="#666", wraplength=480,
+            text=("Dashed triangle: the zero plane. Solid: where the focal "
+                  "plane is now. The orange posts are each actuator's "
+                  "extension.\n\nVertical travel is exaggerated by the factor "
+                  "shown -- the plate is about a metre across and moves "
+                  "millimetres, so a true-scale drawing would be a flat line."),
+        ).grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+
+        ttk.Button(window, text="Close", command=window.destroy).grid(
+            row=2, column=0, pady=(0, 10))
+
+        def forget(_event=None):
+            self.plane_view = None
+            self._plane_window = None
+        window.bind("<Destroy>", forget)
+
+    # ------------------------------------------------------- tip/tilt dialog
+
+    def on_open_tilt(self) -> None:
+        """The tip/tilt controls, deliberately behind a menu."""
+        if self._tilt_window is not None and self._tilt_window.winfo_exists():
+            self._tilt_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        self._tilt_window = window
+        window.title("Tip and tilt")
+        window.transient(self.root)
+
+        tk.Label(
+            window, justify="left", anchor="w", wraplength=520, fg="#555",
+            text=("Tip and tilt change the ORIENTATION of the focal plane, not "
+                  "its focus. Day to day this mechanism is a focus drive, which "
+                  "is why these are kept out of the main window.\n\n"
+                  "tip  = rotation about the east-west axis\n"
+                  "tilt = rotation about the vertical axis\n\n"
+                  "A tilt costs actuator travel in proportion to the actuator "
+                  "radius, so check Preview before committing to one."),
+        ).grid(row=0, column=0, columnspan=8, sticky="w", padx=12, pady=(12, 8))
+
+        ttk.Separator(window, orient="horizontal").grid(
+            row=1, column=0, columnspan=8, sticky="ew", padx=12, pady=4)
+
+        ttk.Label(window, text="tip (deg)").grid(row=2, column=0, sticky="e",
+                                                 padx=(12, 2), pady=6)
+        ttk.Entry(window, textvariable=self.tip_var,
+                  width=12).grid(row=2, column=1, padx=2)
+        ttk.Label(window, text="tilt (deg)").grid(row=2, column=2, sticky="e", padx=(12, 2))
+        ttk.Entry(window, textvariable=self.tilt_var,
+                  width=12).grid(row=2, column=3, padx=2)
+        ttk.Button(window, text="Preview",
+                   command=self.on_preview).grid(row=2, column=4, padx=(12, 2))
+        ttk.Button(window, text="Move",
+                   command=self.on_move).grid(row=2, column=5, padx=2)
+
+        nudge = ttk.Frame(window)
+        nudge.grid(row=3, column=0, columnspan=8, sticky="w", padx=12, pady=(6, 4))
+        ttk.Label(nudge, text="Nudge by (deg):").grid(row=0, column=0, padx=(0, 6))
+        ttk.Entry(nudge, textvariable=self.angle_step_var,
+                  width=10).grid(row=0, column=1, padx=2)
+        ttk.Label(nudge, text="tip").grid(row=0, column=2, padx=(12, 2))
+        ttk.Button(nudge, text="−", width=3,
+                   command=lambda: self.on_nudge("tip", -1)).grid(row=0, column=3, padx=1)
+        ttk.Button(nudge, text="+", width=3,
+                   command=lambda: self.on_nudge("tip", +1)).grid(row=0, column=4, padx=1)
+        ttk.Label(nudge, text="tilt").grid(row=0, column=5, padx=(12, 2))
+        ttk.Button(nudge, text="−", width=3,
+                   command=lambda: self.on_nudge("tilt", -1)).grid(row=0, column=6, padx=1)
+        ttk.Button(nudge, text="+", width=3,
+                   command=lambda: self.on_nudge("tilt", +1)).grid(row=0, column=7, padx=1)
+
+        ttk.Button(window, text="Level (tip = tilt = 0)",
+                   command=self.on_level).grid(row=4, column=0, columnspan=2,
+                                               sticky="w", padx=12, pady=(8, 12))
+        ttk.Button(window, text="Close", command=window.destroy).grid(
+            row=4, column=5, sticky="e", padx=12, pady=(8, 12))
+
+    def on_level(self) -> None:
+        """Zero both tilts, keeping the current focus."""
+        self.tip_var.set("0.0")
+        self.tilt_var.set("0.0")
+        if not self.platform.connected:
+            return
+
+        def work():
+            current = self.platform.read_orientation()
+            self.platform.move_to_orientation(
+                Orientation(current.focus_mm, 0.0, 0.0))
+            self.log_threadsafe("Levelled: tip and tilt set to zero.")
+
+        self.run_async("Level", work)
+
+    # -------------------------------------------------- connection settings
+
+    def on_edit_connection(self) -> None:
+        """Edit each motor's IP and port without leaving the application.
+
+        Addresses change: a motor gets swapped, the subnet is renumbered, or
+        the bench and the telescope are simply not the same network. Making
+        that a text-file edit means someone has to find the text file.
+        """
+        window = tk.Toplevel(self.root)
+        window.title("Connection settings")
+        window.transient(self.root)
+
+        tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=460,
+                 text=("Address of each motor. Changes take effect on the next "
+                       "Connect, and can be saved into the configuration file "
+                       "so they persist.")
+                 ).grid(row=0, column=0, columnspan=4, sticky="w",
+                        padx=12, pady=(12, 8))
+
+        entries = {}
+        for index, actuator in enumerate(self.cfg.actuators):
+            ttk.Label(window, text=actuator.name, width=8,
+                      font=("TkDefaultFont", 10, "bold")).grid(
+                row=1 + index, column=0, sticky="e", padx=(12, 4), pady=4)
+            ip_var = tk.StringVar(value=actuator.ip)
+            port_var = tk.StringVar(value=str(actuator.port))
+            ttk.Entry(window, textvariable=ip_var, width=18).grid(
+                row=1 + index, column=1, padx=4)
+            ttk.Label(window, text="port").grid(row=1 + index, column=2, padx=(8, 2))
+            ttk.Entry(window, textvariable=port_var, width=8).grid(
+                row=1 + index, column=3, padx=(0, 12))
+            entries[actuator.name] = (ip_var, port_var)
+
+        def apply(persist: bool) -> None:
+            for actuator in self.cfg.actuators:
+                ip_var, port_var = entries[actuator.name]
+                ip = ip_var.get().strip()
+                if not ip:
+                    messagebox.showerror(
+                        "Address needed",
+                        f"{actuator.name} has no IP address.", parent=window)
+                    return
+                try:
+                    port = int(port_var.get())
+                except ValueError:
+                    messagebox.showerror(
+                        "Check the port",
+                        f"{actuator.name}: port must be a whole number.",
+                        parent=window)
+                    return
+                if not (0 < port < 65536):
+                    messagebox.showerror(
+                        "Check the port",
+                        f"{actuator.name}: port must be 1..65535.", parent=window)
+                    return
+                actuator.ip, actuator.port = ip, port
+
+            self._refresh_addresses()
+            self._rebuild_platform()
+            self.log("Connection settings updated. Press Connect to use them.")
+            if persist:
+                path = save_config(self.cfg, self.config_path)
+                self.log(f"Saved to {path}")
+            window.destroy()
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=1 + len(self.cfg.actuators), column=0, columnspan=4,
+                     pady=(10, 12))
+        ttk.Button(buttons, text="Use for this session",
+                   command=lambda: apply(False)).grid(row=0, column=0, padx=6)
+        ttk.Button(buttons, text="Use and save",
+                   command=lambda: apply(True)).grid(row=0, column=1, padx=6)
+        ttk.Button(buttons, text="Cancel",
+                   command=window.destroy).grid(row=0, column=2, padx=6)
+
+    def _rebuild_platform(self) -> None:
+        """Rebuild the platform so new addresses are actually used.
+
+        A JVLMotor holds its transport, and the transport holds the address it
+        was built with, so editing the config alone would change the label and
+        nothing else.
+        """
+        was_connected = self.platform.connected
+        self._poll_stop.set()
+        try:
+            self.platform.disconnect()
+        except Exception:
+            pass
+        self.platform = FocalPlanePlatform(
+            cfg=self.cfg, simulate=self.simulate, logger=self.log_threadsafe,
+            config_path=self.config_path,
+        )
+        self.connect_btn.config(text="Connect")
+        self.conn_var.set("disconnected")
+        self.conn_lamp.set(COLOR_IDLE)
+        if was_connected:
+            self.log("Disconnected because the addresses changed.")
+
+    # ------------------------------------------------------ hard-stop search
+
+    def on_find_hard_stop(self) -> None:
+        """Drive one actuator until it physically stops.
+
+        This is the site's calibration procedure -- run the actuator out to its
+        end -- done under torque supervision so it stops when something
+        resists rather than continuing to push.
+        """
+        if not self.platform.connected:
+            messagebox.showwarning("Not connected", "Connect first.")
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Find hard stop")
+        window.transient(self.root)
+
+        tk.Label(
+            window, justify="left", anchor="w", wraplength=520,
+            text=("Drives ONE actuator until it will not go further, then backs "
+                  "the command off so it is not left pressed against the stop.\n\n"
+                  "It walks out in small steps and watches the motor's torque. "
+                  "If torque passes the configured limit, or a step barely "
+                  "moves, that is the stop.\n\n"
+                  "This moves one actuator on its own, which tilts the focal "
+                  "plane. Use it for calibration, not for observing."),
+            fg="#333",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(12, 8))
+
+        ttk.Label(window, text="Actuator").grid(row=1, column=0, sticky="e",
+                                                padx=(12, 4), pady=4)
+        motor_var = tk.StringVar(value=self.cfg.actuators[0].name)
+        ttk.OptionMenu(window, motor_var, motor_var.get(),
+                       *[a.name for a in self.cfg.actuators]).grid(
+            row=1, column=1, sticky="w", padx=4)
+
+        ttk.Label(window, text="Direction").grid(row=1, column=2, sticky="e", padx=(12, 4))
+        direction_var = tk.StringVar(value="+  towards M1")
+        ttk.OptionMenu(window, direction_var, direction_var.get(),
+                       "+  towards M1", "−  towards M2").grid(
+            row=1, column=3, sticky="w", padx=(0, 12))
+
+        ttk.Label(window, text="Step (mm)").grid(row=2, column=0, sticky="e",
+                                                 padx=(12, 4), pady=4)
+        step_var = tk.StringVar(value="0.20")
+        ttk.Entry(window, textvariable=step_var, width=10).grid(row=2, column=1,
+                                                                sticky="w", padx=4)
+        ttk.Label(window, text="Give up after (mm)").grid(row=2, column=2, sticky="e",
+                                                          padx=(12, 4))
+        budget_var = tk.StringVar(value="30.0")
+        ttk.Entry(window, textvariable=budget_var, width=10).grid(row=2, column=3,
+                                                                  sticky="w", padx=(0, 12))
+
+        actuator = self.cfg.actuator(motor_var.get())
+        ttk.Label(window,
+                  text=(f"Torque limit {actuator.stall_torque_percent:.0f}% "
+                        f"of the drive's current limit, over "
+                        f"{actuator.stall_persist_samples} consecutive readings."),
+                  foreground="#777").grid(row=3, column=0, columnspan=4,
+                                          sticky="w", padx=12, pady=(4, 8))
+
+        def start() -> None:
+            try:
+                step_mm = float(step_var.get())
+                budget_mm = float(budget_var.get())
+            except ValueError:
+                messagebox.showerror("Check the numbers",
+                                     "Step and budget must be numbers.",
+                                     parent=window)
+                return
+            name = motor_var.get()
+            direction = 1 if direction_var.get().startswith("+") else -1
+            if not messagebox.askyesno(
+                "Run into the end stop?",
+                f"{name} will be driven {direction_var.get().strip()} until it "
+                f"stops, up to {budget_mm} mm.\n\nThis moves one actuator "
+                "alone, which tilts the focal plane.\n\nProceed?",
+                parent=window,
+            ):
+                return
+            window.destroy()
+            self._run_hard_stop(name, direction, step_mm, budget_mm)
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=4, column=0, columnspan=4, pady=(6, 12))
+        ttk.Button(buttons, text="Find the stop",
+                   command=start).grid(row=0, column=0, padx=6)
+        ttk.Button(buttons, text="Cancel",
+                   command=window.destroy).grid(row=0, column=1, padx=6)
+
+    def _run_hard_stop(self, name: str, direction: int,
+                       step_mm: float, budget_mm: float) -> None:
+        def work():
+            motor = self.platform.motor(name)
+            scale = motor.cfg.resolved_counts_per_mm
+            step_counts = max(1, int(round(step_mm * scale)))
+            budget_counts = max(step_counts, int(round(budget_mm * scale)))
+            self.log_threadsafe(
+                f"{name}: searching for the hard stop, {direction:+d} direction, "
+                f"{step_counts} counts per step, up to {budget_counts} counts."
+            )
+
+            def progress(counts, torque):
+                self.log_threadsafe(
+                    f"{name}: at {counts} counts, peak torque {torque:.0f}%")
+
+            stop_counts = motor.seek_hard_stop(
+                direction=direction, step_counts=step_counts,
+                max_counts=budget_counts, progress=progress,
+            )
+            self.log_threadsafe(
+                f"{name}: hard stop at {stop_counts} counts "
+                f"({motor.cfg.counts_to_mm(stop_counts):+.4f} mm on the current "
+                "zero). Use Motion > Set zero here if this is your reference, "
+                "and narrow the travel limits in the config to keep moves "
+                "inside it."
+            )
+
+        self.run_async(f"Find hard stop ({name})", work)
 
     # ----------------------------------------------------------------- misc
 

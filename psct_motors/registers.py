@@ -286,6 +286,12 @@ REGISTERS: Tuple[RegisterDef, ...] = (
     RegisterDef(217, "ACTUAL_TORQUE", 32, True, False, CONFIRMED,
                 "Actual Torque. Rising torque at a standstill means the axis is "
                 "fighting something."),
+    RegisterDef(212, "CURRENT_MAX", 32, True, True, CONFIRMED,
+                "CL: Current Max. Reads 2048 on the pSCT motor, and Actual "
+                "Torque is expressed against it: 337/2048 is about 16%, which "
+                "matches the 15% the pSCT motion-control procedure reports as "
+                "typical. So torque percent = ACTUAL_TORQUE / CURRENT_MAX.",
+                unit="raw"),
     RegisterDef(173, "STALL_THRESHOLD", 32, True, True, CONFIRMED,
                 "Threshold Stall Detection.", unit="counts"),
 

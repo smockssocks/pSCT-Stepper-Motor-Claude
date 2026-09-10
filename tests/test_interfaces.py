@@ -67,7 +67,7 @@ class TestServer(unittest.TestCase):
     def test_ping(self):
         reply = self.call("ping")
         self.assertTrue(reply["ok"])
-        self.assertEqual(reply["result"]["actuators"], ["A", "B", "C"])
+        self.assertEqual(reply["result"]["actuators"], ["Top", "East", "West"])
         self.assertTrue(reply["result"]["simulated"])
 
     def test_status_shape(self):
@@ -323,7 +323,7 @@ class TestCli(unittest.TestCase):
 
     def test_simulated_move_runs(self):
         from psct_motors.cli import main
-        self.assertEqual(main(["--simulate", "-y", "move", "--focus", "26"]), 0)
+        self.assertEqual(main(["--simulate", "-y", "move", "--focus", "2.0"]), 0)
 
     def test_refused_move_exits_nonzero(self):
         from psct_motors.cli import main
@@ -331,7 +331,7 @@ class TestCli(unittest.TestCase):
 
     def test_preview_needs_no_hardware(self):
         from psct_motors.cli import main
-        self.assertEqual(main(["preview", "--focus", "25", "--tip", "0.1"]), 0)
+        self.assertEqual(main(["preview", "--focus", "2.0", "--tip", "0.1"]), 0)
 
     def test_register_table_prints_offline(self):
         from psct_motors.cli import main

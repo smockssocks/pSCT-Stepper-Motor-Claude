@@ -29,6 +29,16 @@ class MotorFault(RuntimeError):
     """The motor is reachable but refused to do what was asked."""
 
 
+class MotorStalled(MotorFault):
+    """The motor was working too hard and was stopped.
+
+    Its own class because a stall is not a failure in the usual sense: it is
+    the expected outcome of driving deliberately into an end stop, which is
+    how the pSCT actuators are calibrated. `seek_hard_stop` catches it and
+    reports success; everything else treats it as a fault.
+    """
+
+
 #: Registers used to determine the word order. Each holds a small,
 #: non-negative configuration value on a healthy motor, so its high word is
 #: zero -- which is what makes the two Modbus words distinguishable. Values
@@ -169,6 +179,10 @@ class JVLMotor:
         self._log = logger or (lambda msg: None)
         self._connected = False
         self._warned_no_encoder = False
+        self._over_torque_samples = 0
+        #: Highest torque percentage seen during the most recent move, so a
+        #: move that finished can still say how hard it had to work.
+        self.peak_torque_percent: Optional[float] = None
         #: Set by stop()/abort so a move loop waiting for in-position gives up
         #: instead of waiting out its full timeout on a motor that was halted.
         self._cancel = threading.Event()
@@ -439,6 +453,30 @@ class JVLMotor:
         """Projected minus actual, straight from the motor (register 20)."""
         return self.read_register("FLWERR")
 
+    # -------------------------------------------------------------- torque
+
+    def get_torque_percent(self) -> Optional[float]:
+        """Motor torque as a percentage of its current limit.
+
+        Actual Torque (register 217) over CL: Current Max (register 212). On
+        the pSCT motor these read 337 and 2048, giving 16% -- which matches
+        what the pSCT motion-control procedure records as typical for a
+        healthy move, so the interpretation is corroborated by the operating
+        notes rather than assumed.
+
+        Returns None when either register cannot be read, so a motor that does
+        not report torque degrades to no stall protection rather than to a
+        move that refuses to start.
+        """
+        try:
+            torque = abs(self.read_register("ACTUAL_TORQUE"))
+            limit = self.read_register("CURRENT_MAX")
+        except (ModbusError, MotorFault):
+            return None
+        if limit <= 0:
+            return None
+        return 100.0 * torque / limit
+
     def get_position_mm(self) -> float:
         return self.cfg.counts_to_mm(self.get_position_counts())
 
@@ -540,6 +578,7 @@ class JVLMotor:
         timeout = self.cfg.move_timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout
         stable = 0
+        self._over_torque_samples = 0
         while time.monotonic() < deadline:
             if self._cancel.is_set():
                 return False
@@ -551,6 +590,19 @@ class JVLMotor:
                     f"{self.name}: motor reported an error during the move -- "
                     f"{describe_errors(errors)}"
                 )
+
+            stalled = self._check_stall()
+            if stalled is not None:
+                if halt_on_failure:
+                    self.stop_quietly("the motor was working too hard")
+                raise MotorStalled(
+                    f"{self.name}: stopped because torque reached "
+                    f"{stalled:.0f}% of the current limit, over the "
+                    f"{self.cfg.stall_torque_percent:.0f}% limit, for "
+                    f"{self.cfg.stall_persist_samples} readings in a row. "
+                    "Something is resisting the motor: an end stop, an "
+                    "obstruction, or a brake that has not released."
+                )
             if self.is_in_position():
                 stable += 1
                 if stable >= stable_polls:
@@ -561,6 +613,150 @@ class JVLMotor:
         if halt_on_failure:
             self.stop_quietly(f"the move did not complete within {timeout:.0f} s")
         return False
+
+    def _check_stall(self) -> Optional[float]:
+        """Return the torque percentage if the motor has been over its limit
+        for long enough to count as a stall, else None.
+
+        Requires several consecutive over-limit readings, because torque spikes
+        briefly on every acceleration. One sample would abort healthy moves.
+        """
+        if not self.cfg.stall_protection:
+            return None
+        percent = self.get_torque_percent()
+        if percent is None:
+            return None
+        if self.peak_torque_percent is None or percent > self.peak_torque_percent:
+            self.peak_torque_percent = percent
+        if percent >= self.cfg.stall_torque_percent:
+            self._over_torque_samples += 1
+            if self._over_torque_samples >= self.cfg.stall_persist_samples:
+                return percent
+        else:
+            self._over_torque_samples = 0
+        return None
+
+    # --------------------------------------------------------- hard stop seek
+
+    def seek_hard_stop(self, direction: int, step_counts: int,
+                       max_counts: int,
+                       velocity_raw: Optional[int] = None,
+                       settle_s: float = 0.4,
+                       progress: Optional[Callable[[int, float], None]] = None) -> int:
+        """Drive until the axis physically stops, and return where that was.
+
+        This is the pSCT calibration procedure -- run the actuator out to its
+        end and let it stop there -- done deliberately rather than by watching
+        and hoping. The axis is walked out in small increments, and after each
+        one two things are checked:
+
+        * torque, which rises when something starts resisting, and
+        * whether the shaft actually moved, because at a hard stop it will not.
+
+        Either one ends the search. The motor is then commanded to hold where
+        it ended up, so it is not left pressed against the stop.
+
+        `direction` is +1 or -1. On the pSCT actuators, + counts move the
+        camera towards M1 and - towards M2.
+
+        Returns the encoder position where the axis stopped. Raises MotorFault
+        if `max_counts` is exhausted without finding a stop, which means the
+        travel is longer than expected or the torque limit is too high to
+        notice the end.
+        """
+        if direction not in (1, -1):
+            raise ValueError(f"direction must be +1 or -1, got {direction}")
+        if step_counts <= 0:
+            raise ValueError("step_counts must be positive")
+
+        self.clear_cancel()
+        self.ensure_position_mode()
+        original_velocity = self.read_register("V_SOLL")
+        # Deliberately slow. Running into a stop at speed is how a lead screw
+        # gets damaged, and a slow approach also makes the torque rise easy to
+        # distinguish from an acceleration transient.
+        seek_velocity = velocity_raw or max(1, original_velocity // 4)
+
+        start = self.get_position_counts()
+        travelled = 0
+        self.peak_torque_percent = None
+
+        try:
+            self.set_velocity(seek_velocity)
+            while travelled < max_counts:
+                if self._cancel.is_set():
+                    raise MotorFault(
+                        f"{self.name}: hard-stop search stopped by the operator."
+                    )
+                before = self.get_position_counts()
+                self.command_position_counts(before + direction * step_counts)
+
+                # Deliberately not wait_for_in_position: at a hard stop the
+                # move never completes, and that is the expected outcome here
+                # rather than an error.
+                deadline = time.monotonic() + settle_s + 5.0
+                while time.monotonic() < deadline:
+                    stalled = self._check_stall()
+                    if stalled is not None:
+                        stop_at = self.get_position_counts()
+                        self._settle_at_stop(stop_at)
+                        self._log(
+                            f"{self.name}: hard stop found at {stop_at} counts -- "
+                            f"torque reached {stalled:.0f}%."
+                        )
+                        return stop_at
+                    errors = self.get_errors()
+                    if errors:
+                        stop_at = self.get_position_counts()
+                        self._settle_at_stop(stop_at)
+                        raise MotorFault(
+                            f"{self.name}: the drive faulted during the hard-stop "
+                            f"search -- {describe_errors(errors)}"
+                        )
+                    if self.is_in_position():
+                        break
+                    time.sleep(0.05)
+
+                after = self.get_position_counts()
+                moved = abs(after - before)
+                if progress is not None:
+                    progress(after, self.peak_torque_percent or 0.0)
+
+                if moved < step_counts * 0.25:
+                    # It was told to move and barely did. That is a hard stop
+                    # whether or not the torque reading noticed.
+                    self._settle_at_stop(after)
+                    self._log(
+                        f"{self.name}: hard stop found at {after} counts -- "
+                        f"commanded {step_counts} counts, moved {moved}."
+                    )
+                    return after
+                travelled += moved
+        finally:
+            try:
+                self.set_velocity(original_velocity)
+            except (ModbusError, MotorFault):
+                pass
+
+        raise MotorFault(
+            f"{self.name}: travelled {travelled} counts from {start} without "
+            f"finding a hard stop, and gave up at the {max_counts}-count limit. "
+            "Either the travel is longer than expected, or the torque limit "
+            f"({self.cfg.stall_torque_percent:.0f}%) is too high for the end "
+            "stop to register."
+        )
+
+    def _settle_at_stop(self, position: int) -> None:
+        """Back the command off to where the axis actually is.
+
+        Without this the motor is left commanded past the stop and keeps
+        pushing against it, which is exactly the damage this is meant to
+        avoid.
+        """
+        try:
+            self.command_position_counts(position)
+        except (ModbusError, MotorFault) as exc:
+            self._log(f"{self.name}: could not release against the stop: {exc}")
 
     # ------------------------------------------------------------- stopping
 

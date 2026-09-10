@@ -51,7 +51,9 @@ class SimulatedJVLTransport:
     def __init__(self, name: str = "SIM", word_order: WordOrder = WordOrder.LOW_HIGH,
                  start_counts: int = 0, firmware_version: int = 540777,
                  gravity_counts_per_s: float = 0.0,
-                 follow_error_counts: int = 0):
+                 follow_error_counts: int = 0,
+                 hard_stop_low: Optional[int] = None,
+                 hard_stop_high: Optional[int] = None):
         self.name = name
         self.word_order = word_order
         self.gravity_counts_per_s = gravity_counts_per_s
@@ -63,6 +65,17 @@ class SimulatedJVLTransport:
         #: settled -- which is how the in-position logic's following-error
         #: condition gets exercised.
         self.follow_error_counts = follow_error_counts
+
+        #: Mechanical end stops, in counts. The shaft cannot pass them, and
+        #: torque climbs while the drive pushes against one -- which is what
+        #: the pSCT calibration procedure ("run it out until it stops") relies
+        #: on, and what `seek_hard_stop` has to detect.
+        self.hard_stop_low = hard_stop_low
+        self.hard_stop_high = hard_stop_high
+        #: Torque as a fraction of CL: Current Max while unobstructed. 337/2048
+        #: is about 16%, which is what the real motor reads.
+        self.idle_torque = 337
+        self.stalled_torque = 1600
         self._lock = threading.RLock()
         self._open = False
         self._offline = False
@@ -107,7 +120,11 @@ class SimulatedJVLTransport:
             40: -5000,                # Homing Velocity
             42: 0,                    # Homing Mode
             46: int(start_counts),    # Abs Encoder Position
-            97: 1794,                 # Bus voltage
+            # Above the acceptance threshold, i.e. the 60 V supply is on.
+            # The dumped motor read 1794 -- below acceptance -- because that
+            # dump was taken with the 60 V off, which is a fault state, not
+            # the state a test double should start in.
+            97: 4485,                 # Bus voltage (P+)
             98: 565,                  # Bus Voltage Min
             99: 4,                    # Encoder Type
             110: 100,                 # Position Settling Time
@@ -129,6 +146,7 @@ class SimulatedJVLTransport:
             199: 0,                   # ModBus Slave Timeout
             200: 0,                   # ModBus Slave Action
             202: 6674785,             # Ticks
+            212: 2048,                # CL: Current Max
             217: 337,                 # Actual Torque
             238: 21,                  # Motor Rotations
             246: 41687,               # Temperature
@@ -173,6 +191,7 @@ class SimulatedJVLTransport:
                 direction = 1.0 if delta > 0 else -1.0
                 self._position += direction * step
                 self.registers[12] = int(direction * speed / self.COUNTS_PER_SECOND_PER_VSOLL)
+            self._apply_hard_stops()
         else:
             # Drive off. If a load is configured and the brake output is not
             # holding, the axis creeps -- the failure mode the interlocks exist
@@ -191,6 +210,34 @@ class SimulatedJVLTransport:
         self.registers[46] = encoder
         self.registers[20] = projected - encoder
         self.registers[22] = max(self.registers.get(22, 0), abs(projected - encoder))
+
+    def _apply_hard_stops(self) -> None:
+        """Clamp the shaft at an end stop, and raise torque while it is held.
+
+        Torque is what a real drive does when it is commanded past an
+        obstruction: it pushes harder. Modelling that is the only way the
+        stall detection can be exercised without a real end stop.
+        """
+        pressing = False
+        if self.hard_stop_high is not None and self._position > self.hard_stop_high:
+            self._position = float(self.hard_stop_high)
+            pressing = True
+        if self.hard_stop_low is not None and self._position < self.hard_stop_low:
+            self._position = float(self.hard_stop_low)
+            pressing = True
+
+        if pressing:
+            target = float(self.registers.get(3, 0))
+            # Only under load while the drive is still commanded past the stop.
+            beyond = (
+                (self.hard_stop_high is not None and target > self.hard_stop_high)
+                or (self.hard_stop_low is not None and target < self.hard_stop_low)
+            )
+            self.registers[217] = self.stalled_torque if beyond else self.idle_torque
+            if beyond:
+                self.registers[12] = 0
+        else:
+            self.registers[217] = self.idle_torque
 
     def _brake_output_engaged(self) -> bool:
         """True when output bit 0 is low, i.e. a fail-safe brake is holding."""

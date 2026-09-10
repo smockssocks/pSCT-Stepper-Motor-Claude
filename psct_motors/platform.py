@@ -95,6 +95,7 @@ class FocalPlanePlatform:
         self.simulate = simulate
         self._log = logger or (lambda msg: None)
         self.geometry: ThreePointPlatform = platform_from_config(self.cfg)
+        self.external_brake = self._build_external_brake()
         self._move_lock = threading.RLock()
         self._abort = threading.Event()
 
@@ -104,7 +105,17 @@ class FocalPlanePlatform:
             # both directions are possible straight away.
             mid = (self.cfg.limits.min_focus_mm + self.cfg.limits.max_focus_mm) / 2.0
             self.motors: List[JVLMotor] = [
-                simulated_motor(a, start_mm=mid) for a in self.cfg.actuators
+                simulated_motor(
+                    a, start_mm=mid,
+                    # Mechanical end stops a little beyond the soft limits, so
+                    # `find-stop` has something to find in simulation and the
+                    # soft limits are still what stops an ordinary move first.
+                    # Without these, rehearsing the calibration would only ever
+                    # show the "no stop found" path.
+                    hard_stop_low=a.mm_to_counts(a.min_travel_mm - 2.0),
+                    hard_stop_high=a.mm_to_counts(a.max_travel_mm + 2.0),
+                )
+                for a in self.cfg.actuators
             ]
         else:
             self.motors = [
@@ -112,6 +123,44 @@ class FocalPlanePlatform:
                          retries=self.cfg.modbus_retries, logger=self._log)
                 for a in self.cfg.actuators
             ]
+
+    def _build_external_brake(self):
+        """The device that switches the focal-plane brakes, if there is one.
+
+        On the pSCT the brakes are not on the motors, so brake control has to
+        go somewhere else. Built unconditionally: when it is unconfigured it
+        still answers "not available, and here is why", which is more use than
+        an attribute that does not exist.
+        """
+        from .external_brake import BrakeController, ExternalBrakeConfig
+        settings = self.cfg.external_brake
+        return BrakeController(
+            ExternalBrakeConfig(
+                mode=settings.mode, host=settings.host, port=settings.port,
+                unit_id=settings.unit_id, timeout_s=settings.timeout_s,
+                all_or_nothing=settings.all_or_nothing,
+                coils=dict(settings.coils),
+                energized_releases=settings.energized_releases,
+                release_url=settings.release_url,
+                engage_url=settings.engage_url,
+                status_url=settings.status_url,
+                status_field=settings.status_field,
+            ),
+            logger=self._log,
+        )
+
+    @property
+    def drives_holding(self) -> bool:
+        """True when every motor is enabled and actively holding position.
+
+        The precondition for releasing a brake. Checked against the motors
+        rather than assumed, because the brake controller cannot see them.
+        """
+        from .registers import MotorMode
+        try:
+            return all(m.get_mode() == int(MotorMode.POSITION) for m in self.motors)
+        except (ModbusError, MotorFault):
+            return False
 
     # ------------------------------------------------------------ accessors
 
@@ -497,7 +546,24 @@ class FocalPlanePlatform:
     # ---------------------------------------------------------------- brakes
 
     def set_all_brakes(self, engaged: bool) -> Dict[str, str]:
-        """Engage or release every software-controlled brake."""
+        """Engage or release the brakes.
+
+        Prefers the external controller when one is configured, because on the
+        pSCT that is where the brakes actually are. Falls back to per-motor
+        outputs for an installation that wires them to the drives instead.
+        """
+        from .external_brake import BrakeError
+        if self.external_brake.available:
+            try:
+                if engaged:
+                    self.external_brake.engage()
+                else:
+                    self.external_brake.release(
+                        drives_holding=self.drives_holding)
+                return {"all": "ok"}
+            except BrakeError as exc:
+                return {"all": str(exc)}
+
         results: Dict[str, str] = {}
         for motor in self.motors:
             try:
@@ -511,6 +577,14 @@ class FocalPlanePlatform:
         return results
 
     def brake_states(self) -> Dict[str, BrakeState]:
+        from .external_brake import BrakeError
+        if self.external_brake.available:
+            try:
+                state = self.external_brake.read_state()
+            except BrakeError:
+                state = BrakeState.UNKNOWN
+            return {m.name: state for m in self.motors}
+
         out: Dict[str, BrakeState] = {}
         for motor in self.motors:
             try:

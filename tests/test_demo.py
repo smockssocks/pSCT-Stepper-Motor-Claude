@@ -259,7 +259,7 @@ class TestHaltOnFault(unittest.TestCase):
                 injector.clear()
 
             self.assertIn("error", done)
-            self.assertIn("B faulted", done["error"])
+            self.assertIn("East faulted", done["error"])
             self.assertIn("halted", done["error"])
 
             # Every axis, not just the faulting one, is holding where it stopped.
@@ -510,8 +510,8 @@ class TestDemoRuns(unittest.TestCase):
 
 class TestBuildMotor(unittest.TestCase):
     def test_builds_a_single_motor_with_no_platform(self):
-        motor = build_motor(None, "A", simulate=True)
-        self.assertEqual(motor.name, "A")
+        motor = build_motor(None, "Top", simulate=True)
+        self.assertEqual(motor.name, "Top")
         motor.connect()
         self.assertTrue(motor.connected)
         motor.disconnect()
@@ -528,7 +528,7 @@ class TestDemoCli(unittest.TestCase):
 
     def test_simulated_demo_runs_end_to_end(self):
         from psct_motors.cli import main
-        code = main(["--simulate", "-y", "demo", "--allow-motion",
+        code = main(["--simulate", "-y", "demo", "--motor", "Top", "--allow-motion",
                      "--no-operator", "--only",
                      "identity,mode,limit,fault-comms,fault-mode"])
         self.assertEqual(code, 0)

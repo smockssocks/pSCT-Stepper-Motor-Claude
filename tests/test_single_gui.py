@@ -51,7 +51,7 @@ class TestSingleMotorGui(unittest.TestCase):
         self.log_path = os.path.join(self.dir, "events.jsonl")
         self.root = tk.Tk()
         self.root.withdraw()
-        self.app = SingleMotorApp(self.root, motor_name="A", simulate=True,
+        self.app = SingleMotorApp(self.root, motor_name="Top", simulate=True,
                                   log_path=self.log_path)
         self.app.on_connect()
         self.pump(1.0)

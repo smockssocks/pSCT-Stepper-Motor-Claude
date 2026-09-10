@@ -97,8 +97,8 @@ def cmd_init_config(args) -> int:
     out("")
     out("Then run, in order:")
     out("  python -m psct_motors.cli verify-registers")
-    out("  python -m psct_motors.cli check-direction --motor A")
-    out("  python -m psct_motors.cli calibrate --motor A")
+    out("  python -m psct_motors.cli check-direction --motor Top")
+    out("  python -m psct_motors.cli calibrate --motor Top")
     return 0
 
 
@@ -689,6 +689,68 @@ def cmd_demo(args) -> int:
         motor.disconnect()
 
 
+def cmd_find_stop(args) -> int:
+    """Drive one actuator into its end stop, under torque supervision.
+
+    This is the site's calibration procedure -- run the actuator out until it
+    stops -- with the motor's torque watched so it stops when something
+    resists instead of continuing to push.
+    """
+    from .demo import build_motor
+
+    motor = build_motor(args.config, args.motor, args.simulate)
+    try:
+        motor.connect(verify_word_order=False)
+    except (ModbusError, MotorFault) as exc:
+        out(f"Could not connect to motor {args.motor}: {exc}")
+        return 1
+    try:
+        scale = motor.cfg.resolved_counts_per_mm
+        step_counts = max(1, int(round(args.step_mm * scale)))
+        budget_counts = max(step_counts, int(round(args.budget_mm * scale)))
+        direction = 1 if args.direction == "+" else -1
+        towards = "M1 (primary)" if direction > 0 else "M2 (secondary)"
+
+        rule(f"Find hard stop -- {motor.name}")
+        out(f"  direction     {args.direction}  towards {towards}")
+        out(f"  step          {args.step_mm} mm  ({step_counts} counts)")
+        out(f"  give up after {args.budget_mm} mm  ({budget_counts} counts)")
+        out(f"  torque limit  {motor.cfg.stall_torque_percent:.0f}% of the "
+            f"drive's current limit, over "
+            f"{motor.cfg.stall_persist_samples} consecutive readings")
+        out(f"  starting at   {motor.get_position_counts()} counts")
+        out("")
+        out("This moves ONE actuator, which tilts the focal plane. When it")
+        out("stops, the command is backed off so it is not left pressed against")
+        out("the end.")
+        if not confirm("Run it into the stop?", args.yes):
+            return 1
+
+        def progress(counts, torque):
+            out(f"    {counts:>12} counts   peak torque {torque:5.1f}%")
+
+        stop_counts = motor.seek_hard_stop(
+            direction=direction, step_counts=step_counts,
+            max_counts=budget_counts, progress=progress,
+        )
+        out("")
+        rule("Result")
+        out(f"  hard stop at {stop_counts} counts "
+            f"({motor.cfg.counts_to_mm(stop_counts):+.4f} mm on the current zero)")
+        out(f"  peak torque  {motor.peak_torque_percent or 0.0:.1f}%")
+        out("")
+        out("Next: repeat in the other direction to learn the full travel, then")
+        out("set the soft limits in the config to sit inside what you found, and")
+        out("`set-zero` wherever you want the reference to be.")
+        return 0
+    except MotorFault as exc:
+        out("")
+        out(f"Search stopped: {exc}")
+        return 1
+    finally:
+        motor.disconnect()
+
+
 def cmd_motor_report(args) -> int:
     """Everything the motor will tell you about itself, in one page.
 
@@ -914,6 +976,7 @@ one motor on a bench
 --------------------
   motor-gui            live GUI: state, errors, fault injection, event log
   motor-report         one page of everything the motor reports
+  find-stop            drive an actuator into its end stop, watching torque
   demo                 exercise a single motor and deliberately provoke
                        faults, to see the error handling work
   diagnose             explain why a motor is not taking position commands
@@ -950,13 +1013,13 @@ one motor on a bench
 
     p = sub.add_parser("check-direction",
                        help="confirm which way an actuator moves the focal plane")
-    p.add_argument("--motor", required=True, help="actuator name, e.g. A")
+    p.add_argument("--motor", required=True, help="actuator name, e.g. Top")
     p.add_argument("--mm", type=float, default=0.5,
                    help="test move size in mm (default 0.5)")
     p.set_defaults(func=cmd_check_direction)
 
     p = sub.add_parser("calibrate", help="measure counts per millimetre")
-    p.add_argument("--motor", required=True, help="actuator name, e.g. A")
+    p.add_argument("--motor", required=True, help="actuator name, e.g. Top")
     p.add_argument("--counts", type=int, default=409600,
                    help="counts to move for the test (default 409600, one motor rev)")
     p.add_argument("--measured-mm", type=float,
@@ -1015,7 +1078,8 @@ one motor on a bench
             "Nothing turns the shaft unless you pass --allow-motion."
         ),
     )
-    p.add_argument("--motor", default="A", help="actuator name from the config (default A)")
+    p.add_argument("--motor", default="Top",
+                   help="actuator name from the config (default Top)")
     p.add_argument("--allow-motion", action="store_true",
                    help="permit drills that turn the shaft")
     p.add_argument("--range-revs", type=float, default=2.0,
@@ -1037,15 +1101,33 @@ one motor on a bench
             "calibration, records an event log to disk as it runs."
         ),
     )
-    p.add_argument("--motor", default="A", help="actuator name (default A)")
+    p.add_argument("--motor", default="Top", help="actuator name (default Top)")
     p.add_argument("--log", help="path for the JSONL event log")
     p.set_defaults(func=cmd_motor_gui)
+
+    p = sub.add_parser(
+        "find-stop",
+        help="drive one actuator into its end stop, watching torque",
+        description=(
+            "The site's calibration procedure -- run the actuator out until it "
+            "stops -- with the motor's torque watched so it stops when "
+            "something resists rather than continuing to push."
+        ),
+    )
+    p.add_argument("--motor", default="Top")
+    p.add_argument("--direction", choices=["+", "-"], default="+",
+                   help="+ towards M1 (primary), - towards M2 (secondary)")
+    p.add_argument("--step-mm", type=float, default=0.2,
+                   help="how far to move between torque checks (default 0.2)")
+    p.add_argument("--budget-mm", type=float, default=30.0,
+                   help="give up after this much travel (default 30)")
+    p.set_defaults(func=cmd_find_stop)
 
     p = sub.add_parser(
         "motor-report",
         help="one page of everything the motor reports, including its latched history",
     )
-    p.add_argument("--motor", default="A")
+    p.add_argument("--motor", default="Top")
     p.add_argument("--all-registers", action="store_true",
                    help="also dump every register this software knows about")
     p.set_defaults(func=cmd_motor_report)
@@ -1054,7 +1136,7 @@ one motor on a bench
         "diagnose",
         help="explain why a motor is not taking position commands",
     )
-    p.add_argument("--motor", default="A")
+    p.add_argument("--motor", default="Top")
     p.add_argument("--no-write-probe", action="store_true",
                    help="skip the P_SOLL readback probe (which commands the "
                         "position the motor is already at, so cannot move it)")
@@ -1064,7 +1146,7 @@ one motor on a bench
         "watch",
         help="record mode, error, target and timing changes to a log file",
     )
-    p.add_argument("--motor", default="A")
+    p.add_argument("--motor", default="Top")
     p.add_argument("--log", help="path for the JSONL event log")
     p.add_argument("--interval", type=float, default=0.5,
                    help="seconds between polls (default 0.5)")

@@ -424,7 +424,7 @@ class TestPlatform(unittest.TestCase):
         self.platform.motors[1].disconnect()
         with self.assertRaises(PlatformError) as ctx:
             self.platform.move_to_orientation(Orientation(30.0, 0.0, 0.0))
-        self.assertIn("B", str(ctx.exception))
+        self.assertIn("East", str(ctx.exception))
 
     def test_move_refused_when_a_motor_has_an_error(self):
         self.platform.motors[2]._transport.inject_error(1 << 3)
@@ -492,15 +492,15 @@ class TestPlatform(unittest.TestCase):
         state = self.platform.read_state()
         self.assertFalse(state.orientation_valid)
         self.assertIsNone(state.orientation)
-        self.assertIn("A", state.message)
+        self.assertIn("Top", state.message)
 
     def test_single_actuator_move_for_commissioning(self):
-        status = self.platform.move_actuator_mm("B", 28.0)
+        status = self.platform.move_actuator_mm("East", 28.0)
         self.assertAlmostEqual(status.position_mm, 28.0, places=2)
 
     def test_single_actuator_move_still_honours_travel_limits(self):
         with self.assertRaises(MotorFault):
-            self.platform.move_actuator_mm("B", 80.0)
+            self.platform.move_actuator_mm("East", 80.0)
 
     def test_set_zero_here_rebases_the_orientation(self):
         self.platform.move_to_orientation(Orientation(27.0, 0.05, 0.0))
@@ -520,7 +520,7 @@ class TestConfigValidation(unittest.TestCase):
 
     def test_rejects_duplicate_names(self):
         cfg = default_config()
-        cfg.actuators[1].name = "A"
+        cfg.actuators[1].name = cfg.actuators[0].name
         with self.assertRaises(ValueError):
             cfg.validate()
 

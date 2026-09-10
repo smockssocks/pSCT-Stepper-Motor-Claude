@@ -19,6 +19,7 @@ python -m psct_motors.cli gui --simulate      # try it, no hardware needed
 - [The mechanism](#the-mechanism)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Try it with no hardware](#try-it-with-no-hardware)
 - [One motor on the bench](#one-motor-on-the-bench)
 - [When it stops taking commands](#when-it-stops-taking-commands)
 - [Commissioning](#commissioning-do-this-before-trusting-anything)
@@ -123,6 +124,31 @@ until you drop the flag.
 
 ---
 
+## Try it with no hardware
+
+Every command takes `--simulate`, which stands in three dummy motors that
+behave like the real ones — same register map, same 231-count following error,
+same end stops:
+
+```
+python -m psct_motors.cli gui --simulate
+```
+
+Open **View → Focal plane picture** for a live drawing of the plate on its
+three actuators. The dashed triangle is the zero plane, the solid one is where
+the focal plane is now, and the orange posts are each actuator's extension.
+Move the focus or nudge a tilt and watch it respond.
+
+Vertical travel is exaggerated by the factor shown on the picture, and labelled
+as such: the plate is about a metre across and moves millimetres, so a true
+1:1 drawing would be a flat line.
+
+`cli find-stop --simulate` works too — the simulated actuators have end stops a
+little past their soft limits, so the calibration procedure can be rehearsed
+before it is run on the telescope.
+
+---
+
 ## One motor on the bench
 
 You do not need all three motors to make progress. The demo exercises **one**
@@ -131,8 +157,8 @@ things on purpose so you can watch the error handling work.
 
 ```
 python -m psct_motors.cli demo --list                    # what it will do
-python -m psct_motors.cli demo --motor A                 # read-only drills
-python -m psct_motors.cli demo --motor A --allow-motion  # include moving ones
+python -m psct_motors.cli demo --motor Top               # read-only drills
+python -m psct_motors.cli demo --motor Top --allow-motion  # include moving ones
 ```
 
 It reports in **counts, revolutions and degrees of motor shaft** — never
@@ -220,7 +246,7 @@ Nothing in the Modbus response distinguishes them. Three tools here do.
 ### The bench GUI
 
 ```
-python -m psct_motors.cli motor-gui --motor A
+python -m psct_motors.cli motor-gui --motor Top
 python -m psct_motors.cli motor-gui --simulate      # no hardware
 ```
 
@@ -238,7 +264,7 @@ Underneath it runs the event log, recording to disk from the moment it opens.
 The button in the GUI, or from the command line:
 
 ```
-python -m psct_motors.cli diagnose --motor A
+python -m psct_motors.cli diagnose --motor Top
 ```
 
 Runs every check that could independently stop the motor, in the order they
@@ -287,7 +313,7 @@ writing 0, which turns a value with no timestamp into one with a known
 starting point.
 
 ```
-python -m psct_motors.cli motor-report --motor A
+python -m psct_motors.cli motor-report --motor Top
 ```
 
 prints everything the motor reports, organised by what you would be looking
@@ -304,8 +330,8 @@ records **changes**, not samples, so a quiet motor produces a quiet file and
 the interesting moment stands out:
 
 ```
-python -m psct_motors.cli watch --motor A          # record until Ctrl-C
-python -m psct_motors.cli show-log logs/motor-A-20260813-190000.jsonl
+python -m psct_motors.cli watch --motor Top          # record until Ctrl-C
+python -m psct_motors.cli show-log logs/motor-Top-20260813-190000.jsonl
 ```
 
 ```
@@ -391,7 +417,7 @@ update the markers in `psct_motors/registers.py` as you confirm them. See
 ### 3. Check each actuator's direction
 
 ```
-python -m psct_motors.cli check-direction --motor A
+python -m psct_motors.cli check-direction --motor Top
 ```
 
 Moves the actuator and asks whether the focal plane went the way the software
@@ -407,7 +433,7 @@ Repeat for B and C.
 ### 4. Measure counts per millimetre
 
 ```
-python -m psct_motors.cli calibrate --motor A
+python -m psct_motors.cli calibrate --motor Top
 ```
 
 Moves a known number of counts and asks what displacement you measured with a
@@ -436,7 +462,7 @@ Repeat for B and C — they are not necessarily identical.
 ### 5. Confirm brake control
 
 ```
-python -m psct_motors.cli probe-brake --motor A
+python -m psct_motors.cli probe-brake --motor Top
 ```
 
 Toggles the brake with the drive enabled and holding, and asks you to confirm
@@ -473,20 +499,43 @@ about the motor's own position.
 python -m psct_motors.cli gui
 ```
 
+The window is built around **focus**, because that is what this mechanism is:
+the site's procedure motorises only the optical axis, and X and Z are manual
+screw drives.
+
 - **STOP** across the top, always live.
-- Current orientation in mm, degrees, arcmin and arcsec.
-- Absolute moves, with **Preview** to see the actuator targets first.
-- Nudge buttons for relative focus/tip/tilt.
-- Per-actuator position, mode, brake lamp, brake buttons and jog.
+- Focus readout in mm and microns, and which way it is from zero.
+- Absolute focus moves, with **Preview**, plus nudge buttons and one-click
+  step sizes down to 1 µm.
+- A **distance-from-zero gauge** down the right: 0 in the middle, + towards M1
+  above, − towards M2 below, travel limits marked, target shown while moving.
+- Per-actuator position, mode, brake lamp and jog.
 - A timestamped log of everything the application did.
+
+Behind the menus, so the main window stays about the job:
+
+| where | what |
+|---|---|
+| **Motion → Tip and tilt** | the two tilt angles, with nudges and a Level button |
+| **View → Focal plane picture** | live drawing of the plate on its three actuators |
+| **Tools → Connection settings** | edit each motor's IP and port, use now or save |
+| **Tools → Find hard stop** | drive one actuator into its end under torque supervision |
+
+### Addresses change
+
+**Tools → Connection settings** edits each motor's IP and port in the
+application. "Use for this session" applies them until you close it; "Use and
+save" writes them to the configuration file. Either way the connection is
+rebuilt, because a motor object holds the address it was created with — editing
+only the label would change nothing.
 
 ### Command line
 
 ```
 python -m psct_motors.cli status
-python -m psct_motors.cli preview --focus 25 --tip 0.1        # touches nothing
-python -m psct_motors.cli move --focus 25 --tip 0.1 --tilt 0
-python -m psct_motors.cli move --focus 25 --tilt-magnitude 0.2 --azimuth 45
+python -m psct_motors.cli preview --focus 2 --tip 0.1         # touches nothing
+python -m psct_motors.cli move --focus 2 --tip 0.1 --tilt 0
+python -m psct_motors.cli move --focus 2 --tilt-magnitude 0.2 --azimuth 45
 python -m psct_motors.cli move-rel --dfocus 0.5
 python -m psct_motors.cli stop
 python -m psct_motors.cli brake status
@@ -501,7 +550,7 @@ from psct_motors import FocalPlanePlatform, Orientation
 
 with FocalPlanePlatform() as platform:
     print(platform.read_orientation().describe())
-    platform.move_to_orientation(Orientation(focus_mm=25.0, tip_deg=0.1))
+    platform.move_to_orientation(Orientation(focus_mm=2.0, tip_deg=0.1))
     platform.move_relative(d_focus_mm=0.5)
 ```
 
@@ -575,6 +624,26 @@ over Modbus distinguishes that from a genuinely seized axis, so the demo says
 so explicitly rather than pretending otherwise, and a frozen position with no
 error bits is worth a physical look before you command it again.
 
+### Something resisting stops the motor
+
+The site calibrates these actuators by running one out until it stops. That
+only works safely if something notices the resistance, so every move watches
+the motor's torque — Actual Torque (register 217) against CL: Current Max
+(212), which reads 337/2048 ≈ 16% on a healthy pSCT motor and matches the
+"less than 15%, sometimes 30%" the site's own procedure records.
+
+A move aborts if torque passes `stall_torque_percent` (45% by default, clear of
+normal operation including the more heavily loaded top motor) for several
+consecutive readings. Several, not one, because torque spikes briefly on every
+acceleration.
+
+`cli find-stop` and **Tools → Find hard stop** turn that into the calibration
+procedure itself: walk the actuator out in small steps, stop when torque rises
+*or* a step barely moves, then back the command off so the motor is not left
+pressed against the end. Each step ends when the axis stops making progress
+rather than after a fixed delay — a fixed delay cannot know how fast your motor
+is, and one that is too short reports a hard stop that is not there.
+
 ### The three axes arrive together
 
 Velocities are scaled by distance so all three finish at the same moment.
@@ -584,8 +653,30 @@ joints the whole time.
 
 ### Brakes
 
-Three modes, per actuator, because how the brake is wired is an installation
-choice:
+**On the pSCT the brakes are not on the motors.** The site's procedure switches
+them from a separate device with its own web page, and the motors' own Brake
+Output register (179) reads 0 — no motor output drives a brake. That is why the
+per-actuator brake mode defaults to `none`: showing an inferred brake state
+with nothing behind it would be worse than showing none.
+
+`external_brake` in the configuration is where that device goes, and
+`psct_motors/external_brake.py` supports Modbus TCP or an HTTP endpoint. It is
+unconfigured today because the procedure gives the page's address but not its
+protocol, and names two different addresses on different slides. To finish it,
+one of these is needed:
+
+- the make and model of the device behind that page, or
+- whether it answers Modbus TCP, and on which coil, or
+- the URL its own buttons POST to — a browser's network tab shows this in a
+  minute.
+
+Until then the GUI says the brakes are not under software control and why,
+rather than guessing a URL and firing writes at an unknown device that holds a
+suspended camera. Releasing is interlocked either way: it refuses unless the
+drives are confirmed enabled and holding.
+
+For a motor that *does* drive its own brake, three modes are available per
+actuator:
 
 | `brake.mode` | meaning |
 |---|---|
@@ -688,7 +779,10 @@ psct_motors/
   eventlog.py     timestamped change recorder, for explaining a later hang
   diagnostics.py  "why is it not moving" -- ordered checks with remedies
   demo.py         single-motor exerciser and fault drills
+  external_brake.py  the pSCT brakes are on a separate device, not the motors
   gui.py          three-motor focal-plane application
+  focus_gauge.py  the distance-from-zero indicator
+  plane_view.py   live picture of the plate on its three actuators
   single_gui.py   one-motor bench GUI: errors, fault injection, live log
   cli.py          commissioning, calibration and scripted moves
   server.py       JSON-over-TCP bridge
@@ -715,7 +809,7 @@ construction and adapts, so this works across pymodbus 2.x, 3.x and 4.x.
 python -m unittest discover -s tests -v
 ```
 
-252 tests, no hardware needed. The GUI tests skip automatically without a
+277 tests, no hardware needed. The GUI tests skip automatically without a
 display; to run them headlessly:
 
 ```
@@ -755,3 +849,10 @@ Coverage worth knowing about:
 - `stop()` freezes the profile output, so a stop cannot itself cause a step.
 - The brake configuration is checked against register 179, so claiming control
   of a brake no output drives is caught.
+- Torque percent matches the real motor's 337/2048, a stall aborts a move and
+  halts the axis, and a brief spike does not.
+- `find-stop` finds the end, backs the command off, works in both directions,
+  and says so honestly when there is no stop to find.
+- The scale reproduces the measured 0.059 mm per 10,000 counts.
+- Bus voltage below the drive's acceptance threshold blocks, which is the
+  documented "the motor will not move without its 60 V supply".

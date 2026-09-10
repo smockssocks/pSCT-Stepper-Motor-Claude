@@ -20,6 +20,7 @@ from psct_motors.eventlog import (  # noqa: E402
     DEBUG, ERROR, WARNING, EventLog, MotorWatcher, read_log,
 )
 from psct_motors.faults import Fault, wrap_motor  # noqa: E402
+from psct_motors.jvl_motor import MotorFault  # noqa: E402
 from psct_motors.registers import MotorMode  # noqa: E402
 from psct_motors.simulator import simulated_motor  # noqa: E402
 from psct_motors.transport import ModbusError  # noqa: E402
@@ -648,7 +649,7 @@ class TestMotorReport(unittest.TestCase):
         from psct_motors.cli import main
         buffer = _io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            code = main(["--simulate", "motor-report", "--motor", "A"])
+            code = main(["--simulate", "motor-report", "--motor", "Top"])
         body = buffer.getvalue()
         self.assertEqual(code, 0)
         self.assertIn("follow error max (reg 22)", body)
@@ -658,3 +659,225 @@ class TestMotorReport(unittest.TestCase):
         self.assertIn("encoder position   (reg 16)", body)
         self.assertIn("brake output           (179)", body)
         self.assertIn("modbus slave timeout   (199)", body)
+
+
+class TestBusVoltage(unittest.TestCase):
+    """The pSCT troubleshooting list starts with "make sure there is 60 V bus
+    voltage", and notes the motor will not move without it. That is a
+    documented condition, not an inference, so it is checked."""
+
+    def test_bus_below_acceptance_blocks(self):
+        motor = healthy_motor()
+        # 1794 against an acceptance of 2054 is exactly what the register dump
+        # taken with the 60 V supply off shows.
+        motor._transport.registers[97] = 1794
+        try:
+            result = diagnose(motor)
+            titles = [f.title for f in result.blockers]
+            self.assertIn("Bus voltage below the drive's acceptance threshold",
+                          titles)
+            finding = next(f for f in result.blockers
+                           if f.title.startswith("Bus voltage below"))
+            self.assertIn("60 V", finding.detail)
+            self.assertIn("60 V", finding.remedy)
+        finally:
+            motor.disconnect()
+
+    def test_powered_motor_does_not_trip_it(self):
+        motor = healthy_motor()
+        try:
+            titles = [f.title for f in diagnose(motor).blockers]
+            self.assertNotIn("Bus voltage below the drive's acceptance threshold",
+                             titles)
+        finally:
+            motor.disconnect()
+
+
+class TestStallProtection(unittest.TestCase):
+    """The site calibrates by running an actuator out until it stops, so
+    something has to notice resistance and stop pushing."""
+
+    def _motor(self, **kw):
+        from psct_motors.simulator import simulated_motor
+        cfg = bench_actuator(velocity_raw=4000, **{
+            k: v for k, v in kw.items() if k not in ("hard_stop_high", "hard_stop_low")})
+        motor = simulated_motor(
+            cfg,
+            hard_stop_high=kw.get("hard_stop_high"),
+            hard_stop_low=kw.get("hard_stop_low"),
+        )
+        motor.connect()
+        motor.set_mode(MotorMode.POSITION)
+        return motor
+
+    def test_torque_percent_matches_the_real_motor(self):
+        """337 of 2048 is 16%, which is what the site records as typical."""
+        motor = self._motor()
+        try:
+            self.assertAlmostEqual(motor.get_torque_percent(), 100 * 337 / 2048,
+                                   places=3)
+        finally:
+            motor.disconnect()
+
+    def test_seek_finds_the_stop_and_stops_pushing(self):
+        motor = self._motor(hard_stop_high=45000)
+        try:
+            stop = motor.seek_hard_stop(direction=+1, step_counts=10000,
+                                        max_counts=200000)
+            self.assertEqual(stop, 45000)
+            # Left holding at the stop, not commanded past it.
+            self.assertEqual(motor.get_target_counts(), 45000)
+            self.assertLess(motor.get_torque_percent(), 30.0)
+        finally:
+            motor.disconnect()
+
+    def test_seek_works_in_the_negative_direction(self):
+        motor = self._motor(hard_stop_low=-30000)
+        try:
+            self.assertEqual(
+                motor.seek_hard_stop(direction=-1, step_counts=10000,
+                                     max_counts=200000), -30000)
+        finally:
+            motor.disconnect()
+
+    def test_seek_reports_honestly_when_there_is_no_stop(self):
+        """Better to say it did not find one than to invent a position."""
+        motor = self._motor()
+        try:
+            with self.assertRaises(MotorFault) as ctx:
+                motor.seek_hard_stop(direction=+1, step_counts=10000,
+                                     max_counts=40000)
+            self.assertIn("without finding a hard stop", str(ctx.exception))
+        finally:
+            motor.disconnect()
+
+    def test_seek_rejects_a_bad_direction(self):
+        motor = self._motor()
+        try:
+            with self.assertRaises(ValueError):
+                motor.seek_hard_stop(direction=0, step_counts=100, max_counts=1000)
+        finally:
+            motor.disconnect()
+
+    def test_an_ordinary_move_aborts_when_torque_climbs(self):
+        from psct_motors.jvl_motor import MotorStalled
+        motor = self._motor(hard_stop_high=20000)
+        try:
+            motor.command_position_counts(60000)      # straight into the stop
+            with self.assertRaises(MotorStalled) as ctx:
+                motor.wait_for_in_position(timeout_s=15.0)
+            self.assertIn("resisting", str(ctx.exception))
+            # And it was halted rather than left pushing.
+            self.assertNotEqual(motor.get_target_counts(), 60000)
+        finally:
+            motor.disconnect()
+
+    def test_a_brief_spike_does_not_abort(self):
+        """stall_persist_samples exists so acceleration transients do not
+        cancel healthy moves."""
+        motor = self._motor()
+        motor.cfg.stall_torque_percent = 10.0     # below the idle 16.5%
+        motor.cfg.stall_persist_samples = 10_000  # never reached
+        try:
+            motor.command_position_counts(5000)
+            self.assertTrue(motor.wait_for_in_position(timeout_s=15.0))
+        finally:
+            motor.disconnect()
+
+    def test_protection_can_be_turned_off(self):
+        motor = self._motor(hard_stop_high=20000)
+        motor.cfg.stall_protection = False
+        try:
+            motor.command_position_counts(60000)
+            # No stall raised; it simply never arrives and times out.
+            self.assertFalse(motor.wait_for_in_position(timeout_s=2.0))
+        finally:
+            motor.disconnect()
+
+    def test_a_motor_without_torque_registers_still_moves(self):
+        motor = self._motor()
+        del motor._transport.registers[212]
+        try:
+            self.assertIsNone(motor.get_torque_percent())
+            motor.command_position_counts(5000)
+            self.assertTrue(motor.wait_for_in_position(timeout_s=15.0))
+        finally:
+            motor.disconnect()
+
+
+class TestExternalBrake(unittest.TestCase):
+    """The pSCT brakes are switched by a separate device, not the motors --
+    which is why the motor's Brake Output register reads 0."""
+
+    def test_unconfigured_is_the_default_and_explains_itself(self):
+        from psct_motors.external_brake import BrakeController, ExternalBrakeConfig
+        controller = BrakeController(ExternalBrakeConfig())
+        self.assertFalse(controller.available)
+        message = controller.explain_unavailable()
+        self.assertIn("separate device", message)
+        self.assertIn("179", message)
+        self.assertIn("Modbus TCP", message)
+
+    def test_commanding_an_unconfigured_brake_says_what_is_missing(self):
+        from psct_motors.external_brake import (
+            BrakeController, BrakeError, ExternalBrakeConfig)
+        controller = BrakeController(ExternalBrakeConfig())
+        with self.assertRaises(BrakeError) as ctx:
+            controller.engage()
+        self.assertIn("not under software control", str(ctx.exception))
+
+    def test_release_refuses_unless_the_drives_are_holding(self):
+        from psct_motors.external_brake import (
+            BrakeController, BrakeError, ExternalBrakeConfig)
+        controller = BrakeController(ExternalBrakeConfig(
+            mode="modbus", host="192.0.2.1", coils={"all": 0}))
+        with self.assertRaises(BrakeError) as ctx:
+            controller.release(drives_holding=False)
+        self.assertIn("nothing is holding the focal plane", str(ctx.exception))
+
+    def test_incomplete_configuration_is_rejected(self):
+        from psct_motors.external_brake import ExternalBrakeConfig
+        with self.assertRaises(ValueError):
+            ExternalBrakeConfig(mode="modbus").validate()
+        with self.assertRaises(ValueError):
+            ExternalBrakeConfig(mode="modbus", host="h").validate()
+        with self.assertRaises(ValueError):
+            ExternalBrakeConfig(mode="http").validate()
+        with self.assertRaises(ValueError):
+            ExternalBrakeConfig(mode="nonsense").validate()
+
+    def test_platform_reports_brakes_as_unknown_when_unconfigured(self):
+        from psct_motors.platform import FocalPlanePlatform
+        from psct_motors.config import default_config
+        from psct_motors.jvl_motor import BrakeState
+        platform = FocalPlanePlatform(cfg=default_config(), simulate=True)
+        platform.connect()
+        try:
+            self.assertFalse(platform.external_brake.available)
+            for state in platform.brake_states().values():
+                self.assertIs(state, BrakeState.UNKNOWN)
+        finally:
+            platform.disconnect()
+
+
+class TestMeasuredScale(unittest.TestCase):
+    def test_ten_thousand_counts_moves_the_measured_amount(self):
+        """+10,000 counts on all three moved the camera 0.059 mm."""
+        from psct_motors.config import default_config
+        cfg = default_config()
+        for actuator in cfg.actuators:
+            mm = 10000 / actuator.resolved_counts_per_mm
+            self.assertAlmostEqual(mm, 0.059, places=4)
+
+    def test_actuators_are_named_for_where_they_are(self):
+        from psct_motors.config import default_config
+        self.assertEqual([a.name for a in default_config().actuators],
+                         ["Top", "East", "West"])
+
+    def test_zero_is_mid_travel_not_an_end(self):
+        """The gauge shows distance from the focal position, so zero has to
+        have room either side of it."""
+        from psct_motors.config import default_config
+        limits = default_config().limits
+        self.assertLess(limits.min_focus_mm, 0.0)
+        self.assertGreater(limits.max_focus_mm, 0.0)

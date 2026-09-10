@@ -420,7 +420,7 @@ class MotorWatcher:
         )
 
 
-def default_log_path(motor_name: str = "A") -> str:
+def default_log_path(motor_name: str = "Top") -> str:
     """Where a recording goes if no path is given."""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return os.path.join(

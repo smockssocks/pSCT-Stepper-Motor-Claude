@@ -85,7 +85,7 @@ class Lamp(tk.Canvas):
 
 
 class SingleMotorApp:
-    def __init__(self, root: tk.Tk, motor_name: str = "A",
+    def __init__(self, root: tk.Tk, motor_name: str = "Top",
                  config_path: Optional[str] = None, simulate: bool = False,
                  log_path: Optional[str] = None):
         self.root = root
@@ -941,7 +941,7 @@ class SingleMotorApp:
             pass
 
 
-def main(motor_name: str = "A", config_path: Optional[str] = None,
+def main(motor_name: str = "Top", config_path: Optional[str] = None,
          simulate: bool = False, log_path: Optional[str] = None) -> int:
     root = tk.Tk()
     SingleMotorApp(root, motor_name=motor_name, config_path=config_path,

@@ -177,8 +177,8 @@ class ActuatorConfig:
     #: Soft limits in millimetres of actuator travel, relative to the zero set
     #: by `set-zero`. The published total range is 5.08 cm; the default keeps a
     #: 1 mm buffer at each end so a move never parks against a hard stop.
-    min_travel_mm: float = 1.0
-    max_travel_mm: float = 49.8
+    min_travel_mm: float = -24.0
+    max_travel_mm: float = 24.0
     #: Counts reading that corresponds to 0 mm of travel. Written by `set-zero`.
     zero_counts: int = 0
 
@@ -202,6 +202,27 @@ class ActuatorConfig:
     follow_error_window_counts: int = 2000
     #: Maximum time to wait for a move to finish, seconds.
     move_timeout_s: float = 120.0
+
+    # --- stall protection ---------------------------------------------------
+    #: Abort a move when the motor's torque exceeds this percentage of its
+    #: current limit for `stall_persist_samples` consecutive reads.
+    #:
+    #: The pSCT motion-control procedure records torque "always less than 30%,
+    #: most of the time less than 15%" for healthy moves, and says torque
+    #: should stay "less than 100% unless brake is on and no movement is
+    #: possible". 45% therefore sits clear of normal operation -- including the
+    #: top motor, which the procedure notes carries more load than the two
+    #: lower ones -- while still stopping long before the drive would.
+    #:
+    #: Percent is Actual Torque (register 217) over CL: Current Max (register
+    #: 212). On the pSCT motor that is 337/2048, about 16%.
+    stall_torque_percent: float = 45.0
+    #: Consecutive over-limit reads before a move is aborted. More than one, so
+    #: the acceleration transient at the start of a move does not trip it.
+    stall_persist_samples: int = 3
+    #: Whether to watch torque at all. Turn it off only if the torque registers
+    #: turn out to mean something different on your drive.
+    stall_protection: bool = True
 
     brake: BrakeConfig = field(default_factory=BrakeConfig)
 
@@ -262,6 +283,15 @@ class ActuatorConfig:
             raise ValueError(
                 f"Actuator {self.name}: follow_error_window_counts must be positive"
             )
+        if not (0 < self.stall_torque_percent <= 100):
+            raise ValueError(
+                f"Actuator {self.name}: stall_torque_percent must be in 0..100, "
+                f"got {self.stall_torque_percent}"
+            )
+        if self.stall_persist_samples < 1:
+            raise ValueError(
+                f"Actuator {self.name}: stall_persist_samples must be at least 1"
+            )
         if not (0 < self.velocity_raw <= 32767):
             raise ValueError(
                 f"Actuator {self.name}: velocity_raw must be 1..32767, got {self.velocity_raw}"
@@ -276,6 +306,34 @@ class ActuatorConfig:
 # --------------------------------------------------------------------------
 
 @dataclass
+class ExternalBrakeSettings:
+    """Serialisable form of external_brake.ExternalBrakeConfig.
+
+    Kept here so the whole machine configuration is still one JSON file, and
+    separate from the class that does the work so config.py stays free of I/O.
+    """
+
+    mode: str = "none"                    # "none" | "modbus" | "http"
+    host: str = ""
+    port: int = 502
+    unit_id: int = 1
+    timeout_s: float = 3.0
+    all_or_nothing: bool = True
+    coils: Dict[str, int] = field(default_factory=dict)
+    energized_releases: bool = True
+    release_url: str = ""
+    engage_url: str = ""
+    status_url: str = ""
+    status_field: str = "brakes"
+
+    def validate(self) -> None:
+        if self.mode not in ("none", "modbus", "http"):
+            raise ValueError(
+                f"external_brake.mode must be 'none', 'modbus' or 'http', "
+                f"got {self.mode!r}")
+
+
+@dataclass
 class PlatformLimits:
     """Soft limits on the *commanded orientation*, checked before any motion.
 
@@ -285,8 +343,15 @@ class PlatformLimits:
     even if all three actuators could reach it.
     """
 
-    min_focus_mm: float = 1.0
-    max_focus_mm: float = 49.8
+    #: Focus limits, in millimetres either side of the zero set by `set-zero`.
+    #:
+    #: Zero is the focal position, not one end of the travel, so these are
+    #: symmetric: the camera can go towards M1 or towards M2 from there. The
+    #: published total range is 5.08 cm, so +/-24 mm leaves a margin at each
+    #: end. Narrow them once the hard stops have been found with
+    #: `cli find-stop`.
+    min_focus_mm: float = -24.0
+    max_focus_mm: float = 24.0
     max_tilt_deg: float = 1.0       # magnitude of total tilt from the z axis
     #: Largest single commanded step, as a guard against a typo or a bad unit
     #: conversion sending an actuator across its whole range at once.
@@ -328,6 +393,12 @@ class PlatformConfig:
     #: and complains rather than silently reading garbage.
     verify_word_order_on_connect: bool = True
 
+    #: How to reach the device that switches the focal-plane brakes. On the
+    #: pSCT these are NOT on the motors -- see psct_motors/external_brake.py
+    #: for what is needed before this can be filled in.
+    external_brake: "ExternalBrakeSettings" = field(
+        default_factory=lambda: ExternalBrakeSettings())
+
     def validate(self) -> None:
         if len(self.actuators) != 3:
             raise ValueError(
@@ -340,6 +411,7 @@ class PlatformConfig:
         for a in self.actuators:
             a.validate()
         self.limits.validate()
+        self.external_brake.validate()
         if self.min_velocity_raw < 1:
             raise ValueError("min_velocity_raw must be >= 1")
         if self.poll_interval_s <= 0:
@@ -372,18 +444,66 @@ class PlatformConfig:
 # Defaults, load and save
 # --------------------------------------------------------------------------
 
-def default_config() -> PlatformConfig:
-    """A three-actuator platform with the actuators 120 degrees apart.
+#: Counts per millimetre of camera travel, measured on the telescope.
+#:
+#: +10,000 counts on all three motors moved the camera 0.059 mm, giving
+#: 10000/0.059 = 169,492 counts/mm. That agrees with the pSCT motion-control
+#: procedure's own figure of "2000 counts ~ 0.011 mm" (169,000-182,000) and
+#: with the published camera description's 12.7 um per full step (161,000).
+#:
+#: It does NOT agree with the "10,000 steps = ~0.02 inch" on page 23 of that
+#: procedure, which is 8.6x larger. 0.002 inch would fit; the figure as
+#: written looks like a lost decimal point.
+#:
+#: Implied screw lead is 409600/169492 = 2.417 mm/rev, within 5% of a standard
+#: 10 TPI (0.1 in = 2.54 mm) lead -- consistent with a plain measurement
+#: tolerance on a structure this size.
+MEASURED_COUNTS_PER_MM = 169492.0
 
-    IP addresses are placeholders apart from motor A, which is the address the
-    existing single-motor test setup uses. Everything geometric is a starting
-    point to be replaced with real values from the camera drawings.
+
+def default_config() -> PlatformConfig:
+    """The pSCT focal-plane actuators as the site documents them.
+
+    Frame
+    -----
+    The pSCT motion-control procedure uses X east-west, Y along the optical
+    axis, Z vertical. Only Y is motorised -- X and Z are manual screw drives --
+    so these three motors control the focal plane's position along the optical
+    axis and its two tilts, and nothing else.
+
+    This software calls the optical axis "focus", so:
+
+        focus + (this software)  =  +Y  =  + counts  =  towards M1 (primary)
+        focus - (this software)  =  -Y  =  - counts  =  towards M2 (secondary)
+
+    The focal plane itself is the site's X-Z plane, so in the kinematics:
+
+        kinematics x  =  site X  =  east-west
+        kinematics y  =  site Z  =  vertical
+
+    Actuators
+    ---------
+    One at the top and two at the bottom, named for where they are rather than
+    A/B/C, because that is how the site refers to them (and how MacTalk's COM
+    ports are labelled: COM4 top, COM5 east, COM6 west). The procedure notes
+    the top motor carries more load than the lower two, since its weight is on
+    a single slide rather than split between two.
+
+    IP addresses are placeholders except for Top, which is the motor on the
+    bench. The site currently drives these over serial through MacTalk; using
+    this software needs the Ethernet modules on all three.
+
+    Geometry (radius_mm) is still a placeholder -- take it from the camera
+    drawings before commanding any tilt.
     """
     return PlatformConfig(
         actuators=[
-            ActuatorConfig(name="A", ip="192.168.0.52", azimuth_deg=90.0),
-            ActuatorConfig(name="B", ip="192.168.0.53", azimuth_deg=210.0),
-            ActuatorConfig(name="C", ip="192.168.0.54", azimuth_deg=330.0),
+            ActuatorConfig(name="Top", ip="192.168.0.52", azimuth_deg=90.0,
+                           counts_per_mm=MEASURED_COUNTS_PER_MM),
+            ActuatorConfig(name="East", ip="192.168.0.53", azimuth_deg=330.0,
+                           counts_per_mm=MEASURED_COUNTS_PER_MM),
+            ActuatorConfig(name="West", ip="192.168.0.54", azimuth_deg=210.0,
+                           counts_per_mm=MEASURED_COUNTS_PER_MM),
         ]
     )
 
@@ -405,20 +525,23 @@ def config_from_dict(data: Dict[str, Any]) -> PlatformConfig:
     data.pop("_comment", None)
     actuators_raw = data.pop("actuators", None)
     limits_raw = data.pop("limits", None)
+    external_brake_raw = data.pop("external_brake", None)
 
     actuators: List[ActuatorConfig] = []
     for entry in actuators_raw or []:
         entry = dict(entry)
-        brake_raw = entry.pop("brake", None)
+        actuator_brake_raw = entry.pop("brake", None)
         act = _from_dict(ActuatorConfig, entry)
-        if brake_raw is not None:
-            act.brake = _from_dict(BrakeConfig, brake_raw)
+        if actuator_brake_raw is not None:
+            act.brake = _from_dict(BrakeConfig, actuator_brake_raw)
         actuators.append(act)
 
     cfg = _from_dict(PlatformConfig, data)
     cfg.actuators = actuators or default_config().actuators
     if limits_raw is not None:
         cfg.limits = _from_dict(PlatformLimits, limits_raw)
+    if external_brake_raw is not None:
+        cfg.external_brake = _from_dict(ExternalBrakeSettings, external_brake_raw)
     return cfg
 
 
@@ -475,6 +598,7 @@ def default_config_path() -> str:
 
 __all__ = [
     "BrakeConfig", "ActuatorConfig", "PlatformLimits", "PlatformConfig",
+    "ExternalBrakeSettings", "MEASURED_COUNTS_PER_MM",
     "default_config", "load_config", "save_config", "default_config_path",
     "config_from_dict", "config_to_dict", "replace",
 ]

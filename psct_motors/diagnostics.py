@@ -421,12 +421,18 @@ def _check_supply(motor: JVLMotor) -> List[Finding]:
     history this motor keeps. A brown-out that tripped the drive hours ago is
     still recorded there, long after the error bits have been cleared.
 
-    The comparison made here is register 98 against register 97: the same
-    quantity, so the same scale, whatever that scale is. Register 139
-    ('Acceptance Voltage') is deliberately NOT compared against them -- it
-    reads 2054 while the bus reads 1794 on a perfectly healthy pSCT motor,
-    which means they are not on a common scale, and treating that as a
-    brown-out would be a confident wrong answer.
+    Two comparisons are made, both justified:
+
+    * Register 98 against register 97 -- the same quantity, so the same scale
+      whatever that scale is. A big gap means the supply has been much lower
+      than it is now.
+    * Register 97 against register 139 ('Acceptance Voltage') -- the drive's
+      own threshold for running. The pSCT procedure's troubleshooting list
+      begins "make sure there is 60 V bus voltage", and notes the motor will
+      not move without it, so bus-below-acceptance is that documented
+      condition rather than an inference. Note that the register dump taken
+      with the 60 V supply off reads 1794 against an acceptance of 2054, which
+      is consistent with exactly this.
     """
     findings: List[Finding] = []
     try:
@@ -435,6 +441,28 @@ def _check_supply(motor: JVLMotor) -> List[Finding]:
     except (ModbusError, MotorFault) as exc:
         return [Finding(UNKNOWN, "Supply voltage",
                         f"Could not read the bus voltage: {exc}")]
+
+    # The 60 V supply is the documented first thing to check when a pSCT
+    # motor will not move ("Low Bus Voltage Error if the 60V supply is not
+    # on: the motor will not move without the 60V power"). Acceptance Voltage
+    # is the drive's own threshold, so bus-below-acceptance is exactly that
+    # condition -- the one comparison across these two registers that the
+    # written procedure justifies.
+    try:
+        acceptance = motor.read_register("ACCEPTANCE_VOLTAGE")
+    except (ModbusError, MotorFault):
+        acceptance = None
+    if acceptance is not None and 0 < voltage < acceptance:
+        findings.append(Finding(
+            BLOCKING, "Bus voltage below the drive's acceptance threshold",
+            f"Bus voltage reads {voltage} against an Acceptance Voltage of "
+            f"{acceptance} (same raw units). The pSCT procedure is explicit "
+            "that the motor will not move without its 60 V supply on, and this "
+            "is what that looks like from here.",
+            "Switch on the 60 V motor supply and confirm it has come up. The "
+            "procedure's own troubleshooting list starts with exactly this.",
+            data={"voltage": voltage, "acceptance": acceptance},
+        ))
 
     detail = (f"Bus voltage reads {voltage} (raw units), and the lowest value "
               f"ever latched is {minimum}.")

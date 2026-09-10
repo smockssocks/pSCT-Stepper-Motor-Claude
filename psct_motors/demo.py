@@ -2,7 +2,7 @@
 Single-motor exerciser: what one JVL motor can do, and what happens when it
 goes wrong.
 
-    python -m psct_motors.cli demo --motor A
+    python -m psct_motors.cli demo --motor Top
 
 Built for a bench setup with **one** motor, because that is what you have
 before the other two arrive. It works in **counts, revolutions and degrees of
