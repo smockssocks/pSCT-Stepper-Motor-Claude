@@ -120,7 +120,9 @@ python -m psct_motors.cli status
 ```
 
 Every command takes `--simulate`. Get comfortable there first; nothing can move
-until you drop the flag.
+until you drop the flag. `--simulate`, `--config` and `-y` can go on either
+side of the command name, so `cli gui --simulate` and `cli --simulate gui` are
+the same thing.
 
 ---
 

@@ -955,6 +955,23 @@ def cmd_server(args) -> int:
 # Argument parsing
 # --------------------------------------------------------------------------
 
+def _add_global_args(p: argparse.ArgumentParser,
+                     suppress_defaults: bool = False) -> None:
+    """Declare the options that every command accepts.
+
+    `suppress_defaults` is for the copy attached to each subcommand: with
+    SUPPRESS, argparse only sets the attribute when the flag is actually
+    given, so the copy cannot overwrite a value the top-level parser already
+    took from the same flag written before the subcommand.
+    """
+    extra = {"default": argparse.SUPPRESS} if suppress_defaults else {}
+    p.add_argument("--config", help="path to the configuration JSON", **extra)
+    p.add_argument("--simulate", action="store_true", **extra,
+                   help="run against built-in fake motors, no hardware needed")
+    p.add_argument("-y", "--yes", action="store_true", **extra,
+                   help="answer yes to confirmations (for scripts)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m psct_motors.cli",
@@ -984,41 +1001,51 @@ one motor on a bench
   show-log             replay a recording
 """,
     )
-    parser.add_argument("--config", help="path to the configuration JSON")
-    parser.add_argument("--simulate", action="store_true",
-                        help="run against built-in fake motors, no hardware needed")
-    parser.add_argument("-y", "--yes", action="store_true",
-                        help="answer yes to confirmations (for scripts)")
+    _add_global_args(parser)
+
+    # The same options are accepted on either side of the subcommand, so that
+    # both `cli --simulate gui` and `cli gui --simulate` work. Argparse will
+    # not do that on its own: an option declared only on the top-level parser
+    # is rejected once the subcommand has been seen. So they are declared a
+    # second time on every subcommand, via this parent -- with SUPPRESS
+    # defaults, so that the copy leaves the value alone when the flag was
+    # given before the subcommand instead of overwriting it with its default.
+    common = argparse.ArgumentParser(add_help=False)
+    _add_global_args(common, suppress_defaults=True)
+
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("init-config", help="write a starting configuration file")
+    def command(name: str, **kwargs) -> argparse.ArgumentParser:
+        return sub.add_parser(name, parents=[common], **kwargs)
+
+    p = command("init-config", help="write a starting configuration file")
     p.add_argument("--force", action="store_true", help="overwrite an existing file")
     p.set_defaults(func=cmd_init_config)
 
-    p = sub.add_parser("show-config", help="print the active configuration")
+    p = command("show-config", help="print the active configuration")
     p.set_defaults(func=cmd_show_config)
 
-    p = sub.add_parser("status", help="read positions, orientation, brakes and errors")
+    p = command("status", help="read positions, orientation, brakes and errors")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("verify-registers",
+    p = command("verify-registers",
                        help="print the register map beside live values")
     p.add_argument("--offline", action="store_true",
                    help="print the table only, without connecting")
     p.set_defaults(func=cmd_verify_registers)
 
-    p = sub.add_parser("detect", help="detect the Modbus word order on each motor")
+    p = command("detect", help="detect the Modbus word order on each motor")
     p.set_defaults(func=cmd_detect)
 
-    p = sub.add_parser("check-direction",
+    p = command("check-direction",
                        help="confirm which way an actuator moves the focal plane")
     p.add_argument("--motor", required=True, help="actuator name, e.g. Top")
     p.add_argument("--mm", type=float, default=0.5,
                    help="test move size in mm (default 0.5)")
     p.set_defaults(func=cmd_check_direction)
 
-    p = sub.add_parser("calibrate", help="measure counts per millimetre")
+    p = command("calibrate", help="measure counts per millimetre")
     p.add_argument("--motor", required=True, help="actuator name, e.g. Top")
     p.add_argument("--counts", type=int, default=409600,
                    help="counts to move for the test (default 409600, one motor rev)")
@@ -1026,50 +1053,50 @@ one motor on a bench
                    help="measured displacement, if you already have it")
     p.set_defaults(func=cmd_calibrate)
 
-    p = sub.add_parser("probe-brake", help="toggle a brake and confirm it responds")
+    p = command("probe-brake", help="toggle a brake and confirm it responds")
     p.add_argument("--motor", required=True)
     p.add_argument("--cycles", type=int, default=2)
     p.set_defaults(func=cmd_probe_brake)
 
-    p = sub.add_parser("preview", help="show a move's actuator targets without moving")
+    p = command("preview", help="show a move's actuator targets without moving")
     _add_orientation_args(p)
     p.set_defaults(func=cmd_preview)
 
-    p = sub.add_parser("move", help="move to an absolute orientation")
+    p = command("move", help="move to an absolute orientation")
     _add_orientation_args(p)
     p.add_argument("--no-wait", action="store_true",
                    help="return as soon as the move is commanded")
     p.set_defaults(func=cmd_move)
 
-    p = sub.add_parser("move-rel", help="move relative to the current orientation")
+    p = command("move-rel", help="move relative to the current orientation")
     p.add_argument("--dfocus", type=float, default=0.0, help="mm")
     p.add_argument("--dtip", type=float, default=0.0, help="degrees about +x")
     p.add_argument("--dtilt", type=float, default=0.0, help="degrees about +y")
     p.add_argument("--no-wait", action="store_true")
     p.set_defaults(func=cmd_move_relative)
 
-    p = sub.add_parser("jog", help="move a single actuator (commissioning)")
+    p = command("jog", help="move a single actuator (commissioning)")
     p.add_argument("--motor", required=True)
     p.add_argument("--mm", type=float, required=True, help="relative move in mm")
     p.set_defaults(func=cmd_jog)
 
-    p = sub.add_parser("set-zero", help="define the current position as the reference")
+    p = command("set-zero", help="define the current position as the reference")
     p.set_defaults(func=cmd_set_zero)
 
-    p = sub.add_parser("stop", help="controlled stop: decelerate and hold")
+    p = command("stop", help="controlled stop: decelerate and hold")
     p.set_defaults(func=cmd_stop)
 
-    p = sub.add_parser("passivate", help="brakes on, drives off")
+    p = command("passivate", help="brakes on, drives off")
     p.set_defaults(func=cmd_passivate)
 
-    p = sub.add_parser("brake", help="engage, release or report the brakes")
+    p = command("brake", help="engage, release or report the brakes")
     p.add_argument("action", choices=["status", "engage", "release"])
     p.set_defaults(func=cmd_brake)
 
-    p = sub.add_parser("clear-errors", help="best-effort error clear on all motors")
+    p = command("clear-errors", help="best-effort error clear on all motors")
     p.set_defaults(func=cmd_clear_errors)
 
-    p = sub.add_parser(
+    p = command(
         "demo",
         help="exercise ONE motor: capabilities and deliberate faults",
         description=(
@@ -1093,7 +1120,7 @@ one motor on a bench
     p.add_argument("--list", action="store_true", help="list the drills and exit")
     p.set_defaults(func=cmd_demo)
 
-    p = sub.add_parser(
+    p = command(
         "motor-gui",
         help="bench GUI for ONE motor: live state, errors, fault injection, log",
         description=(
@@ -1105,7 +1132,7 @@ one motor on a bench
     p.add_argument("--log", help="path for the JSONL event log")
     p.set_defaults(func=cmd_motor_gui)
 
-    p = sub.add_parser(
+    p = command(
         "find-stop",
         help="drive one actuator into its end stop, watching torque",
         description=(
@@ -1123,7 +1150,7 @@ one motor on a bench
                    help="give up after this much travel (default 30)")
     p.set_defaults(func=cmd_find_stop)
 
-    p = sub.add_parser(
+    p = command(
         "motor-report",
         help="one page of everything the motor reports, including its latched history",
     )
@@ -1132,7 +1159,7 @@ one motor on a bench
                    help="also dump every register this software knows about")
     p.set_defaults(func=cmd_motor_report)
 
-    p = sub.add_parser(
+    p = command(
         "diagnose",
         help="explain why a motor is not taking position commands",
     )
@@ -1142,7 +1169,7 @@ one motor on a bench
                         "position the motor is already at, so cannot move it)")
     p.set_defaults(func=cmd_diagnose)
 
-    p = sub.add_parser(
+    p = command(
         "watch",
         help="record mode, error, target and timing changes to a log file",
     )
@@ -1154,16 +1181,16 @@ one motor on a bench
                    help="log any poll slower than this many seconds (default 1)")
     p.set_defaults(func=cmd_watch)
 
-    p = sub.add_parser("show-log", help="replay a recorded event log")
+    p = command("show-log", help="replay a recorded event log")
     p.add_argument("file")
     p.add_argument("--severity", default="DEBUG",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.set_defaults(func=cmd_show_log)
 
-    p = sub.add_parser("gui", help="launch the three-motor focal-plane application")
+    p = command("gui", help="launch the three-motor focal-plane application")
     p.set_defaults(func=cmd_gui)
 
-    p = sub.add_parser("server", help="run the JSON-over-TCP bridge (for LabVIEW)")
+    p = command("server", help="run the JSON-over-TCP bridge (for LabVIEW)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=5020)
     p.set_defaults(func=cmd_server)
