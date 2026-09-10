@@ -59,6 +59,10 @@ COLOR_IDLE = "#8a8a8a"
 COLOR_STOP = "#c62828"
 COLOR_STOP_DARK = "#7a0000"
 
+#: The hard-stop dialog's default and safe choice. Named rather than typed out
+#: at each use so the menu entry and the comparison cannot drift apart.
+ALL_THREE = "All three (together)"
+
 
 class Lamp(tk.Canvas):
     """A small coloured indicator light."""
@@ -272,6 +276,8 @@ class MotorApp:
                           command=self.on_edit_connection)
         tools.add_command(label="Find hard stop (calibration)...",
                           command=self.on_find_hard_stop)
+        tools.add_command(label="Run safety drills (simulated)...",
+                          command=self.on_safety_drills)
         tools.add_separator()
         tools.add_command(label="Clear errors", command=self.on_clear_errors)
         tools.add_command(label="Release all brakes",
@@ -416,6 +422,7 @@ class MotorApp:
         self.angle_step_var = tk.StringVar(value="0.010")
         self._tilt_window = None
         self._plane_window = None
+        self._hard_stop_window = None
         self.plane_view = None
 
     def _build_actuators(self, parent) -> None:
@@ -1159,11 +1166,13 @@ class MotorApp:
     # ------------------------------------------------------ hard-stop search
 
     def on_find_hard_stop(self) -> None:
-        """Drive one actuator until it physically stops.
+        """Run the actuators out until the travel ends.
 
-        This is the site's calibration procedure -- run the actuator out to its
-        end -- done under torque supervision so it stops when something
-        resists rather than continuing to push.
+        This is the site's calibration procedure. All three go together: taking
+        one actuator to its end stop on its own tilts the focal plane about the
+        other two ball joints, and the site's experience is that this can break
+        something. Single-axis seeking is still available, but it has to be
+        asked for.
         """
         if not self.platform.connected:
             messagebox.showwarning("Not connected", "Connect first.")
@@ -1172,23 +1181,25 @@ class MotorApp:
         window = tk.Toplevel(self.root)
         window.title("Find hard stop")
         window.transient(self.root)
+        self._hard_stop_window = window
 
         tk.Label(
-            window, justify="left", anchor="w", wraplength=520,
-            text=("Drives ONE actuator until it will not go further, then backs "
-                  "the command off so it is not left pressed against the stop.\n\n"
-                  "It walks out in small steps and watches the motor's torque. "
-                  "If torque passes the configured limit, or a step barely "
-                  "moves, that is the stop.\n\n"
-                  "This moves one actuator on its own, which tilts the focal "
-                  "plane. Use it for calibration, not for observing."),
+            window, justify="left", anchor="w", wraplength=560,
+            text=("Runs the actuators out until they will not go further, then "
+                  "backs the commands off so nothing is left pressed against a "
+                  "stop.\n\n"
+                  "They walk out together in small steps. After each step every "
+                  "motor's torque is checked, and so is how far the three have "
+                  "drifted apart. The first axis to reach its stop halts all "
+                  "three, and the other two are then backed off to match it so "
+                  "the plate ends up flat."),
             fg="#333",
         ).grid(row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(12, 8))
 
-        ttk.Label(window, text="Actuator").grid(row=1, column=0, sticky="e",
-                                                padx=(12, 4), pady=4)
-        motor_var = tk.StringVar(value=self.cfg.actuators[0].name)
-        ttk.OptionMenu(window, motor_var, motor_var.get(),
+        ttk.Label(window, text="Move").grid(row=1, column=0, sticky="e",
+                                            padx=(12, 4), pady=4)
+        motor_var = tk.StringVar(value=ALL_THREE)
+        ttk.OptionMenu(window, motor_var, motor_var.get(), ALL_THREE,
                        *[a.name for a in self.cfg.actuators]).grid(
             row=1, column=1, sticky="w", padx=4)
 
@@ -1209,13 +1220,36 @@ class MotorApp:
         ttk.Entry(window, textvariable=budget_var, width=10).grid(row=2, column=3,
                                                                   sticky="w", padx=(0, 12))
 
-        actuator = self.cfg.actuator(motor_var.get())
+        actuator = self.cfg.actuators[0]
         ttk.Label(window,
-                  text=(f"Torque limit {actuator.stall_torque_percent:.0f}% "
-                        f"of the drive's current limit, over "
-                        f"{actuator.stall_persist_samples} consecutive readings."),
-                  foreground="#777").grid(row=3, column=0, columnspan=4,
-                                          sticky="w", padx=12, pady=(4, 8))
+                  text=(f"Torque limit {actuator.stall_torque_percent:.0f}% of "
+                        f"the drive's current limit over "
+                        f"{actuator.stall_persist_samples} consecutive readings. "
+                        f"The search is abandoned if the three drift more than "
+                        f"{self.cfg.limits.max_hard_stop_spread_mm:.2f} mm apart."),
+                  foreground="#777", wraplength=560, justify="left").grid(
+            row=3, column=0, columnspan=4, sticky="w", padx=12, pady=(4, 4))
+
+        # Shown only when a single actuator is chosen, because that is the
+        # choice that can tilt the plate.
+        warning = tk.Label(window, justify="left", anchor="w", wraplength=560,
+                           fg=COLOR_BAD, font=("TkDefaultFont", 9, "bold"))
+        warning.grid(row=4, column=0, columnspan=4, sticky="w", padx=12,
+                     pady=(0, 6))
+        self._hard_stop_warning = warning
+
+        def refresh_warning(*_args) -> None:
+            if motor_var.get() == ALL_THREE:
+                warning.configure(text="")
+            else:
+                warning.configure(
+                    text=(f"{motor_var.get()} alone will be driven into its stop. "
+                          f"That tilts the focal plane about the other two ball "
+                          f"joints, which the site says can break it. Only do "
+                          f"this deliberately, with a small budget."))
+
+        motor_var.trace_add("write", refresh_warning)
+        refresh_warning()
 
         def start() -> None:
             try:
@@ -1228,34 +1262,72 @@ class MotorApp:
                 return
             name = motor_var.get()
             direction = 1 if direction_var.get().startswith("+") else -1
-            if not messagebox.askyesno(
-                "Run into the end stop?",
-                f"{name} will be driven {direction_var.get().strip()} until it "
-                f"stops, up to {budget_mm} mm.\n\nThis moves one actuator "
-                "alone, which tilts the focal plane.\n\nProceed?",
+            if name != ALL_THREE and not messagebox.askyesno(
+                "Tilt the focal plane?",
+                f"{name} will be driven {direction_var.get().strip()} on its "
+                f"own, up to {budget_mm} mm, while the other two stay put.\n\n"
+                "That tilts the focal plane about the other two ball joints. "
+                "The site's guidance is that all three should move together.\n\n"
+                "Drive this one actuator alone anyway?",
                 parent=window,
             ):
                 return
             window.destroy()
-            self._run_hard_stop(name, direction, step_mm, budget_mm)
+            self._hard_stop_window = None
+            if name == ALL_THREE:
+                self._run_hard_stop_together(direction, step_mm, budget_mm)
+            else:
+                self._run_hard_stop(name, direction, step_mm, budget_mm)
 
         buttons = ttk.Frame(window)
-        buttons.grid(row=4, column=0, columnspan=4, pady=(6, 12))
+        buttons.grid(row=5, column=0, columnspan=4, pady=(6, 12))
         ttk.Button(buttons, text="Find the stop",
                    command=start).grid(row=0, column=0, padx=6)
         ttk.Button(buttons, text="Cancel",
                    command=window.destroy).grid(row=0, column=1, padx=6)
 
+    def _run_hard_stop_together(self, direction: int, step_mm: float,
+                                budget_mm: float) -> None:
+        """The normal calibration: all three out together."""
+        def work():
+            self.log_threadsafe(
+                f"Hard-stop search on all three actuators, {direction:+d} "
+                f"direction, {step_mm:.3f} mm per step, up to {budget_mm:.1f} mm."
+            )
+
+            def progress(step):
+                self.log_threadsafe(
+                    "  " + "  ".join(f"{n} {mm:+8.4f}"
+                                     for n, mm in step.positions_mm.items())
+                    + f"   apart by {step.spread_mm:.4f} mm"
+                )
+
+            result = self.platform.seek_hard_stop_together(
+                direction=direction, step_mm=step_mm, budget_mm=budget_mm,
+                progress=progress,
+            )
+            for line in result.summary().splitlines():
+                self.log_threadsafe(line)
+            self.log_threadsafe(
+                "Use Motion > Set zero here if this end of travel is your "
+                "reference, and narrow the focus limits in the config so normal "
+                "moves stay inside it."
+            )
+
+        self.run_async("Find hard stop", work)
+
     def _run_hard_stop(self, name: str, direction: int,
                        step_mm: float, budget_mm: float) -> None:
+        """One actuator alone. Tilts the plate; only reached by explicit choice."""
         def work():
             motor = self.platform.motor(name)
             scale = motor.cfg.resolved_counts_per_mm
             step_counts = max(1, int(round(step_mm * scale)))
             budget_counts = max(step_counts, int(round(budget_mm * scale)))
             self.log_threadsafe(
-                f"{name}: searching for the hard stop, {direction:+d} direction, "
-                f"{step_counts} counts per step, up to {budget_counts} counts."
+                f"{name}: searching for the hard stop ALONE, {direction:+d} "
+                f"direction, {step_counts} counts per step, up to "
+                f"{budget_counts} counts. The focal plane will tilt."
             )
 
             def progress(counts, torque):
@@ -1269,12 +1341,42 @@ class MotorApp:
             self.log_threadsafe(
                 f"{name}: hard stop at {stop_counts} counts "
                 f"({motor.cfg.counts_to_mm(stop_counts):+.4f} mm on the current "
-                "zero). Use Motion > Set zero here if this is your reference, "
-                "and narrow the travel limits in the config to keep moves "
-                "inside it."
+                "zero). The plate is now tilted -- level it before observing."
             )
 
         self.run_async(f"Find hard stop ({name})", work)
+
+    def on_safety_drills(self) -> None:
+        """Provoke each dangerous situation and check the software refuses it.
+
+        Safe to run at any time, including while connected to the telescope:
+        every drill builds its own simulated platform and never touches these
+        motors. What it proves is that the guards still fire -- a check nobody
+        has seen fire is a check nobody should trust.
+        """
+        def work():
+            from .safety import run_all
+
+            self.log_threadsafe(
+                "Safety drills: provoking each dangerous situation in "
+                "simulation. Nothing here touches the real motors.")
+
+            def report(result):
+                self.log_threadsafe(f"  [{result.verdict}] {result.name}")
+                self.log_threadsafe(f"        did:    {result.what_was_done}")
+                self.log_threadsafe(f"        result: {result.what_happened}")
+
+            outcome = run_all(report=report)
+            passed = len(outcome.results) - len(outcome.failures)
+            self.log_threadsafe(
+                f"Safety drills: {passed} of {len(outcome.results)} passed.")
+            if outcome.failures:
+                self.log_threadsafe(
+                    "  A failing drill means a guard is missing or has stopped "
+                    "working. Do not rely on the software to refuse that "
+                    "situation until it is fixed.")
+
+        self.run_async("Safety drills", work)
 
     # ----------------------------------------------------------------- misc
 

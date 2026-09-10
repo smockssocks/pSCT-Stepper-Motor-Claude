@@ -348,5 +348,116 @@ class BrakeController:
                 self._client = None
 
 
+class SimulatedBrakeController:
+    """A stand-in for the site's brake device, for `--simulate`.
+
+    The real device is not configured yet -- nobody here knows its protocol --
+    so without this, nothing in simulation could exercise the brake interlocks,
+    and the interlocks are the part most worth rehearsing: they are what stops
+    a released brake dropping the focal plane.
+
+    It answers the same questions as `BrakeController` and additionally holds
+    the axes: `is_holding(name)` is consulted by the simulated motors, so a
+    move commanded against an engaged brake behaves like the real thing --
+    torque climbs and the shaft does not turn -- rather than sailing through.
+
+    It is deliberately obvious about being fake: `describe()` says so, and the
+    platform logs it on connect. Nobody should be able to mistake a rehearsal
+    for the real brakes being under software control.
+    """
+
+    def __init__(self, names, all_or_nothing: bool = True, logger=None):
+        self.names = list(names)
+        self.all_or_nothing = all_or_nothing
+        self._log = logger or (lambda msg: None)
+        # Brakes are spring-applied: no power means engaged. Simulation starts
+        # in the state the site's procedure describes finding them in.
+        self._engaged = {name: True for name in self.names}
+        #: Set False to simulate the brake supply being off, which on a
+        #: fail-safe brake means the brakes clamp and cannot be released.
+        self.powered = True
+
+    # ------------------------------------------------------ same interface
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    def describe(self) -> str:
+        return "simulated brake controller (no real brakes are being switched)"
+
+    def explain_unavailable(self) -> str:
+        return ""
+
+    def state_is_measured(self, name: str = "all") -> bool:
+        return True
+
+    def read_state(self, name: str = "all") -> BrakeState:
+        if name == "all" or self.all_or_nothing:
+            if all(self._engaged.values()):
+                return BrakeState.ENGAGED
+            if not any(self._engaged.values()):
+                return BrakeState.RELEASED
+            return BrakeState.UNKNOWN
+        return (BrakeState.ENGAGED if self._engaged[self._require_name(name)]
+                else BrakeState.RELEASED)
+
+    def release(self, name: str = "all", drives_holding: bool = False) -> None:
+        if not drives_holding:
+            raise BrakeError(
+                "Refusing to release the brakes: the drives are not confirmed "
+                "to be enabled and holding. Enable Position mode on all three "
+                "motors first. With the brakes off and the drives passive, "
+                "nothing is holding the focal plane."
+            )
+        if not self.powered:
+            raise BrakeError(
+                "The brakes did not release: there is no power to the brake "
+                "supply. These brakes are spring-applied and electrically "
+                "released, so with the supply off they clamp and the motors "
+                "cannot move the focal plane against them."
+            )
+        self._set(name, engaged=False)
+        self._log(f"Simulated brake released ({name}).")
+
+    def engage(self, name: str = "all") -> None:
+        self._set(name, engaged=True)
+        self._log(f"Simulated brake engaged ({name}).")
+
+    def close(self) -> None:
+        return None
+
+    # --------------------------------------------------------- simulation
+
+    def is_holding(self, name: str) -> bool:
+        """Whether this actuator's brake is currently clamping the shaft."""
+        if not self.powered:
+            return True
+        return self._engaged.get(name, True)
+
+    def set_powered(self, powered: bool) -> None:
+        """Turn the brake supply on or off.
+
+        With it off the brakes clamp, which is the safe direction and the
+        state the site's procedure warns about: "motor brakes ON when power is
+        off = cannot move the focal plane".
+        """
+        self.powered = bool(powered)
+        self._log(f"Simulated brake supply {'on' if powered else 'OFF'}.")
+
+    def _require_name(self, name: str) -> str:
+        if name not in self._engaged:
+            raise BrakeError(
+                f"No brake named {name!r}. Known: {sorted(self._engaged)}")
+        return name
+
+    def _set(self, name: str, engaged: bool) -> None:
+        if name == "all" or self.all_or_nothing:
+            for key in self._engaged:
+                self._engaged[key] = engaged
+        else:
+            self._engaged[self._require_name(name)] = engaged
+
+
 __all__ = ["ExternalBrakeConfig", "BrakeController", "BrakeError",
-           "NOT_CONFIGURED_MESSAGE"]
+           "SimulatedBrakeController", "NOT_CONFIGURED_MESSAGE"]

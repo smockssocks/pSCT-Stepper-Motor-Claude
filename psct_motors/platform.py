@@ -46,6 +46,77 @@ class PlatformError(RuntimeError):
     """A move was refused, or the platform is not in a state to move."""
 
 
+@dataclass(frozen=True)
+class HardStopProgress:
+    """One step's worth of a coordinated hard-stop search, for a live display."""
+
+    positions_mm: Dict[str, float]
+    travelled_mm: float
+    spread_mm: float
+    torque_percent: Dict[str, float]
+
+
+@dataclass(frozen=True)
+class HardStopResult:
+    """Where the coordinated hard-stop search ended, and why."""
+
+    direction: int
+    #: The actuator(s) that reported reaching a stop. The others were halted
+    #: with them, so their positions are where they happened to be, not their
+    #: own end of travel.
+    stopped_by: List[str]
+    reasons: Dict[str, str]
+    start_mm: Dict[str, float]
+    positions_mm: Dict[str, float]
+    positions_counts: Dict[str, int]
+    travelled_mm: Dict[str, float]
+    #: Difference in travel between the highest and lowest actuator when the
+    #: search finished, i.e. the tilt left in the plate. Small after levelling.
+    spread_mm: float
+    #: The worst that difference got at any point during the search.
+    worst_spread_mm: float
+    peak_torque_percent: Dict[str, float]
+    levelled: bool = False
+
+    def summary(self) -> str:
+        towards = "M1 (primary)" if self.direction > 0 else "M2 (secondary)"
+        lines = [
+            f"Hard stop found while running towards {towards}. "
+            f"Stopped by: {', '.join(self.stopped_by) or 'nothing'}."
+        ]
+        for name, mm in self.positions_mm.items():
+            why = self.reasons.get(name, "halted with the others")
+            lines.append(
+                f"  {name:<5} {mm:+9.4f} mm  ({self.travelled_mm[name]:+.4f} mm "
+                f"travelled, peak torque "
+                f"{self.peak_torque_percent.get(name, 0.0):.0f}%)  -- {why}"
+            )
+        lines.append(
+            f"  tilt: {self.spread_mm:.4f} mm between the highest and lowest "
+            f"actuator now, {self.worst_spread_mm:.4f} mm at its worst during "
+            f"the search."
+        )
+        if self.levelled:
+            lines.append("  The other actuators were backed off to match the one "
+                         "that stopped, so the plate is flat again.")
+        return "\n".join(lines)
+
+    def as_dict(self) -> dict:
+        return {
+            "direction": self.direction,
+            "stopped_by": list(self.stopped_by),
+            "reasons": dict(self.reasons),
+            "start_mm": dict(self.start_mm),
+            "positions_mm": dict(self.positions_mm),
+            "positions_counts": dict(self.positions_counts),
+            "travelled_mm": dict(self.travelled_mm),
+            "spread_mm": self.spread_mm,
+            "worst_spread_mm": self.worst_spread_mm,
+            "peak_torque_percent": dict(self.peak_torque_percent),
+            "levelled": self.levelled,
+        }
+
+
 @dataclass
 class PlatformState:
     """One consistent snapshot of the whole positioner."""
@@ -114,6 +185,12 @@ class FocalPlanePlatform:
                     # show the "no stop found" path.
                     hard_stop_low=a.mm_to_counts(a.min_travel_mm - 2.0),
                     hard_stop_high=a.mm_to_counts(a.max_travel_mm + 2.0),
+                    # The load the brakes exist to hold. With the brakes off
+                    # and the drives passive, a simulated axis falls -- which
+                    # is the failure the interlocks are there to prevent, and
+                    # it cannot be rehearsed if the simulation ignores gravity.
+                    gravity_counts_per_s=a.resolved_counts_per_mm * 2.0,
+                    brake_held=self._make_brake_hook(a.name),
                 )
                 for a in self.cfg.actuators
             ]
@@ -124,6 +201,14 @@ class FocalPlanePlatform:
                 for a in self.cfg.actuators
             ]
 
+    def _make_brake_hook(self, name: str):
+        """Let a simulated motor ask whether its brake is clamping the shaft."""
+        def held() -> bool:
+            controller = getattr(self, "external_brake", None)
+            hook = getattr(controller, "is_holding", None)
+            return bool(hook(name)) if hook else False
+        return held
+
     def _build_external_brake(self):
         """The device that switches the focal-plane brakes, if there is one.
 
@@ -131,9 +216,21 @@ class FocalPlanePlatform:
         go somewhere else. Built unconditionally: when it is unconfigured it
         still answers "not available, and here is why", which is more use than
         an attribute that does not exist.
+
+        In simulation, and only when no real device is configured, a fake one
+        stands in. Otherwise the brake interlocks -- the checks that stop a
+        released brake dropping the camera -- could not be rehearsed at all,
+        since the real device's protocol is still unknown.
         """
         from .external_brake import BrakeController, ExternalBrakeConfig
         settings = self.cfg.external_brake
+        if self.simulate and settings.mode == "none":
+            from .external_brake import SimulatedBrakeController
+            return SimulatedBrakeController(
+                [a.name for a in self.cfg.actuators],
+                all_or_nothing=settings.all_or_nothing,
+                logger=self._log,
+            )
         return BrakeController(
             ExternalBrakeConfig(
                 mode=settings.mode, host=settings.host, port=settings.port,
@@ -234,7 +331,7 @@ class FocalPlanePlatform:
 
     def read_state(self) -> PlatformState:
         """Poll everything. Never raises -- suitable for a UI timer."""
-        statuses = [m.read_status() for m in self.motors]
+        statuses = [self._with_external_brake(m.read_status()) for m in self.motors]
         valid = all(s.connected and not s.comms_error for s in statuses)
         orientation = None
         message = ""
@@ -251,6 +348,29 @@ class FocalPlanePlatform:
             message = f"Orientation unavailable: no reading from {', '.join(offline)}"
         return PlatformState(motors=statuses, orientation=orientation,
                              orientation_valid=valid, message=message)
+
+    def _with_external_brake(self, status: MotorStatus) -> MotorStatus:
+        """Show the brake that actually holds this axis.
+
+        `MotorStatus.brake` describes the motor's own brake output, which on
+        the pSCT is unassigned -- the brakes are on a separate device. Where
+        that device is reachable, its state is the true one, and displaying the
+        motor's instead would be showing an indicator that cannot change.
+        """
+        from dataclasses import replace
+        from .external_brake import BrakeError
+        from .jvl_motor import BrakeStatus
+
+        controller = self.external_brake
+        if not controller.available or status.comms_error:
+            return status
+        try:
+            state = controller.read_state(status.name)
+            measured = controller.state_is_measured(status.name)
+            detail = getattr(controller, "describe", lambda: "external brake")()
+        except BrakeError as exc:
+            state, measured, detail = BrakeState.UNKNOWN, False, str(exc)
+        return replace(status, brake=BrakeStatus(state, not measured, detail))
 
     # --------------------------------------------------------------- limits
 
@@ -388,8 +508,15 @@ class FocalPlanePlatform:
                     "Raise limits.max_step_mm if this is genuinely intended."
                 )
 
-            motor.ensure_position_mode()
+            # Every drive is enabled, not just the one that moves. The brakes
+            # are one switch for all three actuators, so taking them off with
+            # two drives passive would leave most of the plate held by nothing
+            # -- and the release interlock would refuse anyway.
+            for other in self.motors:
+                if other.connected:
+                    other.ensure_position_mode()
             self._release_brake_if_controlled(motor)
+            self._release_external_brakes()
             motor.set_velocity(motor.cfg.velocity_raw)
             motor.command_position_mm(target)
             self._log(f"{motor.name}: single-axis move to {target:.4f} mm.")
@@ -413,7 +540,13 @@ class FocalPlanePlatform:
             )
 
     def _prepare_for_motion(self) -> None:
-        """Position mode and brakes released on all three, or nothing moves."""
+        """Position mode and brakes released on all three, or nothing moves.
+
+        The order matters. Power is checked before anything is commanded,
+        because a drive with no supply accepts writes and ignores them. The
+        drives are enabled before the brakes come off, because a brake released
+        over a passive drive leaves the focal plane held by nothing.
+        """
         for motor in self.motors:
             errors = motor.get_errors()
             if errors:
@@ -421,10 +554,89 @@ class FocalPlanePlatform:
                     f"{motor.name} has an active error ({motor.error_text()}). "
                     "Clear it before moving."
                 )
+        self._check_drive_power()
         for motor in self.motors:
             motor.ensure_position_mode()
         for motor in self.motors:
             self._release_brake_if_controlled(motor)
+        self._release_external_brakes()
+
+    def _check_drive_power(self) -> None:
+        """Refuse to move if a drive's supply is below its own threshold.
+
+        A JVL with no 60 V still answers Modbus from its control supply: the
+        target is accepted, the mode reads back, and nothing turns. That looks
+        exactly like the software being broken, so it is worth naming.
+        """
+        dead = []
+        for motor in self.motors:
+            try:
+                bus = motor.read_register("BUS_VOLTAGE")
+                acceptance = motor.read_register("ACCEPTANCE_VOLTAGE")
+            except (ModbusError, MotorFault):
+                continue          # a comms problem is reported elsewhere
+            if acceptance > 0 and bus < acceptance:
+                dead.append(f"{motor.name} (bus {bus}, needs {acceptance})")
+        if dead:
+            raise PlatformError(
+                "Not moving: the drive supply is below the acceptance voltage "
+                f"on {', '.join(dead)}. The motors are reachable -- they answer "
+                "Modbus from their control supply -- but with the main supply "
+                "off they will accept a target and not move. Check the 60 V "
+                "supply and its breaker before commanding anything else."
+            )
+
+    def _release_external_brakes(self) -> None:
+        """Take the site's brakes off, or say why the move cannot go ahead."""
+        controller = self.external_brake
+        if not controller.available:
+            # Nothing to command and nothing to read. Say so once per move
+            # rather than pretending the brakes are off.
+            self._log(
+                "Note: the focal-plane brakes are not under software control, "
+                "so this move assumes they have already been released from the "
+                "brake page. If nothing moves, that is the first thing to check."
+            )
+            return
+
+        from .external_brake import BrakeError
+        try:
+            state = controller.read_state()
+        except BrakeError as exc:
+            raise PlatformError(
+                f"Not moving: the brake controller could not be read ({exc}). "
+                "Moving without knowing whether the brakes are off risks driving "
+                "the motors against them."
+            ) from exc
+
+        if state is BrakeState.RELEASED:
+            return
+
+        if not self.drives_holding:
+            raise PlatformError(
+                "Not moving: the brakes are engaged and the drives are not "
+                "holding position, so releasing them now would leave the focal "
+                "plane held by nothing. Enable the drives first."
+            )
+        try:
+            controller.release("all", drives_holding=True)
+        except BrakeError as exc:
+            raise PlatformError(
+                f"Not moving: the brakes did not release ({exc}). Driving the "
+                "motors against an engaged brake is how a lead screw or a "
+                "coupling gets damaged."
+            ) from exc
+
+        try:
+            after = controller.read_state()
+        except BrakeError:
+            return          # commanded, but unreadable; already logged
+        if after is not BrakeState.RELEASED:
+            raise PlatformError(
+                "Not moving: the brakes were commanded to release but still "
+                f"read back as {after.value}. Check the brake supply -- these "
+                "brakes are spring-applied, so with no power to them they clamp."
+            )
 
     def _release_brake_if_controlled(self, motor: JVLMotor) -> None:
         if not motor.brake_is_software_controlled:
@@ -478,22 +690,23 @@ class FocalPlanePlatform:
                         f"Move did not finish: {motor.name} was stopped while it "
                         "was running."
                     )
-                errors = motor.get_errors()
-                if errors:
-                    # One axis faulting does not stop the other two, and two
-                    # actuators continuing to a target the third will never
-                    # reach is precisely how the plate gets racked about its
-                    # ball joints. Halt everything, then report.
-                    text = motor.error_text()
-                    self._halt_all_quietly(f"{motor.name} faulted mid-move")
+                try:
+                    self._poll_during_move(motor, still_pending)
+                except ModbusError as exc:
+                    # The cable came out, or the drive stopped answering. The
+                    # other two are still moving towards a target this one will
+                    # never reach, which is how the plate gets racked about its
+                    # ball joints -- so they stop too, before anything is
+                    # reported.
+                    self._halt_all_quietly(f"lost contact with {motor.name}")
                     raise PlatformError(
-                        f"{motor.name} faulted during the move: {text}. All three "
-                        "actuators have been halted where they were, so the focal "
-                        "plane is at neither the old orientation nor the requested "
-                        "one -- read the current orientation before continuing."
-                    )
-                if not motor.is_in_position():
-                    still_pending.append(motor)
+                        f"Lost contact with {motor.name} during the move: {exc}. "
+                        "The other actuators have been halted where they were, so "
+                        "the focal plane is at neither the old orientation nor the "
+                        "requested one. Check that motor's cable and power, then "
+                        "read the current orientation before commanding anything "
+                        "else."
+                    ) from exc
             if not still_pending:
                 return
             pending = still_pending
@@ -507,6 +720,308 @@ class FocalPlanePlatform:
                 "obstruction, a brake that did not release, or a velocity set "
                 "so low the move could not finish inside the timeout."
             )
+
+    def _poll_during_move(self, motor: JVLMotor,
+                          still_pending: List[JVLMotor]) -> None:
+        """One motor's mid-move health check.
+
+        Appends the motor to `still_pending` if it has not arrived yet. Raises
+        rather than returning a verdict, because every problem it can find
+        means the whole move stops.
+        """
+        errors = motor.get_errors()
+        if errors:
+            # One axis faulting does not stop the other two, and two actuators
+            # continuing to a target the third will never reach is precisely
+            # how the plate gets racked about its ball joints. Halt
+            # everything, then report.
+            text = motor.error_text()
+            self._halt_all_quietly(f"{motor.name} faulted mid-move")
+            raise PlatformError(
+                f"{motor.name} faulted during the move: {text}. All three "
+                "actuators have been halted where they were, so the focal "
+                "plane is at neither the old orientation nor the requested "
+                "one -- read the current orientation before continuing."
+            )
+
+        torque = motor.check_stall()
+        if torque is not None:
+            # Something is resisting. Waiting out the timeout would mean
+            # pushing against it for the rest of the move, with the other two
+            # still travelling.
+            self._halt_all_quietly(f"{motor.name} is stalling")
+            raise PlatformError(
+                f"{motor.name} was resisting at {torque:.0f}% torque, so the "
+                f"move was stopped and all three actuators halted. Something "
+                f"is in the way, an axis has reached the end of its travel, or "
+                f"a brake did not release. The focal plane is at neither the "
+                f"old orientation nor the requested one -- read the current "
+                f"orientation before continuing."
+            )
+
+        if not motor.is_in_position():
+            still_pending.append(motor)
+
+    # ----------------------------------------------------- hard-stop seeking
+
+    def seek_hard_stop_together(
+        self,
+        direction: int,
+        step_mm: float = 0.2,
+        budget_mm: float = 30.0,
+        max_spread_mm: Optional[float] = None,
+        settle_s: float = 0.4,
+        step_timeout_s: float = 5.0,
+        level_after: bool = True,
+        progress: Optional[Callable[["HardStopProgress"], None]] = None,
+    ) -> "HardStopResult":
+        """Run all three actuators out together until the travel ends.
+
+        This is the site's calibration procedure -- drive to the end and let it
+        stop -- done to all three axes at once, which is the only safe way to
+        do it. Sending one actuator to its end stop on its own tilts the focal
+        plane about the other two ball joints, and the site's own experience is
+        that this can break something.
+
+        So the three are walked out in lockstep, in millimetres rather than
+        counts, so they cover the same distance even if their calibrations
+        differ. After every step three things are checked:
+
+        * torque on each axis, which climbs when something starts to resist;
+        * whether each shaft actually moved, because at a stop it will not;
+        * how far apart the three have drifted, because divergence *is* tilt.
+
+        The first axis to reach its stop ends the search for all three: every
+        motor is immediately commanded to hold where it is, so no axis keeps
+        pushing and no axis keeps travelling past the others. The two that did
+        not stop are then backed off to match the one that did (`level_after`),
+        because the step in which the first axis stopped left them up to one
+        step ahead of it -- which is a tilt, and the whole point is to not
+        leave one in the plate.
+
+        `direction` is +1 or -1: + drives the camera towards M1, - towards M2.
+        Returns a HardStopResult describing where the plate ended up. Raises
+        PlatformError if the axes diverge past `max_spread_mm`, or if the
+        budget is exhausted without finding a stop.
+        """
+        if direction not in (1, -1):
+            raise ValueError(f"direction must be +1 or -1, got {direction}")
+        if step_mm <= 0:
+            raise ValueError("step_mm must be positive")
+        if budget_mm <= 0:
+            raise ValueError("budget_mm must be positive")
+
+        limit_spread = (self.cfg.limits.max_hard_stop_spread_mm
+                        if max_spread_mm is None else max_spread_mm)
+
+        self._require_connected()
+        self._abort.clear()
+        for motor in self.motors:
+            motor.clear_cancel()
+        self._prepare_for_motion()
+
+        start_mm = {m.name: m.get_position_mm() for m in self.motors}
+        original_velocity = {m.name: m.read_register("V_SOLL") for m in self.motors}
+        for motor in self.motors:
+            motor.peak_torque_percent = None
+
+        travelled_mm = 0.0
+        worst_spread = 0.0
+        stopped_by: List[str] = []
+        reasons: Dict[str, str] = {}
+
+        try:
+            # Deliberately slow. Meeting a mechanical stop at speed is how a
+            # lead screw gets damaged, and a slow approach makes the torque
+            # rise easy to tell apart from an acceleration transient.
+            for motor in self.motors:
+                motor.set_velocity(max(1, original_velocity[motor.name] // 4))
+
+            while travelled_mm < budget_mm:
+                if self._abort.is_set():
+                    self._settle_all_where_they_are()
+                    raise PlatformError(
+                        "Hard-stop search stopped by the operator. All three "
+                        "actuators are holding where they were halted."
+                    )
+
+                before = {m.name: m.get_position_mm() for m in self.motors}
+                for motor in self.motors:
+                    target = before[motor.name] + direction * step_mm
+                    motor.command_position_counts(motor.cfg.mm_to_counts(target))
+
+                stopped_by, reasons = self._wait_out_hard_stop_step(
+                    settle_s + step_timeout_s)
+
+                after = {m.name: m.get_position_mm() for m in self.motors}
+                moved = {name: abs(after[name] - before[name]) for name in after}
+
+                # An axis that was told to move and barely did has reached its
+                # stop, whether or not the torque reading noticed.
+                for motor in self.motors:
+                    if (motor.name not in reasons
+                            and moved[motor.name] < step_mm * 0.25):
+                        stopped_by.append(motor.name)
+                        reasons[motor.name] = (
+                            f"commanded {step_mm:.3f} mm, moved "
+                            f"{moved[motor.name]:.4f} mm")
+
+                travelled = {name: after[name] - start_mm[name] for name in after}
+                spread = max(travelled.values()) - min(travelled.values())
+                worst_spread = max(worst_spread, spread)
+
+                if progress is not None:
+                    progress(HardStopProgress(
+                        positions_mm=dict(after),
+                        travelled_mm=max(abs(v) for v in travelled.values()),
+                        spread_mm=spread,
+                        torque_percent={m.name: (m.peak_torque_percent or 0.0)
+                                        for m in self.motors},
+                    ))
+
+                if stopped_by:
+                    self._settle_all_where_they_are()
+                    break
+
+                if spread > limit_spread:
+                    self._settle_all_where_they_are()
+                    lagging = min(travelled, key=travelled.get)
+                    leading = max(travelled, key=travelled.get)
+                    raise PlatformError(
+                        f"Hard-stop search abandoned: the actuators drifted "
+                        f"{spread:.4f} mm apart (limit {limit_spread:.4f} mm), "
+                        f"with {leading} ahead of {lagging}. That difference is "
+                        f"tilt in the focal plane, which is what running all "
+                        f"three together is meant to avoid. All three have been "
+                        f"halted where they were. Check for a binding axis or a "
+                        f"wrong counts_per_mm before trying again."
+                    )
+
+                travelled_mm = max(abs(v) for v in travelled.values())
+            else:
+                self._settle_all_where_they_are()
+                raise PlatformError(
+                    f"Travelled {travelled_mm:.2f} mm without any actuator "
+                    f"finding a stop, and gave up at the {budget_mm:.1f} mm "
+                    "budget. Either the travel is longer than expected, or the "
+                    "stall torque threshold is too high for the end stop to "
+                    "register. All three actuators are holding where they are."
+                )
+        finally:
+            for motor in self.motors:
+                try:
+                    motor.set_velocity(original_velocity[motor.name])
+                except (ModbusError, MotorFault):
+                    pass
+
+        levelled = self._level_after_stop(start_mm, direction) if level_after else False
+
+        end_mm = {m.name: m.get_position_mm() for m in self.motors}
+        travelled = {name: end_mm[name] - start_mm[name] for name in end_mm}
+        result = HardStopResult(
+            direction=direction,
+            stopped_by=list(dict.fromkeys(stopped_by)),
+            reasons=reasons,
+            start_mm=start_mm,
+            positions_mm=end_mm,
+            positions_counts={m.name: m.get_position_counts() for m in self.motors},
+            travelled_mm=travelled,
+            spread_mm=max(travelled.values()) - min(travelled.values()),
+            worst_spread_mm=worst_spread,
+            peak_torque_percent={m.name: (m.peak_torque_percent or 0.0)
+                                 for m in self.motors},
+            levelled=levelled,
+        )
+        self._log(result.summary())
+        return result
+
+    def _level_after_stop(self, start_mm: Dict[str, float], direction: int) -> bool:
+        """Bring the axes that did not stop back to match the one that did.
+
+        The search halts everything the moment the first axis stops, but the
+        other two were mid-step when that happened, so they sit up to one step
+        further out. That difference is tilt. Backing them off is always a move
+        *away* from the stop, so it cannot press anything harder.
+        """
+        travelled = {m.name: m.get_position_mm() - start_mm[m.name]
+                     for m in self.motors}
+        # The axis that stopped is the least-travelled one in the direction of
+        # travel; matching it is what makes the plate flat again.
+        reference = min(travelled.values()) if direction > 0 else max(travelled.values())
+        moving = [m for m in self.motors
+                  if abs(travelled[m.name] - reference) > m.cfg.in_position_tol_mm]
+        if not moving:
+            return False
+
+        self._log(
+            f"Levelling: backing off {', '.join(m.name for m in moving)} to match "
+            f"the actuator that stopped, so the plate does not stay tilted."
+        )
+        for motor in moving:
+            motor.command_position_mm(start_mm[motor.name] + reference)
+
+        deadline = time.monotonic() + max(m.cfg.move_timeout_s for m in moving)
+        while time.monotonic() < deadline:
+            if all(m.is_in_position() for m in moving):
+                return True
+            if self._abort.is_set():
+                break
+            time.sleep(0.05)
+        self._log("Levelling did not complete -- the plate may still be tilted. "
+                  "Check the actuator positions before commanding a move.")
+        return False
+
+    def _wait_out_hard_stop_step(self, timeout_s: float):
+        """Wait for one step of the coordinated search to finish or stop.
+
+        Returns (names that stopped, why). Deliberately not `_wait_for_all`:
+        there, an axis that does not reach its target is a failure, while here
+        it is the thing being looked for.
+        """
+        stopped: List[str] = []
+        reasons: Dict[str, str] = {}
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self._abort.is_set():
+                return stopped, reasons
+            pending = False
+            for motor in self.motors:
+                if motor.name in reasons:
+                    continue
+                torque = motor.check_stall()
+                if torque is not None:
+                    stopped.append(motor.name)
+                    reasons[motor.name] = f"torque reached {torque:.0f}%"
+                    continue
+                errors = motor.get_errors()
+                if errors:
+                    stopped.append(motor.name)
+                    reasons[motor.name] = f"drive faulted: {motor.error_text()}"
+                    continue
+                if not motor.is_in_position():
+                    pending = True
+            if stopped:
+                # One axis has finished travelling. Every other axis must stop
+                # now, in this poll, or the plane tilts by however far they get
+                # before the loop next comes round.
+                return stopped, reasons
+            if not pending:
+                return stopped, reasons
+            time.sleep(0.05)
+        return stopped, reasons
+
+    def _settle_all_where_they_are(self) -> None:
+        """Command every axis to hold its present position.
+
+        Without this the motors are left commanded past where they got to and
+        keep pushing -- against a stop, or against each other through the
+        plate.
+        """
+        for motor in self.motors:
+            try:
+                motor.settle_at_stop(motor.get_position_counts())
+            except (ModbusError, MotorFault) as exc:
+                self._log(f"{motor.name}: could not release against the stop: {exc}")
 
     def _halt_all_quietly(self, reason: str) -> None:
         """Stop every axis on an error path, without masking the original fault."""

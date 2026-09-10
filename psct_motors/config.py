@@ -358,10 +358,23 @@ class PlatformLimits:
     max_step_mm: float = 10.0
     max_tilt_step_deg: float = 0.5
 
+    #: How far the three actuators may drift apart during a coordinated
+    #: hard-stop search, in millimetres, before it is abandoned.
+    #:
+    #: The site's calibration procedure runs the actuators out until they
+    #: stop. Doing that one axis at a time racks the focal plane about its
+    #: ball joints, which the site says can break it, so all three go out
+    #: together -- and if one lags or leads the others by more than this, the
+    #: search halts rather than continuing to tilt the plate. Checked between
+    #: steps, when all three should have settled, so it is a real divergence
+    #: and not the transient of a step in progress.
+    max_hard_stop_spread_mm: float = 0.10
+
     def validate(self) -> None:
         if self.min_focus_mm >= self.max_focus_mm:
             raise ValueError("limits.min_focus_mm must be below limits.max_focus_mm")
-        for name in ("max_tilt_deg", "max_step_mm", "max_tilt_step_deg"):
+        for name in ("max_tilt_deg", "max_step_mm", "max_tilt_step_deg",
+                     "max_hard_stop_spread_mm"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"limits.{name} must be positive")
 

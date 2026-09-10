@@ -591,7 +591,7 @@ class JVLMotor:
                     f"{describe_errors(errors)}"
                 )
 
-            stalled = self._check_stall()
+            stalled = self.check_stall()
             if stalled is not None:
                 if halt_on_failure:
                     self.stop_quietly("the motor was working too hard")
@@ -614,7 +614,7 @@ class JVLMotor:
             self.stop_quietly(f"the move did not complete within {timeout:.0f} s")
         return False
 
-    def _check_stall(self) -> Optional[float]:
+    def check_stall(self) -> Optional[float]:
         """Return the torque percentage if the motor has been over its limit
         for long enough to count as a stall, else None.
 
@@ -696,10 +696,10 @@ class JVLMotor:
                 # rather than an error.
                 deadline = time.monotonic() + settle_s + 5.0
                 while time.monotonic() < deadline:
-                    stalled = self._check_stall()
+                    stalled = self.check_stall()
                     if stalled is not None:
                         stop_at = self.get_position_counts()
-                        self._settle_at_stop(stop_at)
+                        self.settle_at_stop(stop_at)
                         self._log(
                             f"{self.name}: hard stop found at {stop_at} counts -- "
                             f"torque reached {stalled:.0f}%."
@@ -708,7 +708,7 @@ class JVLMotor:
                     errors = self.get_errors()
                     if errors:
                         stop_at = self.get_position_counts()
-                        self._settle_at_stop(stop_at)
+                        self.settle_at_stop(stop_at)
                         raise MotorFault(
                             f"{self.name}: the drive faulted during the hard-stop "
                             f"search -- {describe_errors(errors)}"
@@ -725,7 +725,7 @@ class JVLMotor:
                 if moved < step_counts * 0.25:
                     # It was told to move and barely did. That is a hard stop
                     # whether or not the torque reading noticed.
-                    self._settle_at_stop(after)
+                    self.settle_at_stop(after)
                     self._log(
                         f"{self.name}: hard stop found at {after} counts -- "
                         f"commanded {step_counts} counts, moved {moved}."
@@ -746,7 +746,7 @@ class JVLMotor:
             "stop to register."
         )
 
-    def _settle_at_stop(self, position: int) -> None:
+    def settle_at_stop(self, position: int) -> None:
         """Back the command off to where the axis actually is.
 
         Without this the motor is left commanded past the stop and keeps

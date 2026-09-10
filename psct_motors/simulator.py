@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .config import ActuatorConfig
 from .jvl_motor import JVLMotor
@@ -53,10 +53,25 @@ class SimulatedJVLTransport:
                  gravity_counts_per_s: float = 0.0,
                  follow_error_counts: int = 0,
                  hard_stop_low: Optional[int] = None,
-                 hard_stop_high: Optional[int] = None):
+                 hard_stop_high: Optional[int] = None,
+                 brake_held: Optional[Callable[[], bool]] = None,
+                 brake_on_output: bool = False):
         self.name = name
         self.word_order = word_order
         self.gravity_counts_per_s = gravity_counts_per_s
+        #: Asked, on every physics step, whether an external brake is clamping
+        #: this shaft. That is how the brake interlocks become testable: with
+        #: the brake on, a commanded move does not turn the shaft and torque
+        #: climbs, exactly as it would on the telescope.
+        self.brake_held = brake_held or (lambda: False)
+        #: Whether a brake is actually wired to this motor's digital output.
+        #: False for the pSCT, whose brakes are on a separate device.
+        self.brake_on_output = bool(brake_on_output)
+        #: Whether the 60 V drive supply is on. With it off the drive cannot
+        #: hold or move anything, the bus voltage reads below the acceptance
+        #: threshold, and the axis falls back to Passive -- which is what the
+        #: MacTalk dump showed on a motor whose supply was off.
+        self.powered = True
         #: Standing lag of the encoder behind the profile output, in counts.
         #:
         #: Zero by default, so the simulator is an ideal motor and a test that
@@ -178,7 +193,31 @@ class SimulatedJVLTransport:
         if dt <= 0:
             return
 
+        if not self.powered:
+            # No 60 V. The drive cannot hold anything: it drops to Passive and
+            # the bus reads below the acceptance threshold. If the brakes are
+            # not holding either, a loaded axis then falls.
+            self.registers[2] = int(MotorMode.PASSIVE)
+            self.registers[97] = 1794
+            self.registers[12] = 0
+            if self.gravity_counts_per_s and not self._held():
+                self._position -= self.gravity_counts_per_s * dt
+            self._publish_position()
+            return
+
         mode = self.registers.get(2, 0)
+        if self._held() and mode == int(MotorMode.POSITION):
+            # Commanded to move against a clamped brake. The shaft does not
+            # turn and the drive pushes harder -- the same signature as a
+            # mechanical stop, which is what it is.
+            self.registers[12] = 0
+            target = float(self.registers.get(3, 0))
+            self.registers[217] = (self.stalled_torque
+                                   if abs(target - self._position) > 1
+                                   else self.idle_torque)
+            self._publish_position()
+            return
+
         if mode == int(MotorMode.POSITION) and self.registers.get(35, 0) == 0:
             target = float(self.registers.get(3, 0))
             speed = max(1.0, abs(self.registers.get(5, 1000))) * self.COUNTS_PER_SECOND_PER_VSOLL
@@ -197,9 +236,32 @@ class SimulatedJVLTransport:
             # holding, the axis creeps -- the failure mode the interlocks exist
             # to prevent.
             self.registers[12] = 0
-            if self.gravity_counts_per_s and not self._brake_output_engaged():
+            if self.gravity_counts_per_s and not self._held():
                 self._position -= self.gravity_counts_per_s * dt
 
+        self._publish_position()
+
+    def _held(self) -> bool:
+        """True when something mechanical is stopping the shaft turning.
+
+        Either the motor's own brake output, for an installation that wires a
+        brake to a drive output, or the external brake device the pSCT actually
+        uses. The motor output only counts when a brake is wired to it:
+        register 19 reads 0 on every motor here, and treating that as "brake
+        engaged" on an installation with no motor-driven brake would freeze
+        every simulated axis.
+        """
+        if self.brake_on_output and self._brake_output_engaged():
+            return True
+        return bool(self.brake_held())
+
+    def set_powered(self, powered: bool) -> None:
+        """Turn the 60 V drive supply on or off."""
+        self.powered = bool(powered)
+        if powered:
+            self.registers[97] = 4485
+
+    def _publish_position(self) -> None:
         projected = int(round(self._position))
         self.registers[10] = projected
         # The encoder lags the profile by a small standing amount, as the real
@@ -321,6 +383,7 @@ def simulated_motor(cfg: ActuatorConfig, start_mm: Optional[float] = None,
                     **kwargs) -> JVLMotor:
     """A JVLMotor backed by a simulated transport, positioned at `start_mm`."""
     start_counts = cfg.mm_to_counts(start_mm) if start_mm is not None else cfg.zero_counts
+    kwargs.setdefault("brake_on_output", cfg.brake.mode == "output")
     transport = SimulatedJVLTransport(
         name=cfg.name,
         word_order=WordOrder.parse(cfg.word_order),

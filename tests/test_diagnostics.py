@@ -708,6 +708,10 @@ class TestStallProtection(unittest.TestCase):
         )
         motor.connect()
         motor.set_mode(MotorMode.POSITION)
+        # The bench actuator wires a brake to a motor output, and the
+        # simulator models that brake holding the shaft, so it has to come off
+        # before anything can turn -- which is the point of the interlock.
+        motor.release_brake()
         return motor
 
     def test_torque_percent_matches_the_real_motor(self):
@@ -805,6 +809,153 @@ class TestStallProtection(unittest.TestCase):
             motor.disconnect()
 
 
+class TestCoordinatedHardStop(unittest.TestCase):
+    """The calibration runs the actuators out until they stop. Doing that one
+    axis at a time tilts the focal plane about the other two ball joints, and
+    the site says that can break it -- so all three go together."""
+
+    def _platform(self, stops=(3000, 3200, 3400), counts_per_mm=1000.0):
+        from psct_motors.config import default_config
+        from psct_motors.platform import FocalPlanePlatform
+
+        cfg = default_config()
+        for a in cfg.actuators:
+            a.counts_per_mm = counts_per_mm
+            a.velocity_raw = 4000
+            a.min_travel_mm, a.max_travel_mm = -50.0, 50.0
+            a.in_position_tol_mm = 0.01
+            a.move_timeout_s = 20.0
+        cfg.limits.min_focus_mm, cfg.limits.max_focus_mm = -40.0, 40.0
+        platform = FocalPlanePlatform(cfg=cfg, simulate=True)
+        platform.connect()
+        for motor, stop in zip(platform.motors, stops):
+            motor._transport.hard_stop_high = stop
+            motor._transport.hard_stop_low = None
+        return platform
+
+    def test_all_three_move_and_the_first_stop_halts_them_all(self):
+        platform = self._platform(stops=(3000, 9999, 9999))
+        try:
+            result = platform.seek_hard_stop_together(+1, step_mm=0.2,
+                                                      budget_mm=10.0)
+            self.assertEqual(result.stopped_by, ["Top"])
+            # The other two moved with it rather than staying put...
+            for name in ("East", "West"):
+                self.assertGreater(result.travelled_mm[name], 2.0)
+            # ...and were halted at Top's stop, not driven on to their own.
+            for name in ("East", "West"):
+                self.assertLess(result.positions_mm[name], 3.5)
+        finally:
+            platform.disconnect()
+
+    def test_the_plate_ends_flat(self):
+        """The step in which the first axis stops leaves the other two up to
+        one step ahead. That residual is tilt, so it gets levelled out."""
+        platform = self._platform(stops=(3000, 9999, 9999))
+        try:
+            result = platform.seek_hard_stop_together(+1, step_mm=0.2,
+                                                      budget_mm=10.0)
+            self.assertTrue(result.levelled)
+            self.assertLess(result.spread_mm, 0.02)
+            self.assertGreater(result.worst_spread_mm, 0.1)
+            orientation = platform.read_orientation()
+            self.assertLess(abs(orientation.total_tilt_deg), 0.001)
+        finally:
+            platform.disconnect()
+
+    def test_levelling_can_be_turned_off(self):
+        platform = self._platform(stops=(3000, 9999, 9999))
+        try:
+            result = platform.seek_hard_stop_together(+1, step_mm=0.2,
+                                                      budget_mm=10.0,
+                                                      level_after=False)
+            self.assertFalse(result.levelled)
+            self.assertGreater(result.spread_mm, 0.1)
+        finally:
+            platform.disconnect()
+
+    def test_it_gives_up_when_the_axes_diverge(self):
+        """Divergence between the actuators IS tilt. An axis that keeps falling
+        short -- dragging, or running far slower than the others -- has to end
+        the search rather than let the plate go on tilting."""
+        from psct_motors.platform import PlatformError
+        platform = self._platform(stops=(9999, 9999, 9999))
+        try:
+            # West's shaft turns slowly enough that it never finishes a step
+            # in the time allowed, so the shortfall accumulates -- but fast
+            # enough that it is plainly still moving, not at a stop.
+            platform.motors[2]._transport.COUNTS_PER_SECOND_PER_VSOLL = 1.0
+            with self.assertRaises(PlatformError) as ctx:
+                platform.seek_hard_stop_together(
+                    +1, step_mm=0.2, budget_mm=10.0, max_spread_mm=0.5,
+                    settle_s=0.0, step_timeout_s=0.4)
+            message = str(ctx.exception)
+            self.assertIn("drifted", message)
+            self.assertIn("West", message)
+            self.assertIn("halted", message)
+            # And it stopped early rather than running the whole budget.
+            self.assertLess(platform.motors[0].get_position_mm(), 5.0)
+        finally:
+            platform.disconnect()
+
+    def test_a_lagging_axis_is_not_mistaken_for_a_hard_stop(self):
+        """An axis moving slowly but freely is a different fault from one that
+        has hit its end, and saying "hard stop found" there would put the
+        calibration reference in the wrong place."""
+        from psct_motors.platform import PlatformError
+        platform = self._platform(stops=(9999, 9999, 9999))
+        try:
+            platform.motors[2]._transport.COUNTS_PER_SECOND_PER_VSOLL = 1.0
+            with self.assertRaises(PlatformError) as ctx:
+                platform.seek_hard_stop_together(
+                    +1, step_mm=0.2, budget_mm=10.0, max_spread_mm=0.5,
+                    settle_s=0.0, step_timeout_s=0.4)
+            self.assertNotIn("hard stop found", str(ctx.exception).lower())
+        finally:
+            platform.disconnect()
+
+    def test_no_axis_is_left_pushing_against_its_stop(self):
+        platform = self._platform(stops=(3000, 3000, 3000))
+        try:
+            platform.seek_hard_stop_together(+1, step_mm=0.2, budget_mm=10.0)
+            for motor in platform.motors:
+                self.assertLessEqual(motor.get_target_counts(), 3000)
+                self.assertLess(motor.get_torque_percent(), 30.0)
+        finally:
+            platform.disconnect()
+
+    def test_it_says_so_rather_than_inventing_a_stop(self):
+        from psct_motors.platform import PlatformError
+        platform = self._platform(stops=(None, None, None))
+        try:
+            with self.assertRaises(PlatformError) as ctx:
+                platform.seek_hard_stop_together(+1, step_mm=0.5, budget_mm=2.0)
+            self.assertIn("without any actuator finding a stop", str(ctx.exception))
+        finally:
+            platform.disconnect()
+
+    def test_it_works_in_the_negative_direction(self):
+        platform = self._platform(stops=(9999, 9999, 9999))
+        try:
+            for motor in platform.motors:
+                motor._transport.hard_stop_low = -3000
+            result = platform.seek_hard_stop_together(-1, step_mm=0.2,
+                                                      budget_mm=10.0)
+            self.assertTrue(result.stopped_by)
+            for name in platform.names:
+                self.assertLess(result.travelled_mm[name], -2.0)
+        finally:
+            platform.disconnect()
+
+    def test_a_bad_direction_is_refused(self):
+        platform = self._platform()
+        try:
+            with self.assertRaises(ValueError):
+                platform.seek_hard_stop_together(0, step_mm=0.2, budget_mm=1.0)
+        finally:
+            platform.disconnect()
+
+
 class TestExternalBrake(unittest.TestCase):
     """The pSCT brakes are switched by a separate device, not the motors --
     which is why the motor's Brake Output register reads 0."""
@@ -847,15 +998,55 @@ class TestExternalBrake(unittest.TestCase):
             ExternalBrakeConfig(mode="nonsense").validate()
 
     def test_platform_reports_brakes_as_unknown_when_unconfigured(self):
+        """On real hardware, with no brake device configured, the brakes are
+        not under software control and must be reported that way rather than
+        guessed at."""
+        from psct_motors.platform import FocalPlanePlatform
+        from psct_motors.config import default_config
+        from psct_motors.jvl_motor import BrakeState
+        platform = FocalPlanePlatform(cfg=default_config(), simulate=False)
+        self.assertFalse(platform.external_brake.available)
+        self.assertIn("not under software control",
+                      platform.external_brake.explain_unavailable())
+
+    def test_simulation_stands_in_a_brake_device(self):
+        """Without one, the brake interlocks -- the checks that stop a released
+        brake dropping the camera -- could not be rehearsed at all, since the
+        real device's protocol is still unknown."""
         from psct_motors.platform import FocalPlanePlatform
         from psct_motors.config import default_config
         from psct_motors.jvl_motor import BrakeState
         platform = FocalPlanePlatform(cfg=default_config(), simulate=True)
         platform.connect()
         try:
-            self.assertFalse(platform.external_brake.available)
+            self.assertTrue(platform.external_brake.available)
+            self.assertIn("simulated", platform.external_brake.describe())
+            # Spring-applied: they start on, as the site's procedure describes.
             for state in platform.brake_states().values():
-                self.assertIs(state, BrakeState.UNKNOWN)
+                self.assertIs(state, BrakeState.ENGAGED)
+        finally:
+            platform.disconnect()
+
+    def test_a_simulated_brake_actually_holds_the_shaft(self):
+        """A brake indicator that does not stop anything moving would let a
+        'brake did not release' fault pass unnoticed in rehearsal."""
+        from psct_motors.platform import FocalPlanePlatform
+        from psct_motors.config import default_config
+        cfg = default_config()
+        for actuator in cfg.actuators:
+            actuator.counts_per_mm = 1000.0
+        platform = FocalPlanePlatform(cfg=cfg, simulate=True)
+        platform.connect()
+        try:
+            motor = platform.motors[0]
+            motor.ensure_position_mode()          # brakes still engaged
+            before = motor.get_position_counts()
+            motor.command_position_counts(before + 5000)
+            time.sleep(0.4)
+            self.assertEqual(motor.get_position_counts(), before,
+                             "the shaft turned with the brake on")
+            # And the drive is pushing against it, as it would on the telescope.
+            self.assertGreater(motor.get_torque_percent(), 40.0)
         finally:
             platform.disconnect()
 

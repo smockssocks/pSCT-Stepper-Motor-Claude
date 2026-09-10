@@ -49,6 +49,11 @@ class TestFaultInjection(unittest.TestCase):
         self.motor = simulated_motor(bench_actuator(), start_mm=0.0)
         self.injector = wrap_motor(self.motor, seed=7)
         self.motor.connect()
+        # bench_actuator wires a brake to a motor output, and the simulator
+        # models that brake holding the shaft, so it has to come off before
+        # anything can turn. force=True because the drive is deliberately left
+        # passive here and there is no load on a bench.
+        self.motor.release_brake(force=True)
 
     def tearDown(self):
         self.motor.disconnect()
@@ -182,6 +187,7 @@ class TestHaltOnFault(unittest.TestCase):
         motor.connect()
         try:
             motor.ensure_position_mode()
+            motor.release_brake()
             motor.set_velocity(20)
             motor.command_position_counts(40000)
             time.sleep(0.3)
@@ -202,6 +208,7 @@ class TestHaltOnFault(unittest.TestCase):
         motor.connect()
         try:
             motor.ensure_position_mode()
+            motor.release_brake()
             injector.arm(Fault.STUCK_POSITION)
             motor.command_position_counts(40000)
             self.assertFalse(motor.wait_for_in_position(timeout_s=1.0))

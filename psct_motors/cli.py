@@ -689,13 +689,118 @@ def cmd_demo(args) -> int:
         motor.disconnect()
 
 
-def cmd_find_stop(args) -> int:
-    """Drive one actuator into its end stop, under torque supervision.
+def cmd_safety_check(args) -> int:
+    """Provoke each dangerous situation and check the software refuses it."""
+    from .safety import run_all
 
-    This is the site's calibration procedure -- run the actuator out until it
-    stops -- with the motor's torque watched so it stops when something
-    resists instead of continuing to push.
+    rule("Safety drills")
+    out("Each drill sets up one dangerous situation in simulation and checks")
+    out("the software refuses it, and says something useful when it does.")
+    out("No hardware is touched: every drill builds its own simulated platform.")
+    out("")
+
+    def report(result):
+        out(f"[{result.verdict}] {result.name}")
+        out(f"        did:      {result.what_was_done}")
+        out(f"        result:   {result.what_happened}")
+        if result.expected and not result.passed:
+            out(f"        expected: {result.expected}")
+        out("")
+
+    outcome = run_all(only=args.only.split(",") if args.only else None,
+                      report=None if args.json else report)
+    if args.json:
+        out(json.dumps(outcome.as_dict(), indent=2))
+        return 0 if outcome.passed else 1
+
+    rule("Summary")
+    passed = len(outcome.results) - len(outcome.failures)
+    out(f"  {passed} of {len(outcome.results)} drills passed.")
+    if outcome.failures:
+        out("")
+        out("  A failing drill means a guard is missing or has stopped working:")
+        for failure in outcome.failures:
+            out(f"    * {failure.name}")
+        return 1
+    out("")
+    out("  Every guard fired. Note what this does NOT prove: the drills use")
+    out("  simulated brakes, because the real brake device's protocol is not")
+    out("  known yet. They show the interlock logic is right, not that the")
+    out("  wiring is.")
+    return 0
+
+
+def cmd_find_stop(args) -> int:
+    """Run the actuators out until the travel ends, under torque supervision.
+
+    This is the site's calibration procedure. All three go together by
+    default, because taking one actuator to its stop on its own tilts the
+    focal plane about the other two ball joints.
     """
+    if not args.motor:
+        return _find_stop_together(args)
+    return _find_stop_single(args)
+
+
+def _find_stop_together(args) -> int:
+    """The normal case: all three out together, halting on the first stop."""
+    platform = make_platform(args)
+    try:
+        platform.connect()
+    except PlatformError as exc:
+        out(str(exc))
+        return 1
+    try:
+        direction = 1 if args.direction == "+" else -1
+        towards = "M1 (primary)" if direction > 0 else "M2 (secondary)"
+        limits = platform.cfg.limits
+
+        rule("Find hard stop -- all three actuators together")
+        out(f"  direction     {args.direction}  towards {towards}")
+        out(f"  step          {args.step_mm} mm, on every actuator")
+        out(f"  give up after {args.budget_mm} mm")
+        out(f"  torque limit  "
+            f"{platform.cfg.actuators[0].stall_torque_percent:.0f}% of the "
+            f"drive's current limit, over "
+            f"{platform.cfg.actuators[0].stall_persist_samples} consecutive readings")
+        out(f"  tilt guard    abandon if the three drift more than "
+            f"{limits.max_hard_stop_spread_mm:.3f} mm apart")
+        for name, mm in zip(platform.names, platform.read_actuator_positions_mm()):
+            out(f"  starting at   {name:<5} {mm:+9.4f} mm")
+        out("")
+        out("All three walk out together. The first one to stop halts the other")
+        out("two, which are then backed off to match it so the plate ends flat.")
+        if not confirm("Run them into the stop?", args.yes):
+            return 1
+
+        def progress(step):
+            out("    " + "  ".join(f"{n} {mm:+9.4f}"
+                                   for n, mm in step.positions_mm.items())
+                + f"   apart by {step.spread_mm:.4f} mm")
+
+        result = platform.seek_hard_stop_together(
+            direction=direction, step_mm=args.step_mm,
+            budget_mm=args.budget_mm, progress=progress,
+        )
+        out("")
+        rule("Result")
+        for line in result.summary().splitlines():
+            out("  " + line if not line.startswith(" ") else line)
+        out("")
+        out("Next: repeat in the other direction to learn the full travel, then")
+        out("set the focus limits in the config to sit inside what you found, and")
+        out("`set-zero` wherever you want the reference to be.")
+        return 0
+    except (PlatformError, MotorFault) as exc:
+        out("")
+        out(f"Search stopped: {exc}")
+        return 1
+    finally:
+        platform.disconnect()
+
+
+def _find_stop_single(args) -> int:
+    """One actuator alone. Tilts the plate, so it has to be asked for."""
     from .demo import build_motor
 
     motor = build_motor(args.config, args.motor, args.simulate)
@@ -720,10 +825,13 @@ def cmd_find_stop(args) -> int:
             f"{motor.cfg.stall_persist_samples} consecutive readings")
         out(f"  starting at   {motor.get_position_counts()} counts")
         out("")
-        out("This moves ONE actuator, which tilts the focal plane. When it")
-        out("stops, the command is backed off so it is not left pressed against")
-        out("the end.")
-        if not confirm("Run it into the stop?", args.yes):
+        out("This moves ONE actuator while the other two stay put, which tilts")
+        out("the focal plane about their ball joints -- the site's guidance is")
+        out("that all three should move together, which is what this command")
+        out("does when you leave --motor off. When it stops, the command is")
+        out("backed off so it is not left pressed against the end.")
+        if not confirm(f"Drive {motor.name} alone into the stop, tilting the "
+                       f"plane?", args.yes):
             return 1
 
         def progress(counts, torque):
@@ -1133,15 +1241,36 @@ one motor on a bench
     p.set_defaults(func=cmd_motor_gui)
 
     p = command(
-        "find-stop",
-        help="drive one actuator into its end stop, watching torque",
+        "safety-check",
+        help="provoke each dangerous situation and check it is refused",
         description=(
-            "The site's calibration procedure -- run the actuator out until it "
-            "stops -- with the motor's torque watched so it stops when "
-            "something resists rather than continuing to push."
+            "Runs the safety drills: brakes on, brake supply off, no drive "
+            "power, a brake released with nothing holding the load, limits, "
+            "stalls, and a motor lost mid-move. Everything runs against "
+            "simulated motors, so it is safe to run at any time and proves "
+            "the guards still fire."
         ),
     )
-    p.add_argument("--motor", default="Top")
+    p.add_argument("--only", help="comma-separated words to match drill names")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=cmd_safety_check)
+
+    p = command(
+        "find-stop",
+        help="run the actuators out into their end stops, watching torque",
+        description=(
+            "The site's calibration procedure -- run the actuators out until "
+            "they stop -- with torque watched so they stop when something "
+            "resists rather than continuing to push. All three move together "
+            "unless you name one with --motor, because taking a single "
+            "actuator to its stop tilts the focal plane about the other two "
+            "ball joints."
+        ),
+    )
+    p.add_argument("--motor", default=None,
+                   help="drive ONE actuator alone, tilting the plane (omit "
+                        "this to move all three together, which is what the "
+                        "calibration procedure wants)")
     p.add_argument("--direction", choices=["+", "-"], default="+",
                    help="+ towards M1 (primary), - towards M2 (secondary)")
     p.add_argument("--step-mm", type=float, default=0.2,
