@@ -287,6 +287,7 @@ See **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 
 | | |
 |---|---|
+| **[docs/how-it-works.md](docs/how-it-works.md)** | how the software is put together, the decisions behind it, and what is not verified — read before explaining it to anyone |
 | **[docs/verification.md](docs/verification.md)** | how to know it is alright: what to check, in what order, before it runs unattended |
 | **[docs/commissioning.md](docs/commissioning.md)** | the seven steps to do before trusting any reading |
 | **[docs/troubleshooting.md](docs/troubleshooting.md)** | when a motor stops taking commands: diagnose, event log, bench tools |
