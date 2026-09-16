@@ -154,6 +154,13 @@ class ActuatorConfig:
     """
 
     name: str = "A"
+    #: Stand this actuator in with a simulated motor even when the rest are
+    #: real. That is what makes a one-motor bench useful: the whole
+    #: application -- three-axis kinematics, the coordinated hard stop, the
+    #: emergency interlocks -- can be exercised against the one motor you
+    #: actually have, with the other two faked, instead of being untestable
+    #: until all three are wired.
+    simulated: bool = False
     ip: str = "192.168.0.52"
     port: int = 502
     unit_id: int = 1

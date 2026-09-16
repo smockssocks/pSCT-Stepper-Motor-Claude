@@ -70,6 +70,28 @@ which is why every decoded error prints raw hex first.
 
 ---
 
+## 2b. The whole application, on one bench motor
+
+`--bench` makes one motor real and stands in the other two, so the three-axis
+half of the application can be exercised before all three are wired:
+
+```
+python -m psct_motors.cli --bench Top gui
+python -m psct_motors.cli --bench Top find-stop --budget-mm 5
+python -m psct_motors.cli --bench Top safety-check
+```
+
+What this genuinely tests: that real Modbus writes, real torque readings, real
+stall detection and the real halt path work on hardware. What it does not: the
+two simulated axes always agree with each other and never fail, so a fault that
+only shows up when three real motors disagree cannot appear here.
+
+Keep the budget small. The bench motor has no end stop and no load, so a
+hard-stop search on it will run to its budget and report honestly that it found
+nothing -- which is itself worth seeing once.
+
+---
+
 ## 3. On the telescope, before any motion
 
 With the motors connected and the camera hanging on them:

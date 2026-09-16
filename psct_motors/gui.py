@@ -302,19 +302,21 @@ class MotorRow:
 
 class MotorApp:
     def __init__(self, root: tk.Tk, config_path: Optional[str] = None,
-                 simulate: bool = False):
+                 simulate: bool = False, bench: Optional[str] = None):
         self.root = root
         self.simulate = simulate
+        self.bench = bench
         self.config_path = config_path
-        self.root.title(
-            "pSCT Focal Plane Control" + ("  [SIMULATION]" if simulate else "")
-        )
 
         self.cfg = load_config(config_path)
+        if bench:
+            from .cli import apply_bench
+            apply_bench(self.cfg, bench)
         self.platform = FocalPlanePlatform(
             cfg=self.cfg, simulate=simulate, logger=self.log_threadsafe,
             config_path=config_path,
         )
+        self.root.title(self._window_title())
 
         self._busy = False
         self._poll_stop = threading.Event()
@@ -328,6 +330,14 @@ class MotorApp:
         self.log(f"Configuration: {config_path or default_config_path()}")
         if simulate:
             self.log("SIMULATION MODE -- no hardware is being touched.")
+        elif self.platform.is_mixed:
+            self.log("BENCH MODE: "
+                     + ", ".join(self.platform.simulated_names)
+                     + " are simulated. Only "
+                     + ", ".join(m.name for m in self.platform.motors
+                                 if m.name not in self.platform.simulated_names)
+                     + " is a real motor, and everything the others report is "
+                       "made up.")
         for actuator in self.cfg.actuators:
             if not actuator.scale_is_measured:
                 self.log(
@@ -373,6 +383,21 @@ class MotorApp:
             )
         except Exception:  # noqa: BLE001
             pass
+
+    def _window_title(self) -> str:
+        """Say in the title bar what is real and what is not.
+
+        Somebody walking up to this window has to be able to tell at a glance
+        whether it is driving a telescope. A screenshot of a simulated run and
+        a screenshot of a real one are otherwise identical.
+        """
+        if self.simulate:
+            return "pSCT Focal Plane Control  [SIMULATION -- no hardware]"
+        if self.platform.is_mixed:
+            real = ", ".join(m.name for m in self.platform.motors
+                             if m.name not in self.platform.simulated_names)
+            return (f"pSCT Focal Plane Control  [BENCH -- only {real} is real]")
+        return "pSCT Focal Plane Control"
 
     # ------------------------------------------------------------------ UI
 
@@ -422,6 +447,8 @@ class MotorApp:
         tools = tk.Menu(menubar, tearoff=0)
         tools.add_command(label="Connection settings...",
                           command=self.on_edit_connection)
+        tools.add_command(label="Motion limits...",
+                          command=self.on_edit_limits)
         tools.add_command(label="Find hard stop (calibration)...",
                           command=self.on_find_hard_stop)
         tools.add_command(label="Run safety drills (simulated)...",
@@ -641,6 +668,7 @@ class MotorApp:
         self._tilt_window = None
         self._plane_window = None
         self._hard_stop_window = None
+        self._limits_window = None
         self.plane_view = None
 
     def _build_actuators(self, parent) -> None:
@@ -1282,6 +1310,172 @@ class MotorApp:
 
     # -------------------------------------------------- connection settings
 
+    def on_edit_limits(self) -> None:
+        """Edit the motion limits without going to the configuration file.
+
+        The limits are the thing most likely to be wrong on a machine that has
+        not been commissioned yet: they ship as a guess, and the numbers that
+        replace them come out of `find-stop`, which is run from this same
+        window. Making that a text-file edit means somebody has to find the
+        text file, in the dark, on a telescope.
+        """
+        window = tk.Toplevel(self.root)
+        window.title("Motion limits")
+        window.transient(self.root)
+        self._limits_window = window
+        limits = self.cfg.limits
+
+        tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=520,
+                 text=("What the software will refuse. These are soft limits: "
+                       "they must sit INSIDE the mechanism's own end stops, "
+                       "with margin. Changes apply immediately and can be "
+                       "saved to the configuration file.")
+                 ).grid(row=0, column=0, columnspan=3, sticky="w",
+                        padx=12, pady=(12, 8))
+
+        fields = [
+            ("min_focus_mm", "Focus, lowest (mm)",
+             "towards M2 (secondary)"),
+            ("max_focus_mm", "Focus, highest (mm)",
+             "towards M1 (primary)"),
+            ("max_tilt_deg", "Max total tilt (deg)",
+             "magnitude, from the optical axis"),
+            ("max_step_mm", "Max single step (mm)",
+             "guards against a typo or a unit mistake"),
+            ("max_tilt_step_deg", "Max single tilt step (deg)", ""),
+            ("max_hard_stop_spread_mm", "Max drift apart, find-stop (mm)",
+             "how far the three may diverge before the search is abandoned"),
+        ]
+        entries = {}
+        for index, (attr, label, note) in enumerate(fields):
+            ttk.Label(window, text=label).grid(row=1 + index, column=0,
+                                               sticky="e", padx=(12, 4), pady=3)
+            var = tk.StringVar(value=f"{getattr(limits, attr):g}")
+            ttk.Entry(window, textvariable=var, width=12).grid(
+                row=1 + index, column=1, sticky="w", padx=4)
+            if note:
+                ttk.Label(window, text=note, foreground="#777",
+                          font=("TkDefaultFont", 8)).grid(
+                    row=1 + index, column=2, sticky="w", padx=(4, 12))
+            entries[attr] = var
+
+        # --- what find-stop found, and a one-click way to use it -------------
+        row = 1 + len(fields)
+        found = ttk.LabelFrame(window, text="Ends of travel found by Find hard stop")
+        found.grid(row=row, column=0, columnspan=3, sticky="ew",
+                   padx=12, pady=(10, 4))
+
+        def describe(value, which):
+            if value is None:
+                return f"{which}: not found yet"
+            return f"{which}: {value:+.4f} mm"
+
+        ttk.Label(found, text=describe(limits.hard_stop_low_mm, "lower")).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+        ttk.Label(found, text=describe(limits.hard_stop_high_mm, "upper")).grid(
+            row=1, column=0, sticky="w", padx=8)
+
+        margin_var = tk.StringVar(value="1.0")
+        ttk.Label(found, text="keep this much margin (mm):").grid(
+            row=2, column=0, sticky="e", padx=8, pady=4)
+        ttk.Entry(found, textvariable=margin_var, width=8).grid(
+            row=2, column=1, sticky="w")
+
+        def from_stops() -> None:
+            try:
+                margin = float(margin_var.get())
+            except ValueError:
+                messagebox.showerror("Check the number",
+                                     "Margin must be a number.", parent=window)
+                return
+            if margin < 0:
+                messagebox.showerror("Check the number",
+                                     "Margin cannot be negative.", parent=window)
+                return
+            if limits.hard_stop_low_mm is None and limits.hard_stop_high_mm is None:
+                messagebox.showwarning(
+                    "Nothing found yet",
+                    "Run Tools > Find hard stop in each direction first.",
+                    parent=window)
+                return
+            if limits.hard_stop_low_mm is not None:
+                entries["min_focus_mm"].set(
+                    f"{limits.hard_stop_low_mm + margin:g}")
+            if limits.hard_stop_high_mm is not None:
+                entries["max_focus_mm"].set(
+                    f"{limits.hard_stop_high_mm - margin:g}")
+
+        ttk.Button(found, text="Set focus limits from these",
+                   command=from_stops).grid(row=2, column=2, padx=8, pady=4)
+
+        def apply(persist: bool) -> None:
+            values = {}
+            for attr, label, _note in fields:
+                try:
+                    values[attr] = float(entries[attr].get())
+                except ValueError:
+                    messagebox.showerror("Check the numbers",
+                                         f"{label} must be a number.",
+                                         parent=window)
+                    return
+
+            # Validate on a copy, so a rejected edit cannot leave the live
+            # limits half-applied.
+            import dataclasses
+            candidate = dataclasses.replace(limits, **values)
+            try:
+                candidate.validate()
+                self._check_limits_against_stops(candidate)
+            except ValueError as exc:
+                messagebox.showerror("These limits will not do", str(exc),
+                                     parent=window)
+                return
+
+            for attr, value in values.items():
+                setattr(limits, attr, value)
+            self._refresh_gauge_limits()
+            self.log(f"Motion limits updated: focus "
+                     f"{limits.min_focus_mm:+g} to {limits.max_focus_mm:+g} mm, "
+                     f"max tilt {limits.max_tilt_deg:g} deg, max step "
+                     f"{limits.max_step_mm:g} mm.")
+            if persist:
+                path = save_config(self.cfg, self.config_path)
+                self.log(f"Saved to {path}")
+            window.destroy()
+            self._limits_window = None
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=row + 1, column=0, columnspan=3, pady=(6, 12))
+        ttk.Button(buttons, text="Use for this session",
+                   command=lambda: apply(False)).grid(row=0, column=0, padx=6)
+        ttk.Button(buttons, text="Use and save",
+                   command=lambda: apply(True)).grid(row=0, column=1, padx=6)
+        ttk.Button(buttons, text="Cancel",
+                   command=window.destroy).grid(row=0, column=2, padx=6)
+
+    @staticmethod
+    def _check_limits_against_stops(limits) -> None:
+        """Refuse soft limits that sit outside the mechanism's own ends.
+
+        A soft limit outside the hard stop is not a limit at all: every move it
+        allows would end by driving into the end of travel. This is the one
+        combination that is wrong on its face rather than merely unusual, so it
+        is refused rather than warned about.
+        """
+        low, high = limits.hard_stop_low_mm, limits.hard_stop_high_mm
+        if high is not None and limits.max_focus_mm > high:
+            raise ValueError(
+                f"The upper focus limit ({limits.max_focus_mm:+g} mm) is beyond "
+                f"the end of travel found at {high:+g} mm. A move to that limit "
+                f"would drive into the stop. Set it below {high:+g} mm."
+            )
+        if low is not None and limits.min_focus_mm < low:
+            raise ValueError(
+                f"The lower focus limit ({limits.min_focus_mm:+g} mm) is beyond "
+                f"the end of travel found at {low:+g} mm. A move to that limit "
+                f"would drive into the stop. Set it above {low:+g} mm."
+            )
+
     def on_edit_connection(self) -> None:
         """Edit each motor's IP and port without leaving the application.
 
@@ -1653,9 +1847,10 @@ class MotorApp:
             pass
 
 
-def main(config_path: Optional[str] = None, simulate: bool = False) -> int:
+def main(config_path: Optional[str] = None, simulate: bool = False,
+         bench: Optional[str] = None) -> int:
     root = tk.Tk()
-    MotorApp(root, config_path=config_path, simulate=simulate)
+    MotorApp(root, config_path=config_path, simulate=simulate, bench=bench)
     root.mainloop()
     return 0
 

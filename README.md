@@ -101,6 +101,7 @@ Behind the menus, so the main window stays about the job:
 | **Motion → Tip and tilt** | the two tilt angles, with nudges and a Level button |
 | **View → Focal plane picture** | live drawing of the plate on its three actuators |
 | **Tools → Connection settings** | edit each motor's IP and port, use now or save |
+| **Tools → Motion limits** | focus, tilt and step limits; set them from the ends of travel that Find hard stop discovered |
 | **Tools → Find hard stop** | run the actuators out to the end of travel |
 | **Tools → Run safety drills** | prove the guards still fire (simulated, safe any time) |
 
@@ -237,6 +238,23 @@ brake device's protocol is not known yet. It shows the interlock logic is
 right, not that the wiring is.
 
 ### One motor on a bench
+
+You do not need three motors to exercise the three-motor application. `--bench`
+makes the motor you name real and stands in the other two:
+
+```
+python -m psct_motors.cli --bench Top gui
+python -m psct_motors.cli --bench Top find-stop
+python -m psct_motors.cli --bench Top safety-check
+```
+
+Everything above the driver then runs for real against your one motor:
+kinematics, coordinated moves, the hard-stop search, the emergency interlocks,
+the load bars. The two stood-in axes answer instantly and truthfully-looking,
+so the title bar says **[BENCH — only Top is real]** and the log says it too.
+Do not read anything into what East and West report.
+
+The single-motor tools are still there, and need no calibration at all:
 
 ```
 python -m psct_motors.cli motor-gui --motor Top       # live state and errors

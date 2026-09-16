@@ -266,13 +266,21 @@ class PlatformServer(socketserver.ThreadingTCPServer):
 def serve(host: str = "127.0.0.1", port: int = 5020,
           config_path: Optional[str] = None, simulate: bool = False,
           platform: Optional[FocalPlanePlatform] = None,
+          bench: Optional[str] = None,
           logger: Optional[Callable[[str], None]] = None) -> int:
     """Run the bridge until interrupted."""
     log = logger or (lambda msg: print(msg, flush=True))
     if platform is None:
         cfg = load_config(config_path)
+        if bench:
+            from .cli import apply_bench
+            apply_bench(cfg, bench)
         platform = FocalPlanePlatform(cfg=cfg, simulate=simulate, logger=log,
                                       config_path=config_path)
+        if platform.is_mixed:
+            log("BENCH MODE: " + ", ".join(platform.simulated_names)
+                + " are simulated. A LabVIEW client cannot tell the difference,"
+                  " so do not leave the bridge in this mode by accident.")
 
     dispatcher = CommandDispatcher(platform, logger=log)
     server = PlatformServer((host, port), dispatcher)

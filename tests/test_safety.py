@@ -252,6 +252,107 @@ class TestEmergencyDoesNotDropTheCamera(unittest.TestCase):
             self.assertEqual(motor.get_mode(), int(MotorMode.PASSIVE))
 
 
+class TestBenchMode(unittest.TestCase):
+    """One real motor and two stood in.
+
+    What the site actually has is one motor on a bench. Without this the whole
+    three-axis half of the application -- kinematics, coordinated moves, the
+    hard-stop search, the emergency interlocks -- could not be exercised
+    against real hardware at all until all three were wired.
+    """
+
+    def _cfg(self, bench="Top"):
+        from psct_motors.cli import apply_bench
+        cfg = safety.bench_config()
+        apply_bench(cfg, bench)
+        return cfg
+
+    def test_only_the_named_motor_is_real(self):
+        cfg = self._cfg("Top")
+        self.assertFalse(cfg.actuator("Top").simulated)
+        self.assertTrue(cfg.actuator("East").simulated)
+        self.assertTrue(cfg.actuator("West").simulated)
+
+    def test_the_name_is_matched_case_insensitively(self):
+        cfg = self._cfg("top")
+        self.assertFalse(cfg.actuator("Top").simulated)
+
+    def test_an_unknown_name_is_refused_rather_than_ignored(self):
+        """Silently simulating all three would be the worst outcome: the
+        application would look like it was driving hardware."""
+        from psct_motors.cli import apply_bench
+        with self.assertRaises(ValueError) as ctx:
+            apply_bench(safety.bench_config(), "Middle")
+        self.assertIn("Middle", str(ctx.exception))
+        self.assertIn("Top", str(ctx.exception))
+
+    def test_the_platform_reports_which_axes_are_pretend(self):
+        platform = FocalPlanePlatform(cfg=self._cfg("Top"), simulate=False)
+        self.assertEqual(set(platform.simulated_names), {"East", "West"})
+        self.assertTrue(platform.is_mixed)
+
+    def test_a_fully_simulated_platform_is_not_called_mixed(self):
+        platform = FocalPlanePlatform(cfg=safety.bench_config(), simulate=True)
+        self.assertEqual(len(platform.simulated_names), 3)
+        self.assertFalse(platform.is_mixed)
+
+    def test_bench_mode_still_does_coordinated_moves(self):
+        """The point of it: the three-axis code runs, against one real motor."""
+        from psct_motors.kinematics import Orientation
+        cfg = self._cfg("Top")
+        cfg.actuator("Top").simulated = True     # no real motor in a test
+        platform = FocalPlanePlatform(cfg=cfg, simulate=False)
+        platform.connect()
+        self.addCleanup(platform.disconnect)
+        platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+        self.assertAlmostEqual(platform.read_orientation().focus_mm, 1.0, places=2)
+
+
+class TestSimulatedBoundsAreCoherent(unittest.TestCase):
+    """The simulated end stops have to agree with the configured limits.
+
+    They used to be placed from the actuator travel limits, which on a
+    configuration whose actuator limits are wider than its focus limits put the
+    simulated end of travel far outside everything: the search ran past its
+    budget without finding anything, and when it did find something the plate
+    was parked well outside the limits and every ordinary move was refused.
+    """
+
+    def _platform(self):
+        platform = FocalPlanePlatform(cfg=safety.bench_config(), simulate=True)
+        platform.connect()
+        self.addCleanup(platform.disconnect)
+        return platform
+
+    def test_the_stops_sit_just_outside_the_focus_limits(self):
+        from psct_motors.platform import SIMULATED_STOP_MARGIN_MM
+        platform = self._platform()
+        limits = platform.cfg.limits
+        for motor in platform.motors:
+            high = motor.cfg.counts_to_mm(motor._transport.hard_stop_high)
+            low = motor.cfg.counts_to_mm(motor._transport.hard_stop_low)
+            self.assertAlmostEqual(high, limits.max_focus_mm + SIMULATED_STOP_MARGIN_MM,
+                                   places=3)
+            self.assertAlmostEqual(low, limits.min_focus_mm - SIMULATED_STOP_MARGIN_MM,
+                                   places=3)
+            # The soft limit is what stops an ordinary move first.
+            self.assertGreater(high, limits.max_focus_mm)
+
+    def test_the_default_budget_reaches_a_stop(self):
+        """A rehearsal that never finds one only ever shows the failure path."""
+        platform = self._platform()
+        result = platform.seek_hard_stop_together(+1, budget_mm=30.0)
+        self.assertTrue(result.stopped_by)
+
+    def test_it_does_not_leave_the_plate_stranded(self):
+        platform = self._platform()
+        platform.seek_hard_stop_together(+1, budget_mm=30.0)
+        focus = platform.read_orientation().focus_mm
+        # Backed off from the stop, and within a millimetre of the soft limit
+        # rather than stranded far outside it.
+        self.assertLess(focus, platform.cfg.limits.max_focus_mm + 1.0)
+
+
 class TestSafetyDrills(unittest.TestCase):
     def test_every_drill_passes(self):
         report = safety.run_all()

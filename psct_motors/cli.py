@@ -70,8 +70,37 @@ def ask_float(prompt: str) -> Optional[float]:
 
 def make_platform(args) -> FocalPlanePlatform:
     cfg = load_config(args.config)
-    return FocalPlanePlatform(cfg=cfg, simulate=args.simulate, logger=out,
-                              config_path=args.config)
+    apply_bench(cfg, getattr(args, "bench", None))
+    platform = FocalPlanePlatform(cfg=cfg, simulate=args.simulate, logger=out,
+                                  config_path=args.config)
+    if platform.is_mixed:
+        out("BENCH MODE: " + ", ".join(platform.simulated_names)
+            + " are simulated; only "
+            + ", ".join(m.name for m in platform.motors
+                        if m.name not in platform.simulated_names)
+            + " is a real motor.")
+        out("Anything the simulated axes report is made up. Use this to")
+        out("exercise the application, not to believe its numbers.")
+    return platform
+
+
+def apply_bench(cfg, bench: Optional[str]):
+    """Mark every actuator except `bench` as simulated.
+
+    One motor on a bench is what the site actually has, and without this the
+    entire three-axis half of the application -- kinematics, coordinated moves,
+    the hard-stop search, the emergency interlocks -- cannot be exercised
+    against real hardware at all until all three are wired.
+    """
+    if not bench:
+        return cfg
+    names = [a.name for a in cfg.actuators]
+    matches = [a for a in cfg.actuators if a.name.lower() == bench.lower()]
+    if not matches:
+        raise ValueError(f"No actuator named {bench!r}. Known: {names}")
+    for actuator in cfg.actuators:
+        actuator.simulated = actuator is not matches[0]
+    return cfg
 
 
 # --------------------------------------------------------------------------
@@ -1220,13 +1249,14 @@ def cmd_show_log(args) -> int:
 
 def cmd_gui(args) -> int:
     from .gui import main as gui_main
-    return gui_main(config_path=args.config, simulate=args.simulate)
+    return gui_main(config_path=args.config, simulate=args.simulate,
+                    bench=args.bench)
 
 
 def cmd_server(args) -> int:
     from .server import serve
     return serve(host=args.host, port=args.port, config_path=args.config,
-                 simulate=args.simulate)
+                 simulate=args.simulate, bench=args.bench)
 
 
 # --------------------------------------------------------------------------
@@ -1248,6 +1278,10 @@ def _add_global_args(p: argparse.ArgumentParser,
                    help="run against built-in fake motors, no hardware needed")
     p.add_argument("-y", "--yes", action="store_true", **extra,
                    help="answer yes to confirmations (for scripts)")
+    p.add_argument("--bench", metavar="MOTOR", **extra,
+                   help="bench mode: MOTOR is real, the other two are "
+                        "simulated. Lets the whole three-axis application be "
+                        "exercised against the one motor you have.")
 
 
 def build_parser() -> argparse.ArgumentParser:

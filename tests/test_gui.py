@@ -281,6 +281,45 @@ class TestGui(unittest.TestCase):
         self.assertIn("End of travel recorded",
                       self.app.log_text.get("1.0", "end"))
 
+    def test_motion_limits_can_be_edited_from_the_menu(self):
+        """The limits ship as a guess and the numbers that replace them come
+        out of find-stop, run from this same window. Making that a text-file
+        edit means somebody has to find the text file, in the dark."""
+        self.assertIsNone(self.app._limits_window)
+        self._answer(False, self.app.on_edit_limits)
+        self.pump(0.3)
+        self.assertTrue(self.app._limits_window.winfo_exists())
+        self.app._limits_window.destroy()
+        self.app._limits_window = None
+
+    def test_soft_limits_outside_the_hard_stops_are_refused(self):
+        """A soft limit beyond the end of travel is not a limit: every move it
+        allows would end by driving into the stop."""
+        from psct_motors.gui import MotorApp
+        limits = self.app.cfg.limits
+        limits.hard_stop_high_mm = 25.4
+        limits.hard_stop_low_mm = -25.4
+
+        limits.max_focus_mm = 24.0
+        MotorApp._check_limits_against_stops(limits)      # inside: fine
+
+        limits.max_focus_mm = 26.0
+        with self.assertRaises(ValueError) as ctx:
+            MotorApp._check_limits_against_stops(limits)
+        self.assertIn("beyond the end of travel", str(ctx.exception))
+
+        limits.max_focus_mm = 24.0
+        limits.min_focus_mm = -30.0
+        with self.assertRaises(ValueError):
+            MotorApp._check_limits_against_stops(limits)
+
+    def test_limits_are_unchecked_until_the_stops_are_known(self):
+        from psct_motors.gui import MotorApp
+        limits = self.app.cfg.limits
+        self.assertIsNone(limits.hard_stop_high_mm)
+        limits.max_focus_mm = 900.0
+        MotorApp._check_limits_against_stops(limits)   # nothing to check against
+
     def test_rows_show_each_actuator(self):
         self.app._start_polling()
         self.pump(0.5)

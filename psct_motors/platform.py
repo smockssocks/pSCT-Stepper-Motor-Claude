@@ -42,6 +42,16 @@ from .kinematics import Orientation, ThreePointPlatform, platform_from_config
 from .transport import ModbusError
 
 
+#: How far beyond the soft focus limits the *simulated* end stops sit.
+#:
+#: The published pSCT travel is 5.08 cm, i.e. +/-25.4 mm, against soft limits
+#: of +/-24 mm -- so about a millimetre and a half of margin at each end, which
+#: is what this reproduces. Small enough that the search finds a stop inside a
+#: sensible budget, and large enough that the soft limit is what stops an
+#: ordinary move first.
+SIMULATED_STOP_MARGIN_MM = 1.4
+
+
 class PlatformError(RuntimeError):
     """A move was refused, or the platform is not in a state to move."""
 
@@ -256,36 +266,61 @@ class FocalPlanePlatform:
         self._move_lock = threading.RLock()
         self._abort = threading.Event()
 
-        if simulate:
-            from .simulator import simulated_motor
-            # Start the simulated actuators mid-travel so relative moves in
-            # both directions are possible straight away.
-            mid = (self.cfg.limits.min_focus_mm + self.cfg.limits.max_focus_mm) / 2.0
-            self.motors: List[JVLMotor] = [
-                simulated_motor(
-                    a, start_mm=mid,
-                    # Mechanical end stops a little beyond the soft limits, so
-                    # `find-stop` has something to find in simulation and the
-                    # soft limits are still what stops an ordinary move first.
-                    # Without these, rehearsing the calibration would only ever
-                    # show the "no stop found" path.
-                    hard_stop_low=a.mm_to_counts(a.min_travel_mm - 2.0),
-                    hard_stop_high=a.mm_to_counts(a.max_travel_mm + 2.0),
-                    # The load the brakes exist to hold. With the brakes off
-                    # and the drives passive, a simulated axis falls -- which
-                    # is the failure the interlocks are there to prevent, and
-                    # it cannot be rehearsed if the simulation ignores gravity.
-                    gravity_counts_per_s=a.resolved_counts_per_mm * 2.0,
-                    brake_held=self._make_brake_hook(a.name),
-                )
-                for a in self.cfg.actuators
-            ]
-        else:
-            self.motors = [
-                JVLMotor(a, timeout_s=self.cfg.modbus_timeout_s,
-                         retries=self.cfg.modbus_retries, logger=self._log)
-                for a in self.cfg.actuators
-            ]
+        # An actuator is simulated when the whole platform is, or when that
+        # one actuator asks to be. The mixed case is the point: one real motor
+        # on a bench, two stood in, so everything above the driver can be
+        # exercised before all three are wired.
+        self.motors: List[JVLMotor] = [
+            self._build_motor(a, simulate or a.simulated)
+            for a in self.cfg.actuators
+        ]
+
+    def _build_motor(self, a, simulated: bool) -> JVLMotor:
+        """One motor: real Modbus, or a stand-in."""
+        if not simulated:
+            return JVLMotor(a, timeout_s=self.cfg.modbus_timeout_s,
+                            retries=self.cfg.modbus_retries, logger=self._log)
+
+        from .simulator import simulated_motor
+        # Start the simulated actuators mid-travel so relative moves in both
+        # directions are possible straight away.
+        mid = (self.cfg.limits.min_focus_mm + self.cfg.limits.max_focus_mm) / 2.0
+        return simulated_motor(
+            a, start_mm=mid,
+            # Mechanical end stops just outside the *focus* limits, which is
+            # the range the operator and the gauge think in.
+            #
+            # They used to be placed from the actuator travel limits instead,
+            # which on a configuration whose actuator limits are wider than its
+            # focus limits put the simulated end of travel far outside
+            # everything: a search that ran past its budget without finding
+            # anything, and, when it did find something, a plate parked well
+            # outside the limits so every ordinary move afterwards was refused.
+            # Soft limits sit inside the mechanism; the simulation has to agree.
+            hard_stop_low=a.mm_to_counts(
+                self.cfg.limits.min_focus_mm - SIMULATED_STOP_MARGIN_MM),
+            hard_stop_high=a.mm_to_counts(
+                self.cfg.limits.max_focus_mm + SIMULATED_STOP_MARGIN_MM),
+            # The load the brakes exist to hold. With the brakes off and the
+            # drives passive, a simulated axis falls -- which is the failure the
+            # interlocks are there to prevent, and it cannot be rehearsed if
+            # the simulation ignores gravity.
+            gravity_counts_per_s=a.resolved_counts_per_mm * 2.0,
+            brake_held=self._make_brake_hook(a.name),
+        )
+
+    @property
+    def simulated_names(self) -> List[str]:
+        """Which actuators are stood in rather than real."""
+        from .simulator import SimulatedJVLTransport
+        return [m.name for m in self.motors
+                if isinstance(m._transport, SimulatedJVLTransport)]
+
+    @property
+    def is_mixed(self) -> bool:
+        """True when some motors are real and some are simulated."""
+        simulated = set(self.simulated_names)
+        return bool(simulated) and len(simulated) != len(self.motors)
 
     def _make_brake_hook(self, name: str):
         """Let a simulated motor ask whether its brake is clamping the shaft."""
@@ -928,6 +963,9 @@ class FocalPlanePlatform:
 
             last_movement = {m.name: time.monotonic() for m in self.motors}
             last_position = dict(start_mm)
+            #: Largest distance any axis covered between two polls. Used to
+            #: size the divergence guard's allowance for detection latency.
+            per_poll = 0.0
             deadline = time.monotonic() + self._seek_timeout_s(budget_mm)
 
             while True:
@@ -950,6 +988,9 @@ class FocalPlanePlatform:
 
                 now = time.monotonic()
                 here = {m.name: m.get_position_mm() for m in self.motors}
+                # Snapshot before the per-motor loop below updates it, or the
+                # per-poll distance measured afterwards is always zero.
+                previous = dict(last_position)
 
                 for motor in self.motors:
                     name = motor.name
@@ -984,6 +1025,19 @@ class FocalPlanePlatform:
                 spread = max(travelled.values()) - min(travelled.values())
                 worst_spread = max(worst_spread, spread)
 
+                # How far an axis covers between polls, measured rather than
+                # assumed. The divergence guard has to allow for it: when one
+                # axis meets its stop, confirming the stall takes
+                # `stall_persist_samples` consecutive readings, and the other
+                # two keep travelling throughout. That is detection latency,
+                # not a mechanism tilting, and a guard that cannot tell them
+                # apart aborts every successful search.
+                moved_this_poll = max(
+                    (abs(here[n] - previous[n]) for n in here), default=0.0)
+                per_poll = max(per_poll, moved_this_poll)
+                latency_allowance = per_poll * (
+                    max(m.cfg.stall_persist_samples for m in self.motors) + 2)
+
                 if progress is not None:
                     progress(HardStopProgress(
                         positions_mm=dict(here),
@@ -998,13 +1052,15 @@ class FocalPlanePlatform:
                     self._settle_all_where_they_are()
                     break
 
-                if spread > limit_spread:
+                if spread > limit_spread + latency_allowance:
                     self._settle_all_where_they_are()
                     lagging = min(travelled, key=travelled.get)
                     leading = max(travelled, key=travelled.get)
                     raise PlatformError(
                         f"Hard-stop search abandoned: the actuators drifted "
-                        f"{spread:.4f} mm apart (limit {limit_spread:.4f} mm), "
+                        f"{spread:.4f} mm apart (limit {limit_spread:.4f} mm "
+                        f"plus {latency_allowance:.4f} mm allowed for stall "
+                        f"detection latency), "
                         f"with {leading} ahead of {lagging}. That difference is "
                         f"tilt in the focal plane, which is what running all "
                         f"three together is meant to avoid. All three have been "
