@@ -67,6 +67,59 @@ class TestSingleMotorGui(unittest.TestCase):
             os.remove(os.path.join(self.dir, name))
         os.rmdir(self.dir)
 
+    def test_the_bench_gui_shows_torque(self):
+        """The bench is where you find out what "working normally" reads,
+        before trusting a stall threshold on the telescope. It had no torque
+        display at all, which is what "still no torque reading" meant."""
+        self.app.watcher.poll_once()
+        self.app._apply_status()
+        self.pump(0.2)
+        text = self.app.torque_var.get()
+        # 337 / 2048 is what the real pSCT motor reads, and the simulator
+        # reproduces it. The raw pair is shown as well as the percentage, so it
+        # can be compared against MacTalk.
+        self.assertIn("16.5", text)
+        self.assertIn("337", text)
+        self.assertIn("2048", text)
+        self.assertAlmostEqual(self.app.torque_bar._percent, 100 * 337 / 2048,
+                               places=1)
+        self.assertIn("stall at", self.app.torque_note_var.get())
+
+    def test_torque_rises_against_an_end_stop(self):
+        """The reading is only worth having if it moves when the motor works
+        harder. The simulated axis has to show that, or a rehearsal teaches
+        nothing about what a real stall looks like."""
+        motor = self.app.motor
+        motor.ensure_position_mode()
+        # The fault injector wraps the transport, so the simulated hardware is
+        # one layer in.
+        inner = self.app.injector.inner
+        inner.hard_stop_high = motor.get_position_counts() + 409600
+
+        self.app.watcher.poll_once()
+        self.app._apply_status()
+        idle = self.app.torque_bar._percent
+
+        motor.command_position_counts(motor.get_position_counts() + 2_000_000)
+        self.pump(1.2)
+        self.app.watcher.poll_once()
+        self.app._apply_status()
+        stalled = self.app.torque_bar._percent
+
+        self.assertGreater(stalled, idle + 20.0,
+                           f"torque did not rise: {idle} -> {stalled}")
+        self.assertGreater(stalled, motor.cfg.stall_torque_percent,
+                           "a stalled axis must read above the stall threshold")
+        self.assertIn("1600", self.app.torque_var.get())
+
+    def test_torque_blanks_when_the_motor_stops_answering(self):
+        self.app.injector.inner.set_offline(True)
+        self.app.watcher.poll_once()
+        self.app._apply_status()
+        self.pump(0.2)
+        self.assertEqual(self.app.torque_var.get(), "--")
+        self.assertIsNone(self.app.torque_bar._percent)
+
     def pump(self, seconds: float) -> None:
         end = time.monotonic() + seconds
         while time.monotonic() < end:

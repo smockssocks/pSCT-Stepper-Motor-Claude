@@ -223,6 +223,37 @@ class SingleMotorApp:
         ttk.Label(frame, textvariable=self.vsoll_var, width=18,
                   anchor="w").grid(row=2, column=6, sticky="w", padx=4)
 
+        # --- torque -------------------------------------------------------
+        # Actual Torque (217) over CL: Current Max (212). Both CONFIRMED on
+        # these motors, which read 337 and 2048 -- about 16% when idle. It is
+        # the only measure of effort these drives publish: there is no amps
+        # register anywhere in the map.
+        #
+        # It belongs on a bench GUI more than anywhere else, because the bench
+        # is where you find out what "working normally" reads before trusting
+        # a stall threshold on the telescope.
+        from .gui import LoadBar
+
+        self.torque_var = tk.StringVar(value="--")
+        ttk.Label(frame, text="Torque").grid(row=4, column=0, sticky="e",
+                                             padx=(8, 2))
+        ttk.Label(frame, textvariable=self.torque_var, width=34, anchor="w",
+                  font=("TkFixedFont", 12, "bold")).grid(
+            row=4, column=1, columnspan=3, sticky="w")
+
+        self.torque_bar = LoadBar(
+            frame,
+            warn_percent=self.motor.cfg.torque_warn_percent,
+            stall_percent=self.motor.cfg.stall_torque_percent)
+        self.torque_bar.grid(row=4, column=4, columnspan=2, padx=(16, 2),
+                             sticky="w")
+
+        self.torque_note_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.torque_note_var, width=22,
+                  anchor="w", foreground="#555",
+                  font=("TkDefaultFont", 8)).grid(row=4, column=6, sticky="w",
+                                                  padx=4)
+
         # Follow error: the number that says whether the SHAFT arrived, as
         # opposed to whether the profile generator did. Shown beside the
         # position because the two together are the whole story.
@@ -469,6 +500,9 @@ class SingleMotorApp:
             self.mode_var.set("no comms")
             self.mode_lamp.set(COLOR_BAD)
             self.conn_lamp.set(COLOR_BAD)
+            self.torque_var.set("--")
+            self.torque_bar.set(None, "--")
+            self.torque_note_var.set("")
             self._show_errors(None, snapshot.comms_error)
             return
 
@@ -497,6 +531,8 @@ class SingleMotorApp:
         self.conn_lamp.set(COLOR_WARN if snapshot.moving else COLOR_OK)
         self._show_errors(snapshot.errors, "")
 
+        self._apply_torque()
+
         try:
             brake = self.motor.get_brake_status()
             self.brake_var.set(brake.state.value
@@ -507,6 +543,32 @@ class SingleMotorApp:
         except (ModbusError, MotorFault):
             self.brake_var.set("unknown")
             self.brake_lamp.set(COLOR_IDLE)
+
+    def _apply_torque(self) -> None:
+        """Show how hard the motor is working, and against what limits."""
+        try:
+            percent = self.motor.get_torque_percent()
+            limit = self.motor.get_current_limit()
+            raw = self.motor.read_register("ACTUAL_TORQUE")
+        except (ModbusError, MotorFault):
+            percent = limit = raw = None
+
+        if percent is None:
+            self.torque_var.set("not reported by this motor")
+            self.torque_bar.set(None, "n/a")
+            self.torque_note_var.set("no ACTUAL_TORQUE / CURRENT_MAX")
+            return
+
+        amps = self.motor.get_current_amps(percent)
+        # The raw pair as well as the percentage: on a bench the raw numbers
+        # are what you compare against MacTalk to confirm the interpretation.
+        self.torque_var.set(
+            f"{percent:>9.1f} %   {raw} / {limit}"
+            + (f"   ~{amps:.2f} A" if amps is not None else ""))
+        self.torque_bar.set(percent)
+        self.torque_note_var.set(
+            f"peak {self.torque_bar._peak:.0f}%  "
+            f"stall at {self.motor.cfg.stall_torque_percent:.0f}%")
 
     def _show_errors(self, errors: Optional[int], comms_error: str) -> None:
         if comms_error:

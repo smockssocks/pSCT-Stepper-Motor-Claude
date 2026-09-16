@@ -287,7 +287,11 @@ python -m psct_motors.cli demo --motor Top            # drills, incl. real fault
 ```
 
 Both work on a single motor with no calibration, in counts and revolutions, and
-can inject faults so you can see the error handling work.
+can inject faults so you can see the error handling work. `motor-gui` shows
+live torque — the percentage, the raw `337 / 2048` pair for comparing against
+MacTalk, and a bar with the stall threshold marked — because the bench is where
+you find out what "working normally" reads before trusting that threshold on
+the telescope.
 See **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 
 ---

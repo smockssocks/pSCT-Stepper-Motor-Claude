@@ -169,9 +169,11 @@ stop, and recommends a threshold from the gap. Three outcomes:
 * **No torque readings at all** — set `stall_protection: false` rather than
   leaving it on and trusting it.
 
-Then watch the load bars in the GUI during a normal move. Green during ordinary
-motion, with the peak mark well short of the red line, is what "correctly set"
-looks like.
+Then watch the load bars during a normal move. Green during ordinary motion,
+with the peak mark well short of the red line, is what "correctly set" looks
+like. `motor-gui` shows the same reading for one motor with the raw
+`ACTUAL_TORQUE / CURRENT_MAX` pair beside it, which is what to compare against
+MacTalk's own display to confirm the interpretation.
 
 ---
 
