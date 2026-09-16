@@ -390,6 +390,29 @@ class TestMotorWatcher(unittest.TestCase):
     def messages(self, severity=DEBUG):
         return [e.message for e in self.log.events(min_severity=severity)]
 
+    def test_it_polls_faster_while_the_shaft_is_turning(self):
+        """A parked motor reports the same numbers however often it is asked.
+        A moving one does not, and that is when the readout has to keep up."""
+        watcher = MotorWatcher(self.motor, self.log,
+                               interval_s=0.05, idle_interval_s=0.5,
+                               heartbeat_s=0)
+        self.assertEqual(watcher.next_interval(moving=True), 0.05)
+        self.assertEqual(watcher.next_interval(moving=False), 0.5)
+
+        # ...and the flag it switches on is the one the poll actually sets.
+        self.motor.ensure_position_mode()
+        watcher.poll_once()                      # baseline position
+        self.assertFalse(watcher.poll_once().moving)
+        self.motor.command_position_counts(self.motor.get_position_counts()
+                                           + 2_000_000)
+        time.sleep(0.05)                         # let the shaft actually turn
+        self.assertTrue(watcher.poll_once().moving)
+
+    def test_an_idle_interval_is_never_shorter_than_the_moving_one(self):
+        watcher = MotorWatcher(self.motor, self.log,
+                               interval_s=0.5, idle_interval_s=0.1)
+        self.assertEqual(watcher.idle_interval_s, 0.5)
+
     def test_only_changes_are_logged_not_every_poll(self):
         """A quiet motor must produce a quiet log, or nobody will read it."""
         for _ in range(20):
@@ -662,33 +685,63 @@ class TestMotorReport(unittest.TestCase):
 
 
 class TestBusVoltage(unittest.TestCase):
-    """The pSCT troubleshooting list starts with "make sure there is 60 V bus
+    """The pSCT troubleshooting list starts with "make sure there is bus
     voltage", and notes the motor will not move without it. That is a
-    documented condition, not an inference, so it is checked."""
+    documented condition, not an inference, so it is checked.
 
-    def test_bus_below_acceptance_blocks(self):
-        motor = healthy_motor()
-        # 1794 against an acceptance of 2054 is exactly what the register dump
-        # taken with the 60 V supply off shows.
-        motor._transport.registers[97] = 1794
+    What it is checked *against* matters. Register 97 is compared with the
+    healthy value recorded for register 97 -- same register, same scale. It is
+    not compared with register 139 ('Acceptance Voltage'), which is also in
+    raw units but not known to be on the same scale: on the pSCT bench motor
+    those read 1794 and 2054, and treating that as a fault would refuse every
+    move on a motor running perfectly well at 48 V.
+    """
+
+    def test_a_supply_below_the_recorded_healthy_value_blocks(self):
+        motor = healthy_motor(supply_nominal_v=48.0, supply_raw_at_nominal=4485)
+        motor._transport.registers[97] = 1794       # 40% of healthy
         try:
             result = diagnose(motor)
             titles = [f.title for f in result.blockers]
-            self.assertIn("Bus voltage below the drive's acceptance threshold",
-                          titles)
+            self.assertIn("Supply has failed", titles)
             finding = next(f for f in result.blockers
-                           if f.title.startswith("Bus voltage below"))
-            self.assertIn("60 V", finding.detail)
-            self.assertIn("60 V", finding.remedy)
+                           if f.title == "Supply has failed")
+            self.assertIn("19.2 V", finding.detail)
+            self.assertIn("breaker", finding.remedy)
+        finally:
+            motor.disconnect()
+
+    def test_register_139_is_reported_but_never_compared(self):
+        """The bench motor's own numbers: 97 reads 1794 with the supply on and
+        healthy at 48 V, and 139 reads 2054."""
+        motor = healthy_motor(supply_nominal_v=48.0, supply_raw_at_nominal=1794)
+        motor._transport.registers[97] = 1794
+        motor._transport.registers[139] = 2054
+        try:
+            result = diagnose(motor)
+            self.assertEqual([f.title for f in result.blockers], [])
+            supply = next(f for f in result.findings
+                          if "Acceptance Voltage register" in f.detail)
+            self.assertIn("2054", supply.detail)
+            self.assertIn("reported rather than compared", supply.detail)
+        finally:
+            motor.disconnect()
+
+    def test_without_a_recorded_value_it_says_so_rather_than_guessing(self):
+        motor = healthy_motor()
+        try:
+            result = diagnose(motor)
+            titles = [f.title for f in result.findings]
+            self.assertIn("Supply cannot be judged", titles)
+            self.assertEqual([f.title for f in result.blockers], [])
         finally:
             motor.disconnect()
 
     def test_powered_motor_does_not_trip_it(self):
-        motor = healthy_motor()
+        motor = healthy_motor(supply_nominal_v=48.0, supply_raw_at_nominal=4485)
         try:
             titles = [f.title for f in diagnose(motor).blockers]
-            self.assertNotIn("Bus voltage below the drive's acceptance threshold",
-                             titles)
+            self.assertNotIn("Supply has failed", titles)
         finally:
             motor.disconnect()
 

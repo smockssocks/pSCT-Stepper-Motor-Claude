@@ -9,7 +9,7 @@ whether the software actually refused, and with what words.
     python -m psct_motors.cli safety-check
 
 Nothing here touches hardware: each drill builds its own simulated platform.
-That is deliberate. Several of these drills work by turning off the 60 V
+That is deliberate. Several of these drills work by turning off the motor
 supply or dropping the load, and the point is to see the refusal, not to find
 out what the telescope does when the refusal is missing.
 
@@ -98,6 +98,14 @@ def bench_config() -> PlatformConfig:
     # runner, not by a person, and at the default 2 mm/s a single run to the
     # end of travel would take the best part of a minute.
     cfg.simulated_speed_mm_per_s = 30.0
+    # A recorded healthy supply reading, as `cli supply` would write after
+    # being run once against a live motor. Without one the supply check has
+    # nothing to compare against and says so instead of refusing, so the
+    # supply drill would not be exercising the thing it names. 4485 is what
+    # the simulated drive reports on register 97 with its supply on.
+    for actuator in cfg.actuators:
+        actuator.supply_nominal_v = 48.0
+        actuator.supply_raw_at_nominal = 4485
     cfg.validate()
     return cfg
 
@@ -283,12 +291,12 @@ def drill_move_refused_without_drive_power() -> DrillResult:
             motor._transport.set_powered(False)
         return _expect_refusal(
             "move refused with no drive supply",
-            "turned off the 60 V supply, leaving the motors answering Modbus "
+            "turned off the motor supply, leaving the motors answering Modbus "
             "but unable to move, then commanded a move",
             "refuse and name the supply, rather than time out looking like a "
             "software fault",
             lambda: platform.move_to_orientation(Orientation(2.0, 0.0, 0.0)),
-            ["acceptance voltage", "60 V"])
+            ["supply", "breaker"])
     finally:
         platform.disconnect()
 

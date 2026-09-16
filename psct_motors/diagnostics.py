@@ -426,13 +426,14 @@ def _check_supply(motor: JVLMotor) -> List[Finding]:
     * Register 98 against register 97 -- the same quantity, so the same scale
       whatever that scale is. A big gap means the supply has been much lower
       than it is now.
-    * Register 97 against register 139 ('Acceptance Voltage') -- the drive's
-      own threshold for running. The pSCT procedure's troubleshooting list
-      begins "make sure there is 60 V bus voltage", and notes the motor will
-      not move without it, so bus-below-acceptance is that documented
-      condition rather than an inference. Note that the register dump taken
-      with the 60 V supply off reads 1794 against an acceptance of 2054, which
-      is consistent with exactly this.
+    * Register 97 against the healthy value recorded for register 97 by
+      `cli supply` -- again the same register, so again the same scale.
+
+    Register 139 ('Acceptance Voltage') is reported but never compared
+    against. It is in raw units like 97, but nothing establishes that the two
+    share a scale, and on the pSCT bench motor they read 1794 and 2054. An
+    earlier version treated that as "below acceptance" and would have refused
+    every move on a motor running perfectly well at 48 V.
     """
     findings: List[Finding] = []
     try:
@@ -442,30 +443,48 @@ def _check_supply(motor: JVLMotor) -> List[Finding]:
         return [Finding(UNKNOWN, "Supply voltage",
                         f"Could not read the bus voltage: {exc}")]
 
-    # The 60 V supply is the documented first thing to check when a pSCT
-    # motor will not move ("Low Bus Voltage Error if the 60V supply is not
-    # on: the motor will not move without the 60V power"). Acceptance Voltage
-    # is the drive's own threshold, so bus-below-acceptance is exactly that
-    # condition -- the one comparison across these two registers that the
-    # written procedure justifies.
+    # A failed supply is the documented first thing to check when a pSCT motor
+    # will not move. The check compares this motor's reading against its own
+    # recorded healthy one, which is the only comparison here that does not
+    # assume a scale nobody has established.
+    verdict, explanation = motor.supply_is_healthy(voltage)
+    if verdict is False:
+        findings.append(Finding(
+            BLOCKING, "Supply has failed",
+            f"Compared against this motor's own recorded healthy reading, "
+            f"{explanation}. A drive with no main supply still answers Modbus "
+            "from its control supply: it accepts targets and ignores them.",
+            "Check the motor supply and its breaker, then re-read this.",
+            data={"voltage": voltage,
+                  "healthy_raw": motor.cfg.supply_raw_at_nominal},
+        ))
+    elif verdict is None:
+        findings.append(Finding(
+            UNKNOWN, "Supply cannot be judged",
+            explanation,
+            f"Run `cli supply --motor {motor.name}` with the supply on. "
+            "Without it, a motor that silently ignores its targets because "
+            "its supply has dropped will look like a software fault.",
+            data={"voltage": voltage},
+        ))
+
+    # Register 139 is reported, never compared. It is in the drive's raw units
+    # like 97, but nothing establishes that the two share a scale -- and on the
+    # pSCT bench motor they read 1794 and 2054, so treating 97 < 139 as "supply
+    # failed" would have refused every move on a motor running happily at 48 V.
     try:
         acceptance = motor.read_register("ACCEPTANCE_VOLTAGE")
     except (ModbusError, MotorFault):
         acceptance = None
-    if acceptance is not None and 0 < voltage < acceptance:
-        findings.append(Finding(
-            BLOCKING, "Bus voltage below the drive's acceptance threshold",
-            f"Bus voltage reads {voltage} against an Acceptance Voltage of "
-            f"{acceptance} (same raw units). The pSCT procedure is explicit "
-            "that the motor will not move without its 60 V supply on, and this "
-            "is what that looks like from here.",
-            "Switch on the 60 V motor supply and confirm it has come up. The "
-            "procedure's own troubleshooting list starts with exactly this.",
-            data={"voltage": voltage, "acceptance": acceptance},
-        ))
 
-    detail = (f"Bus voltage reads {voltage} (raw units), and the lowest value "
-              f"ever latched is {minimum}.")
+    volts = motor.get_supply_volts(voltage)
+    detail = (f"Bus voltage reads {voltage} (raw units"
+              + (f", {volts:.1f} V" if volts is not None else "")
+              + f"), and the lowest value ever latched is {minimum}."
+              + (f" The drive's Acceptance Voltage register reads {acceptance}, "
+                 "which is in raw units too but not known to be on the same "
+                 "scale, so it is reported rather than compared."
+                 if acceptance is not None else ""))
     if voltage > 0 and minimum < 0.7 * voltage:
         findings.append(Finding(
             SUSPECT, "Supply has been much lower than it is now",

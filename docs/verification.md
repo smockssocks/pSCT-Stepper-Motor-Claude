@@ -97,16 +97,21 @@ nothing -- which is itself worth seeing once.
 With the motors connected and the camera hanging on them:
 
 ```
+python -m psct_motors.cli supply --volts 48     # once, with a meter on it
 python -m psct_motors.cli status
 python -m psct_motors.cli diagnose --motor Top
 ```
+
+`supply` first, and only once: until it has run, `diagnose` reports "Supply
+cannot be judged" and a failed supply cannot be detected — which is the one
+fault that presents as the software being broken rather than as an error.
 
 Check by eye, against the readouts:
 
 | check | why |
 |---|---|
 | all three report a position | a motor that answers but reads 0 is not connected to what you think |
-| bus voltage above acceptance | a JVL with no 60 V accepts targets and ignores them |
+| bus voltage near its recorded healthy value | a JVL with no main supply accepts targets and ignores them |
 | no error bits on any motor | clear them before moving, not after |
 | brake state matches reality | look at the brakes; the software cannot |
 | positions agree with a ruler | `counts_per_mm` wrong by a factor is invisible in software |

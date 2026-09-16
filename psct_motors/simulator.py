@@ -76,10 +76,10 @@ class SimulatedJVLTransport:
         #: Whether a brake is actually wired to this motor's digital output.
         #: False for the pSCT, whose brakes are on a separate device.
         self.brake_on_output = bool(brake_on_output)
-        #: Whether the 60 V drive supply is on. With it off the drive cannot
-        #: hold or move anything, the bus voltage reads below the acceptance
-        #: threshold, and the axis falls back to Passive -- which is what the
-        #: MacTalk dump showed on a motor whose supply was off.
+        #: Whether the main drive supply is on. With it off the drive cannot
+        #: hold or move anything, the bus voltage reading collapses, and the
+        #: axis falls back to Passive -- which is what the MacTalk dump showed
+        #: on a motor whose supply was off.
         self.powered = True
         #: Standing lag of the encoder behind the profile output, in counts.
         #:
@@ -144,10 +144,11 @@ class SimulatedJVLTransport:
             40: -5000,                # Homing Velocity
             42: 0,                    # Homing Mode
             46: int(start_counts),    # Abs Encoder Position
-            # Above the acceptance threshold, i.e. the 60 V supply is on.
-            # The dumped motor read 1794 -- below acceptance -- because that
-            # dump was taken with the 60 V off, which is a fault state, not
-            # the state a test double should start in.
+            # A healthy supply. The raw scale of this register is not known;
+            # what is known is that a drive with its supply off reads a
+            # fraction of what the same drive reads with it on, and that is
+            # the only comparison anything here makes. 4485 is "on"; the
+            # 1794 below is "off".
             97: 4485,                 # Bus voltage (P+)
             98: 565,                  # Bus Voltage Min
             99: 4,                    # Encoder Type
@@ -203,9 +204,9 @@ class SimulatedJVLTransport:
             return
 
         if not self.powered:
-            # No 60 V. The drive cannot hold anything: it drops to Passive and
-            # the bus reads below the acceptance threshold. If the brakes are
-            # not holding either, a loaded axis then falls.
+            # No main supply. The drive cannot hold anything: it drops to
+            # Passive and the bus reading collapses. If the brakes are not
+            # holding either, a loaded axis then falls.
             self.registers[2] = int(MotorMode.PASSIVE)
             self.registers[97] = 1794
             self.registers[12] = 0
@@ -265,7 +266,7 @@ class SimulatedJVLTransport:
         return bool(self.brake_held())
 
     def set_powered(self, powered: bool) -> None:
-        """Turn the 60 V drive supply on or off."""
+        """Turn the main drive supply on or off."""
         self.powered = bool(powered)
         if powered:
             self.registers[97] = 4485

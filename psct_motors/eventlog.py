@@ -204,7 +204,13 @@ def read_log(path: str) -> List[Event]:
 
 @dataclass
 class WatchSnapshot:
-    """The fields the watcher compares between polls."""
+    """The fields the watcher compares between polls.
+
+    The last three are not compared and are never logged. They are here so a
+    readout can be drawn from one poll taken on the watcher's own thread
+    instead of the UI issuing its own Modbus reads while drawing -- which is
+    what makes a window stop responding when a motor goes slow to answer.
+    """
 
     reachable: bool = False
     mode: Optional[int] = None
@@ -214,6 +220,13 @@ class WatchSnapshot:
     velocity_setting: Optional[int] = None
     moving: bool = False
     comms_error: str = ""
+
+    #: Actual Torque (217), raw.
+    torque_raw: Optional[int] = None
+    #: Following error (20), counts.
+    follow_error: Optional[int] = None
+    #: Brake state, as the motor reports or infers it.
+    brake: Optional[Any] = None
 
 
 class MotorWatcher:
@@ -226,12 +239,21 @@ class MotorWatcher:
 
     def __init__(self, motor: JVLMotor, log: EventLog,
                  interval_s: float = 0.5,
+                 idle_interval_s: Optional[float] = None,
                  slow_transaction_s: float = 1.0,
                  heartbeat_s: float = 60.0,
                  position_change_counts: int = 0):
         self.motor = motor
         self.log = log
+        #: Interval used while the shaft is turning. This is the one that has
+        #: to be short: a readout that updates twice a second during a move is
+        #: no use for watching a position converge or torque climb.
         self.interval_s = interval_s
+        #: Interval used while nothing is moving. A parked motor reports the
+        #: same numbers however often it is asked, so polling it hard just
+        #: fills the link with traffic that matters during a move.
+        self.idle_interval_s = (interval_s if idle_interval_s is None
+                                else max(interval_s, idle_interval_s))
         #: Any poll slower than this is logged. A transaction that stalls and
         #: then succeeds leaves no error behind, but it is what a "hang" is.
         self.slow_transaction_s = slow_transaction_s
@@ -256,8 +278,10 @@ class MotorWatcher:
         self._stop.clear()
         self._first_poll = True
         self.log.info("watch", f"Started watching {self.motor.name} "
-                               f"every {self.interval_s:g}s",
+                               f"every {self.interval_s:g}s while moving, "
+                               f"{self.idle_interval_s:g}s while idle",
                       interval_s=self.interval_s,
+                      idle_interval_s=self.idle_interval_s,
                       slow_transaction_s=self.slow_transaction_s)
         self._thread = threading.Thread(target=self._loop, name="watcher", daemon=True)
         self._thread.start()
@@ -275,13 +299,18 @@ class MotorWatcher:
 
     # ---------------------------------------------------------------- polling
 
+    def next_interval(self, moving: bool) -> float:
+        """How long to wait before the next poll."""
+        return self.interval_s if moving else self.idle_interval_s
+
     def _loop(self) -> None:
         while not self._stop.is_set():
+            moving = False
             try:
-                self.poll_once()
+                moving = bool(self.poll_once().moving)
             except Exception as exc:  # noqa: BLE001 - a watcher must not die
                 self.log.error("watch", f"Watcher poll raised: {exc}")
-            self._stop.wait(self.interval_s)
+            self._stop.wait(self.next_interval(moving))
 
     def poll_once(self) -> WatchSnapshot:
         """One poll: read, time it, and record anything that changed."""
@@ -304,6 +333,20 @@ class MotorWatcher:
         except (ModbusError, MotorFault) as exc:
             current.reachable = False
             current.comms_error = str(exc)
+
+        # Display-only, and each one independently optional: a drive that does
+        # not answer for torque should blank that one indicator, not cost the
+        # poll its position reading.
+        for attr, read in (("torque_raw",
+                            lambda: self.motor.read_register("ACTUAL_TORQUE")),
+                           ("follow_error", self.motor.get_follow_error),
+                           ("brake", self.motor.get_brake_status)):
+            if not current.reachable:
+                break
+            try:
+                setattr(current, attr, read())
+            except (ModbusError, MotorFault):
+                pass
 
         elapsed = time.monotonic() - started
         if elapsed >= self.slow_transaction_s:

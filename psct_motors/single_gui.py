@@ -87,7 +87,8 @@ class Lamp(tk.Canvas):
 class SingleMotorApp:
     def __init__(self, root: tk.Tk, motor_name: str = "Top",
                  config_path: Optional[str] = None, simulate: bool = False,
-                 log_path: Optional[str] = None):
+                 log_path: Optional[str] = None,
+                 poll_interval_s: Optional[float] = None):
         self.root = root
         self.simulate = simulate
         self.motor_name = motor_name
@@ -97,6 +98,10 @@ class SingleMotorApp:
         )
 
         self.cfg = load_config(config_path)
+        if poll_interval_s:
+            self.cfg.poll_interval_s = poll_interval_s
+            self.cfg.idle_poll_interval_s = max(poll_interval_s,
+                                                self.cfg.idle_poll_interval_s)
         actuator = self.cfg.actuator(motor_name)
         self.counts_per_rev = float(actuator.counts_per_rev)
 
@@ -111,12 +116,17 @@ class SingleMotorApp:
         self.log = EventLog(path=self.log_path)
         self.injector = wrap_motor(self.motor)
         self.watcher = MotorWatcher(self.motor, self.log,
-                                    interval_s=self.cfg.poll_interval_s)
+                                    interval_s=self.cfg.poll_interval_s,
+                                    idle_interval_s=self.cfg.idle_poll_interval_s)
 
         self._busy = False
         self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
         self._ui_job: Optional[str] = None
         self._log_cursor = 0
+        # Redraw about twice as often as the motor is polled, so the screen is
+        # never the thing holding a new reading back. Floored so a very fast
+        # poll setting cannot turn the UI loop into a busy wait.
+        self._ui_tick_ms = max(50, int(round(self.cfg.poll_interval_s * 500)))
 
         self._build_ui()
         self._drain_ui()
@@ -415,7 +425,14 @@ class SingleMotorApp:
                 except Exception:
                     pass
         self._refresh_log()
-        self._ui_job = self.root.after(150, self._drain_ui)
+        try:
+            self._apply_status()
+        except Exception as exc:  # noqa: BLE001 -- a readout must not stop the UI
+            try:
+                self.log.error("ui", f"Readout refresh failed: {exc}")
+            except Exception:
+                pass
+        self._ui_job = self.root.after(self._ui_tick_ms, self._drain_ui)
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -514,14 +531,14 @@ class SingleMotorApp:
         self.target_var.set(
             f"{target:>10d} ct   {self.revs(target):+8.4f} rev   "
             f"({position - target:+d} ct away)")
-        try:
-            follow = self.motor.get_follow_error()
+        follow = snapshot.follow_error
+        if follow is None:
+            self.follow_var.set("--")
+        else:
             window = self.motor.cfg.follow_error_window_counts
             self.follow_var.set(
                 f"{follow:>10d} ct   window {window}"
                 + ("   << OUTSIDE" if abs(follow) > window else ""))
-        except (ModbusError, MotorFault):
-            self.follow_var.set("--")
         self.mode_var.set(describe_mode(snapshot.mode).split(" (")[0]
                           if snapshot.mode is not None else "?")
         self.mode_lamp.set(COLOR_OK if snapshot.mode == int(MotorMode.POSITION)
@@ -531,27 +548,32 @@ class SingleMotorApp:
         self.conn_lamp.set(COLOR_WARN if snapshot.moving else COLOR_OK)
         self._show_errors(snapshot.errors, "")
 
-        self._apply_torque()
+        self._apply_torque(snapshot.torque_raw)
 
-        try:
-            brake = self.motor.get_brake_status()
+        brake = snapshot.brake
+        if brake is None:
+            self.brake_var.set("unknown")
+            self.brake_lamp.set(COLOR_IDLE)
+        else:
             self.brake_var.set(brake.state.value
                                + (" (inferred)" if brake.inferred else ""))
             self.brake_lamp.set(COLOR_BAD if brake.state is BrakeState.ENGAGED
                                 else COLOR_OK if brake.state is BrakeState.RELEASED
                                 else COLOR_IDLE)
-        except (ModbusError, MotorFault):
-            self.brake_var.set("unknown")
-            self.brake_lamp.set(COLOR_IDLE)
 
-    def _apply_torque(self) -> None:
-        """Show how hard the motor is working, and against what limits."""
-        try:
-            percent = self.motor.get_torque_percent()
-            limit = self.motor.get_current_limit()
-            raw = self.motor.read_register("ACTUAL_TORQUE")
-        except (ModbusError, MotorFault):
-            percent = limit = raw = None
+    def _apply_torque(self, raw: Optional[int] = None) -> None:
+        """Show how hard the motor is working, and against what limits.
+
+        `raw` comes from the watcher's poll. The reads happen on its thread,
+        not while the window is being drawn: a Modbus transaction that goes
+        slow on the UI thread is exactly what an application freeze looks
+        like from the outside.
+        """
+        # Nothing to read when the poll brought nothing back, so a motor that
+        # has stopped answering does not get one more transaction to time out
+        # on while the window is being drawn.
+        limit = self.motor.get_current_limit() if raw is not None else None
+        percent = self.motor.get_torque_percent(raw) if raw is not None else None
 
         if percent is None:
             self.torque_var.set("not reported by this motor")
@@ -862,12 +884,20 @@ class SingleMotorApp:
                     f"      Right now the follow error is {values['follow_error']}.\n\n")
         text.insert("end", f"  Bus Voltage Min (reg 98)    {values['bus_voltage_min']}\n",
                     "key")
+        live = values['bus_voltage']
+        volts = self.motor.get_supply_volts(live if isinstance(live, int) else None)
         text.insert("end",
                     "      The lowest supply voltage seen since this was last\n"
                     "      cleared, in the same raw units as the live reading of\n"
-                    f"      {values['bus_voltage']}. A big gap is evidence of a\n"
+                    f"      {live}"
+                    + (f" ({volts:.1f} V)" if volts is not None else "")
+                    + ". A big gap is evidence of a\n"
                     "      brown-out, though it can also just be the supply ramping\n"
-                    "      up at power-on.\n\n")
+                    "      up at power-on.\n"
+                    + ("      These are the drive's own raw units; run `cli supply`\n"
+                       "      with a meter on the supply to see volts here.\n"
+                       if volts is None else "")
+                    + "\n")
         text.insert("end", f"  Ticks (reg 202)             {values['ticks']}\n", "key")
         text.insert("end",
                     "      A free-running counter. If it is lower than last time you\n"
@@ -929,6 +959,11 @@ class SingleMotorApp:
         events = self.log.events(min_severity=self.severity_var.get())
         if len(events) == self._log_cursor:
             return
+        # Note: the readout is NOT refreshed from here. It used to be, and the
+        # early return above meant position and torque only moved on screen
+        # when a new log line happened to appear -- and the watcher logs
+        # transitions, not samples, so during a steady move nothing was logged
+        # and the numbers sat frozen. `_drain_ui` refreshes it every tick.
         new = events[self._log_cursor:] if len(events) > self._log_cursor else events
         if len(events) < self._log_cursor:      # filter changed; redraw
             self.log_text.configure(state="normal")
@@ -950,7 +985,6 @@ class SingleMotorApp:
         self.log_counts_var.set(
             f"{counts[ERROR]} error, {counts[WARNING]} warning, "
             f"{counts[INFO]} info")
-        self._apply_status()
 
     def on_export_log(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -1016,10 +1050,12 @@ class SingleMotorApp:
 
 
 def main(motor_name: str = "Top", config_path: Optional[str] = None,
-         simulate: bool = False, log_path: Optional[str] = None) -> int:
+         simulate: bool = False, log_path: Optional[str] = None,
+         poll_interval_s: Optional[float] = None) -> int:
     root = tk.Tk()
     SingleMotorApp(root, motor_name=motor_name, config_path=config_path,
-                   simulate=simulate, log_path=log_path)
+                   simulate=simulate, log_path=log_path,
+                   poll_interval_s=poll_interval_s)
     root.mainloop()
     return 0
 

@@ -66,6 +66,41 @@ It is read-only apart from one probe: it writes `P_SOLL` with the position the
 motor is **already at**, which cannot cause motion and is the only way to find
 out whether writes are landing at all. `--no-write-probe` turns even that off.
 
+### Supply voltage: what the software knows and what it does not
+
+Register 97 `Bus voltage` reads in the drive's own raw units. **Nothing in the
+register map, and nothing in the dump, says what those units are worth in
+volts.** So the software does not guess. `cli supply` records the raw reading
+beside the voltage you measured with a meter, once, and everything after that
+is a straight ratio from a pair of numbers somebody actually observed.
+
+Two consequences worth knowing before anyone asks:
+
+- **Register 139 `Acceptance Voltage` is never compared against register 97.**
+  Both are raw, but nothing establishes a shared scale, and on the pSCT bench
+  motor they read **1794** and **2054**. An earlier version of this software
+  treated 97 < 139 as "supply failed" and would have refused every move on a
+  motor running perfectly well at 48 V. 139 is now printed in the report and
+  used for nothing.
+- **Without a recorded reading, a failed supply cannot be detected.** The
+  software says so once per session rather than blocking, because refusing
+  every move on an unproven comparison is worse than not checking.
+
+What voltage the motor should be on is a hardware question, not one this
+software can answer from the registers. The JVL MIS23x family is specified for
+a nominal **12–48 VDC** main supply, so a bench motor measured at 48 V is at
+the top of its documented range and a few volts either way is unremarkable —
+but treat that as a data-sheet figure to confirm against the motor's own
+documentation and the pSCT wiring, not as something this software has
+verified. What the software does check is that the reading has not collapsed
+relative to the one recorded when the motor was known to be working, which is
+the failure mode that actually presents as "the software is broken": a JVL
+with no main supply still answers Modbus from its control supply, accepts a
+target, and does nothing.
+
+The default alarm point is 80% of the recorded reading (`supply_low_fraction`).
+At a recorded 48 V that refuses moves below about 38 V.
+
 ### What the motor itself remembers
 
 Nothing, essentially — and that is worth knowing before you go looking.

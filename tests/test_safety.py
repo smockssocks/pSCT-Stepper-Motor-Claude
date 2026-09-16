@@ -106,10 +106,10 @@ class TestBrakeInterlocks(unittest.TestCase):
         with self.assertRaises(PlatformError) as ctx:
             platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
         message = str(ctx.exception)
-        self.assertIn("acceptance voltage", message)
         # Naming the supply matters: the motors answer Modbus perfectly well
         # in this state, so it presents as the software being broken.
-        self.assertIn("60 V", message)
+        self.assertIn("supply has failed", message)
+        self.assertIn("breaker", message)
 
     def test_a_single_axis_move_enables_every_drive_first(self):
         """The brakes are one switch for all three, so releasing them with two
@@ -536,6 +536,138 @@ class TestSimulatedSpeed(unittest.TestCase):
         # 5 mm at 10 mm/s is half a second, plus the settle poll.
         self.assertGreater(elapsed, 0.3)
         self.assertLess(elapsed, 3.0)
+
+
+class TestSupplyVoltage(unittest.TestCase):
+    """Register 97 is in the drive's own raw units and nobody knows the scale.
+
+    The check used to compare it against register 139 ('Acceptance Voltage'),
+    which is also raw but not known to be on the same scale. On the pSCT bench
+    motor those read 1794 and 2054 -- so a motor running perfectly well at 48 V
+    read as "below acceptance" and every move would have been refused.
+    """
+
+    def _platform(self, **actuator_kw):
+        cfg = safety.bench_config()
+        for actuator in cfg.actuators:
+            for key, value in actuator_kw.items():
+                setattr(actuator, key, value)
+        platform = FocalPlanePlatform(cfg=cfg, simulate=True)
+        platform.connect()
+        self.addCleanup(platform.disconnect)
+        return platform
+
+    def test_a_move_is_not_blocked_just_because_97_is_below_139(self):
+        """The exact situation on the bench motor: 97 reads 1794 with the
+        supply on and healthy at 48 V, while 139 reads 2054."""
+        from psct_motors.kinematics import Orientation
+        platform = self._platform(supply_nominal_v=48.0,
+                                  supply_raw_at_nominal=1794)
+        for motor in platform.motors:
+            motor._transport.registers[97] = 1794      # as dumped
+            motor._transport.registers[139] = 2054     # as dumped
+        platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+        self.assertAlmostEqual(platform.read_orientation().focus_mm, 1.0, places=2)
+
+    def test_without_a_baseline_the_supply_cannot_be_judged(self):
+        platform = self._platform(supply_nominal_v=None,
+                                  supply_raw_at_nominal=None)
+        verdict, explanation = platform.motors[0].supply_is_healthy()
+        self.assertIsNone(verdict)
+        self.assertIn("cli supply", explanation)
+
+    def test_a_recorded_baseline_gives_volts(self):
+        platform = self._platform(supply_nominal_v=48.0,
+                                  supply_raw_at_nominal=4485)
+        motor = platform.motors[0]
+        self.assertAlmostEqual(motor.get_supply_volts(4485), 48.0, places=3)
+        self.assertAlmostEqual(motor.get_supply_volts(2242), 24.0, places=1)
+        self.assertAlmostEqual(platform.read_state().motors[0].supply_volts,
+                               48.0, places=1)
+
+    def test_a_real_supply_failure_is_caught_once_there_is_a_baseline(self):
+        from psct_motors.kinematics import Orientation
+        platform = self._platform(supply_nominal_v=48.0,
+                                  supply_raw_at_nominal=4485)
+        for motor in platform.motors:
+            motor._transport.set_powered(False)        # drops 97 to 1794
+        with self.assertRaises(PlatformError) as ctx:
+            platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+        message = str(ctx.exception)
+        self.assertIn("supply has failed", message.lower())
+        self.assertIn("19.2 V", message)               # 1794 scaled to volts
+
+    def test_a_reading_a_little_low_is_still_accepted(self):
+        """48 V nominal, a few volts of sag, still fine."""
+        platform = self._platform(supply_nominal_v=48.0,
+                                  supply_raw_at_nominal=4485)
+        motor = platform.motors[0]
+        for volts in (48.0, 46.0, 45.0, 39.0):
+            raw = int(4485 * volts / 48.0)
+            verdict, explanation = motor.supply_is_healthy(raw)
+            self.assertTrue(verdict, f"{volts} V rejected: {explanation}")
+        # ...and 80% of nominal is where it stops being fine.
+        verdict, _ = motor.supply_is_healthy(int(4485 * 0.7))
+        self.assertFalse(verdict)
+
+    def test_the_pair_must_be_set_together(self):
+        from psct_motors.config import default_config
+        cfg = default_config()
+        cfg.actuators[0].supply_nominal_v = 48.0
+        with self.assertRaises(ValueError) as ctx:
+            cfg.validate()
+        self.assertIn("together", str(ctx.exception))
+
+
+class TestPollRate(unittest.TestCase):
+    def test_a_fast_poll_skips_the_slow_registers(self):
+        """Temperature and bus voltage move over minutes. Reading them at the
+        position rate doubles the traffic for numbers that have not changed."""
+        platform = FocalPlanePlatform(cfg=safety.bench_config(), simulate=True)
+        platform.connect()
+        self.addCleanup(platform.disconnect)
+
+        # One read first, uncounted: the current limit is read once and cached,
+        # so counting from cold would charge that one-off read to the slow set.
+        platform.read_state(include_slow=True)
+
+        motor = platform.motors[0]
+        reads = []
+        original = motor.read_register
+
+        def counted(reg, *a, **k):
+            reads.append(reg)
+            return original(reg, *a, **k)
+
+        motor.read_register = counted
+        platform.read_state(include_slow=True)
+        with_slow = len(reads)
+        self.assertIn("BUS_VOLTAGE", reads)
+        self.assertIn("TEMPERATURE_LOW_RES", reads)
+
+        reads.clear()
+        platform.read_state(include_slow=False)
+        without_slow = len(reads)
+        self.assertNotIn("BUS_VOLTAGE", reads)
+        self.assertNotIn("TEMPERATURE_LOW_RES", reads)
+        self.assertEqual(with_slow - without_slow, 2)
+
+    def test_the_cached_values_are_still_reported(self):
+        platform = FocalPlanePlatform(cfg=safety.bench_config(), simulate=True)
+        platform.connect()
+        self.addCleanup(platform.disconnect)
+        first = platform.read_state(include_slow=True).motors[0]
+        second = platform.read_state(include_slow=False).motors[0]
+        self.assertIsNotNone(second.bus_voltage)
+        self.assertEqual(first.bus_voltage, second.bus_voltage)
+        self.assertEqual(first.temperature, second.temperature)
+
+    def test_the_defaults_are_responsive_but_not_reckless(self):
+        from psct_motors.config import default_config
+        cfg = default_config()
+        self.assertLessEqual(cfg.poll_interval_s, 0.2)
+        self.assertGreaterEqual(cfg.idle_poll_interval_s, cfg.poll_interval_s)
+        self.assertGreater(cfg.slow_poll_every, 1)
 
 
 class TestSafetyDrills(unittest.TestCase):

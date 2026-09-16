@@ -124,6 +124,25 @@ about 16.5% — on the site's own motor. That ratio is the only measure of effor
 the drives publish, so that is what is displayed, labelled "load" rather than
 "current".
 
+### Why does the software have to be told what the supply voltage is?
+
+Register 97 `Bus voltage` reads in the drive's own raw units and nothing says
+what they are worth in volts. `cli supply` records the raw number beside a
+measured voltage, once, and after that the readouts show volts and a collapsed
+supply can be recognised.
+
+The interesting part is what it deliberately does **not** do. There is a
+register 139 called `Acceptance Voltage`, and comparing 97 against it is the
+obvious thing to try. On the site's own motor those read **1794** and **2054** —
+so the obvious check calls a motor running perfectly well at 48 V "below
+acceptance" and refuses every move. Two numbers in unspecified raw units cannot
+be compared unless something establishes that they share a scale, and nothing
+does. So 97 is compared only against a previous reading of 97.
+
+That bug was in this software, and it was caught by someone measuring the bench
+supply and noticing the numbers did not agree with what the code assumed. It is
+a good example of the thing the "what is NOT verified" list is for.
+
 ### Why is the hard-stop search all three at once?
 
 Driving one actuator into its end stop tilts the focal plane about the other two
@@ -163,6 +182,12 @@ Say this first, not last. It is the part that makes the rest credible.
 * **Real speed.** Nobody has measured what the drive's velocity units come to in
   millimetres per second, which is why the *simulated* speed is a setting rather
   than a claim.
+* **The voltage scale.** Register 97's raw units are unknown until `cli supply`
+  is run against a motor with a meter on its supply. Until then the software
+  reports the raw number, says it cannot judge the supply, and does not block —
+  and what supply voltage the motor *should* be on is a data-sheet question
+  (the MIS23x family is specified 12–48 VDC nominal), not something these
+  registers establish.
 
 ---
 
@@ -192,6 +217,14 @@ No, and this is worth saying plainly. The command and the readback use the same
 `counts_per_mm`, so an actuator that physically travels half as far as it says
 still reports the right number. Only a dial indicator catches that.
 
+**"What voltage do these run on?"**
+The bench motor measures 48 V, the top of the 12–48 VDC the MIS23x family is
+specified for. The software does not assume that: register 97 is in the drive's
+own raw units, so `cli supply` records the raw reading beside a measured voltage
+once, and everything after that is a ratio between two numbers somebody
+observed. Ask it what the supply is before it has been told, and it says it
+cannot judge — which is the right answer.
+
 **"What is the worst thing that could still happen?"**
 The brakes not being what we think they are. Every interlock that mentions
 brakes rests on an assumption nobody has tested on the real device.
@@ -217,7 +250,10 @@ somebody ran it on the telescope and watched the motors run away.
 The same pattern repeats smaller: a stop button that stepped the axis by the
 following error; a demo that ended by dropping a loaded axis; a hard-stop search
 that would have reported a stop that was not there on a slow axis; simulated
-bounds that disagreed with the configured ones.
+bounds that disagreed with the configured ones; a supply check that compared
+two registers in unspecified units and would have refused every move on a
+perfectly healthy motor. Every one of those was found by measuring the real
+machine, not by reading the code.
 
 **What that means.** The model was good at writing code and bad at knowing which
 of its assumptions were load-bearing on a specific machine it could not see. The

@@ -120,6 +120,32 @@ class TestSingleMotorGui(unittest.TestCase):
         self.assertEqual(self.app.torque_var.get(), "--")
         self.assertIsNone(self.app.torque_bar._percent)
 
+    def test_the_readout_refreshes_on_its_own_with_a_quiet_log(self):
+        """It used to be refreshed from inside the log refresher, which
+        returns early when no new lines have arrived. The watcher records
+        transitions rather than samples, so during a steady move the log is
+        quiet -- and the position and torque on screen sat frozen until
+        something happened to write a line."""
+        self.pump(0.4)                       # let the start-up lines settle
+        before = len(self.app.log.events())
+        calls = []
+        original = self.app._apply_status
+
+        def counted():
+            calls.append(1)
+            original()
+
+        self.app._apply_status = counted
+        try:
+            self.pump(0.6)
+        finally:
+            self.app._apply_status = original
+
+        self.assertEqual(len(self.app.log.events()), before,
+                         "this test needs a quiet log to be testing anything")
+        self.assertGreaterEqual(len(calls), 2,
+                                "the readout did not refresh on its own")
+
     def pump(self, seconds: float) -> None:
         end = time.monotonic() + seconds
         while time.monotonic() < end:

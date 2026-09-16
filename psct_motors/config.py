@@ -230,6 +230,28 @@ class ActuatorConfig:
     #: Whether to watch torque at all. Turn it off only if the torque registers
     #: turn out to mean something different on your drive.
     stall_protection: bool = True
+
+    # --- supply voltage ----------------------------------------------------
+    #: What the supply actually is, in volts, and what register 97 reads when
+    #: it is healthy. Recorded together by `cli supply`.
+    #:
+    #: Register 97 is in the drive's own raw units and nobody here knows the
+    #: scale. Two registers in raw units cannot safely be compared unless they
+    #: are known to share a scale -- and 97 against 139 ('Acceptance Voltage')
+    #: is exactly that unproven comparison. On the pSCT bench motor they read
+    #: 1794 and 2054, which reads as "below acceptance" and would refuse every
+    #: move on a motor that is in fact perfectly happy at 48 V.
+    #:
+    #: So the check compares register 97 against *its own* recorded healthy
+    #: value instead: same register, same scale, no assumption. Until that
+    #: value is recorded there is nothing trustworthy to compare against, and
+    #: the software says so rather than blocking.
+    supply_nominal_v: Optional[float] = None
+    supply_raw_at_nominal: Optional[int] = None
+    #: How far below the recorded healthy reading counts as a supply failure.
+    #: At 0.8 with 48 V recorded, a move is refused below about 38 V -- well
+    #: under the sag a working supply shows, well over a supply that is off.
+    supply_low_fraction: float = 0.8
     #: Torque percentage above which the GUI's load bar turns amber, as a
     #: warning that the axis is working harder than usual well before the
     #: stall threshold stops it.
@@ -314,6 +336,23 @@ class ActuatorConfig:
         if self.rated_current_a < 0:
             raise ValueError(
                 f"Actuator {self.name}: rated_current_a cannot be negative"
+            )
+        if not (0 < self.supply_low_fraction < 1):
+            raise ValueError(
+                f"Actuator {self.name}: supply_low_fraction must be between "
+                f"0 and 1, got {self.supply_low_fraction}"
+            )
+        if (self.supply_nominal_v is not None) != (self.supply_raw_at_nominal is not None):
+            raise ValueError(
+                f"Actuator {self.name}: supply_nominal_v and "
+                f"supply_raw_at_nominal must be set together -- one without "
+                f"the other cannot convert anything. Run `cli supply`."
+            )
+        if self.supply_nominal_v is not None and self.supply_nominal_v <= 0:
+            raise ValueError(f"Actuator {self.name}: supply_nominal_v must be positive")
+        if self.supply_raw_at_nominal is not None and self.supply_raw_at_nominal <= 0:
+            raise ValueError(
+                f"Actuator {self.name}: supply_raw_at_nominal must be positive"
             )
         if self.stall_persist_samples < 1:
             raise ValueError(
@@ -464,7 +503,20 @@ class PlatformConfig:
     #: something closely.
     simulated_speed_mm_per_s: float = 2.0
 
-    poll_interval_s: float = 0.5
+    #: Seconds between live status polls while something is moving.
+    #:
+    #: Each poll costs one Modbus round trip per register per motor, so this
+    #: trades responsiveness against traffic. Eight registers times three
+    #: motors at 0.15 s is about 160 reads a second, which a switched LAN
+    #: handles comfortably; going much below this starts to matter.
+    poll_interval_s: float = 0.15
+    #: Seconds between polls when nothing is moving. Nothing changes quickly on
+    #: a stationary axis, so there is no reason to keep hammering the drives.
+    idle_poll_interval_s: float = 0.5
+    #: Refresh temperature and bus voltage only every Nth poll. They move over
+    #: minutes, and reading them at the position rate doubles the traffic for
+    #: numbers that will not have changed.
+    slow_poll_every: int = 12
     #: Modbus socket timeout, seconds.
     modbus_timeout_s: float = 2.0
     #: Attempts per Modbus transaction. Keep this at 1 unless you have a
@@ -501,6 +553,10 @@ class PlatformConfig:
             raise ValueError("min_velocity_raw must be >= 1")
         if self.simulated_speed_mm_per_s <= 0:
             raise ValueError("simulated_speed_mm_per_s must be positive")
+        if self.idle_poll_interval_s <= 0:
+            raise ValueError("idle_poll_interval_s must be positive")
+        if self.slow_poll_every < 1:
+            raise ValueError("slow_poll_every must be at least 1")
         if self.poll_interval_s <= 0:
             raise ValueError("poll_interval_s must be positive")
 

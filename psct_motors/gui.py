@@ -303,7 +303,8 @@ class MotorRow:
 class MotorApp:
     def __init__(self, root: tk.Tk, config_path: Optional[str] = None,
                  simulate: bool = False, bench: Optional[str] = None,
-                 sim_speed: Optional[float] = None):
+                 sim_speed: Optional[float] = None,
+                 poll_interval_s: Optional[float] = None):
         self.root = root
         self.simulate = simulate
         self.bench = bench
@@ -315,6 +316,12 @@ class MotorApp:
             apply_bench(self.cfg, bench)
         if sim_speed:
             self.cfg.simulated_speed_mm_per_s = sim_speed
+        if poll_interval_s:
+            self.cfg.poll_interval_s = poll_interval_s
+            # The idle rate can never be the faster of the two, or asking for
+            # a slow poll would silently make the stationary case quicker.
+            self.cfg.idle_poll_interval_s = max(poll_interval_s,
+                                                self.cfg.idle_poll_interval_s)
         self.platform = FocalPlanePlatform(
             cfg=self.cfg, simulate=simulate, logger=self.log_threadsafe,
             config_path=config_path,
@@ -860,16 +867,31 @@ class MotorApp:
         self._start_polling()
 
     def _start_polling(self) -> None:
+        """Poll fast while something is moving, slowly when nothing is.
+
+        Every poll costs one Modbus round trip per register per motor, so a
+        single fixed rate is either too slow to watch a move or heavier traffic
+        than a stationary machine deserves. Moving, it runs at
+        `poll_interval_s`; idle, at `idle_poll_interval_s`. Temperature and bus
+        voltage -- which move over minutes -- are refreshed only every
+        `slow_poll_every` polls, so the fast path is two round trips lighter
+        per motor.
+        """
         self._poll_stop.clear()
-        interval = self.cfg.poll_interval_s
 
         def poll():
+            tick = 0
             while not self._poll_stop.is_set():
+                interval = self.cfg.idle_poll_interval_s
                 try:
-                    state = self.platform.read_state()
+                    include_slow = (tick % max(1, self.cfg.slow_poll_every)) == 0
+                    state = self.platform.read_state(include_slow=include_slow)
                     self.post(lambda s=state: self._apply_state(s))
+                    interval = (self.cfg.poll_interval_s if state.moving
+                                else self.cfg.idle_poll_interval_s)
                 except Exception as exc:  # noqa: BLE001 - a poll must never die
                     self.log_threadsafe(f"Status poll error: {exc}")
+                tick += 1
                 self._poll_stop.wait(interval)
 
         self._poll_thread = threading.Thread(target=poll, name="poll", daemon=True)
@@ -1225,7 +1247,11 @@ class MotorApp:
                  text=("Torque as a percentage of each drive's current limit "
                        "(Actual Torque / CL: Current Max). These motors have "
                        "no register that reports amps, so this is the honest "
-                       "measure of how hard they are working.")
+                       "measure of how hard they are working. Supply shows "
+                       "volts once `cli supply` has been run with a meter on "
+                       "it, and the raw register value until then -- the "
+                       "drive's units are not documented and are not guessed "
+                       "at here.")
                  ).grid(row=0, column=0, columnspan=5, sticky="w",
                         padx=12, pady=(12, 8))
 
@@ -1320,8 +1346,16 @@ class MotorApp:
             peak_var.set(f"{bar._peak:.0f}%")
             temp_var.set("--" if status.temperature is None
                          else f"{status.temperature} C")
-            supply_var.set("--" if status.bus_voltage is None
-                           else f"{status.bus_voltage}")
+            # Volts once `cli supply` has recorded the scale; until then the
+            # raw register value, labelled as raw. Never an invented voltage:
+            # the drive's units are not documented, and a confident-looking
+            # number with nothing behind it is worse than an honest raw count.
+            if status.bus_voltage is None:
+                supply_var.set("--")
+            elif status.supply_volts is not None:
+                supply_var.set(f"{status.supply_volts:.1f} V")
+            else:
+                supply_var.set(f"{status.bus_voltage} raw")
 
     def on_open_plane_view(self) -> None:
         """A live picture of the plate on its three actuators.
@@ -1981,10 +2015,11 @@ class MotorApp:
 
 
 def main(config_path: Optional[str] = None, simulate: bool = False,
-         bench: Optional[str] = None, sim_speed: Optional[float] = None) -> int:
+         bench: Optional[str] = None, sim_speed: Optional[float] = None,
+         poll_interval_s: Optional[float] = None) -> int:
     root = tk.Tk()
     MotorApp(root, config_path=config_path, simulate=simulate, bench=bench,
-             sim_speed=sim_speed)
+             sim_speed=sim_speed, poll_interval_s=poll_interval_s)
     root.mainloop()
     return 0
 

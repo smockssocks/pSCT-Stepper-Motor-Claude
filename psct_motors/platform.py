@@ -265,6 +265,10 @@ class FocalPlanePlatform:
         self.external_brake = self._build_external_brake()
         self._move_lock = threading.RLock()
         self._abort = threading.Event()
+        #: Said once, not on every move: there is no healthy supply reading to
+        #: compare against. Repeating it every time would train people to
+        #: ignore it.
+        self._warned_no_supply_baseline = False
 
         # An actuator is simulated when the whole platform is, or when that
         # one actuator asks to be. The mixed case is the point: one real motor
@@ -476,9 +480,14 @@ class FocalPlanePlatform:
         """Current orientation, computed from the three live positions."""
         return self.geometry.orientation_from_actuators(self.read_actuator_positions_mm())
 
-    def read_state(self) -> PlatformState:
-        """Poll everything. Never raises -- suitable for a UI timer."""
-        statuses = [self._with_external_brake(m.read_status()) for m in self.motors]
+    def read_state(self, include_slow: bool = True) -> PlatformState:
+        """Poll everything. Never raises -- suitable for a UI timer.
+
+        `include_slow` is passed to each motor: False skips temperature and bus
+        voltage and reuses the last ones, which is what a fast poll loop wants.
+        """
+        statuses = [self._with_external_brake(m.read_status(include_slow))
+                    for m in self.motors]
         valid = all(s.connected and not s.comms_error for s in statuses)
         orientation = None
         message = ""
@@ -803,28 +812,50 @@ class FocalPlanePlatform:
         self._release_external_brakes()
 
     def _check_drive_power(self) -> None:
-        """Refuse to move if a drive's supply is below its own threshold.
+        """Refuse to move if a drive's supply has failed.
 
-        A JVL with no 60 V still answers Modbus from its control supply: the
-        target is accepted, the mode reads back, and nothing turns. That looks
-        exactly like the software being broken, so it is worth naming.
+        A JVL with no main supply still answers Modbus from its control
+        supply: the target is accepted, the mode reads back, and nothing
+        turns. That looks exactly like the software being broken, so it is
+        worth naming.
+
+        The comparison is register 97 against its *own* recorded healthy value,
+        not against register 139 ('Acceptance Voltage'). Those two are both in
+        the drive's raw units, but nothing establishes that they share a scale,
+        and on the pSCT bench motor they read 1794 and 2054 -- which under the
+        old check read as "below acceptance" and would have refused every move
+        on a motor running perfectly well at 48 V.
+
+        Until `cli supply` has recorded a healthy reading there is nothing
+        trustworthy to compare against, so this says so once and lets the move
+        proceed rather than blocking on a guess.
         """
         dead = []
+        unknown = []
         for motor in self.motors:
-            try:
-                bus = motor.read_register("BUS_VOLTAGE")
-                acceptance = motor.read_register("ACCEPTANCE_VOLTAGE")
-            except (ModbusError, MotorFault):
-                continue          # a comms problem is reported elsewhere
-            if acceptance > 0 and bus < acceptance:
-                dead.append(f"{motor.name} (bus {bus}, needs {acceptance})")
+            verdict, explanation = motor.supply_is_healthy()
+            if verdict is False:
+                dead.append(f"{motor.name}: {explanation}")
+            elif verdict is None:
+                unknown.append(motor.name)
+
         if dead:
             raise PlatformError(
-                "Not moving: the drive supply is below the acceptance voltage "
-                f"on {', '.join(dead)}. The motors are reachable -- they answer "
-                "Modbus from their control supply -- but with the main supply "
-                "off they will accept a target and not move. Check the 60 V "
-                "supply and its breaker before commanding anything else."
+                "Not moving: the supply has failed on "
+                + "; ".join(dead)
+                + ". The motors are reachable -- they answer Modbus from their "
+                "control supply -- but with the main supply down they will "
+                "accept a target and not move. Check the supply and its "
+                "breaker before commanding anything else."
+            )
+        if unknown and not self._warned_no_supply_baseline:
+            self._warned_no_supply_baseline = True
+            self._log(
+                "Note: no healthy supply reading has been recorded for "
+                + ", ".join(unknown)
+                + ", so a failed supply cannot be detected. Run `cli supply` "
+                "with the supply on to record one. Until then a motor that "
+                "silently ignores its targets will look like a software fault."
             )
 
     def _release_external_brakes(self) -> None:

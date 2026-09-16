@@ -132,6 +132,8 @@ class MotorStatus:
     current_a: Optional[float] = None
     #: Raw bus voltage (97) and drive temperature (26), for the health row.
     bus_voltage: Optional[int] = None
+    #: The same reading in volts, when `cli supply` has recorded the scale.
+    supply_volts: Optional[float] = None
     temperature: Optional[int] = None
     #: Populated when the read itself failed, in which case the numeric fields
     #: are stale/zero and must not be displayed as live values.
@@ -162,6 +164,7 @@ class MotorStatus:
             "torque_percent": self.torque_percent,
             "current_a": self.current_a,
             "bus_voltage": self.bus_voltage,
+            "supply_volts": self.supply_volts,
             "temperature": self.temperature,
             "comms_error": self.comms_error,
             "healthy": self.healthy,
@@ -193,6 +196,9 @@ class JVLMotor:
         self._connected = False
         self._warned_no_encoder = False
         self._over_torque_samples = 0
+        #: Bus voltage and temperature from the last slow poll, reused in
+        #: between so a fast poll costs two fewer round trips.
+        self._slow_cache = (None, None)
         #: CL: Current Max (212), cached. A configuration value, not a
         #: measurement, so it is read once rather than on every poll.
         self._current_limit: Optional[int] = None
@@ -490,7 +496,7 @@ class JVLMotor:
             self._current_limit = limit
         return self._current_limit
 
-    def get_torque_percent(self) -> Optional[float]:
+    def get_torque_percent(self, raw: Optional[int] = None) -> Optional[float]:
         """Motor torque as a percentage of its current limit.
 
         Actual Torque (register 217) over CL: Current Max (register 212). On
@@ -502,15 +508,74 @@ class JVLMotor:
         Returns None when either register cannot be read, so a motor that does
         not report torque degrades to no stall protection rather than to a
         move that refuses to start.
+
+        Pass `raw` when Actual Torque has already been read, so a caller that
+        wants to show the raw pair as well as the percentage does not read the
+        same register twice per refresh.
         """
         limit = self.get_current_limit()
         if not limit:
             return None
-        try:
-            torque = abs(self.read_register("ACTUAL_TORQUE"))
-        except (ModbusError, MotorFault):
+        if raw is None:
+            try:
+                raw = self.read_register("ACTUAL_TORQUE")
+            except (ModbusError, MotorFault):
+                return None
+        return 100.0 * abs(raw) / limit
+
+    def get_supply_volts(self, raw: Optional[int] = None) -> Optional[float]:
+        """Supply voltage in volts, or None if nobody has said what it is.
+
+        Register 97 is in the drive's own raw units, and this software does not
+        know the scale. It is learned once, by `cli supply`: read the register
+        with the supply known good, and record it beside the voltage a meter
+        or the supply's own display says. After that the conversion is a
+        straight ratio.
+
+        Not guessed, ever. Two registers in raw units cannot be compared unless
+        they are known to share a scale, and an invented scale would put a
+        confident number on the screen with nothing behind it.
+        """
+        nominal_v = self.cfg.supply_nominal_v
+        nominal_raw = self.cfg.supply_raw_at_nominal
+        if not nominal_v or not nominal_raw:
             return None
-        return 100.0 * torque / limit
+        if raw is None:
+            try:
+                raw = self.read_register("BUS_VOLTAGE")
+            except (ModbusError, MotorFault):
+                return None
+        return raw * nominal_v / nominal_raw
+
+    def supply_is_healthy(self, raw: Optional[int] = None):
+        """(verdict, explanation) for the supply, compared like with like.
+
+        Returns verdict True (healthy), False (too low) or None (nothing to
+        compare against yet). The comparison is register 97 against its *own*
+        recorded healthy value -- same register, same scale, no assumption.
+        """
+        nominal_raw = self.cfg.supply_raw_at_nominal
+        if raw is None:
+            try:
+                raw = self.read_register("BUS_VOLTAGE")
+            except (ModbusError, MotorFault) as exc:
+                return None, f"could not read the bus voltage: {exc}"
+        if not nominal_raw:
+            return None, (
+                "no healthy reading has been recorded for this motor, so "
+                f"there is nothing to compare {raw} against. Run "
+                f"`cli supply --motor {self.name}` with the supply on."
+            )
+        floor = nominal_raw * self.cfg.supply_low_fraction
+        volts = self.get_supply_volts(raw)
+        shown = f"{raw}" + (f" ({volts:.1f} V)" if volts is not None else "")
+        if raw < floor:
+            return False, (
+                f"the supply reads {shown}, below {floor:.0f} "
+                f"({self.cfg.supply_low_fraction:.0%} of the {nominal_raw} "
+                f"recorded when it was healthy)"
+            )
+        return True, f"the supply reads {shown}"
 
     def get_current_amps(self, percent: Optional[float] = None) -> Optional[float]:
         """Approximate phase current, in amps, or None if it cannot be stated.
@@ -1077,9 +1142,15 @@ class JVLMotor:
 
     # ---------------------------------------------------------------- status
 
-    def read_status(self) -> MotorStatus:
+    def read_status(self, include_slow: bool = True) -> MotorStatus:
         """One snapshot for the UI. Never raises; comms failures are reported
-        in the returned object so a poll loop cannot die on a dropped packet."""
+        in the returned object so a poll loop cannot die on a dropped packet.
+
+        `include_slow` controls whether temperature and bus voltage are read.
+        They move over minutes, so refreshing them at the position rate doubles
+        the traffic for numbers that will not have changed; with it False the
+        last values are reused and the poll costs two fewer round trips.
+        """
         if not self.connected:
             return MotorStatus(name=self.name, connected=False,
                                comms_error="not connected")
@@ -1105,14 +1176,19 @@ class JVLMotor:
             # one of them should show a blank indicator, not fail the poll.
             torque_percent = self.get_torque_percent()
             current_a = self.get_current_amps(torque_percent)
-            try:
-                bus_voltage = self.read_register("BUS_VOLTAGE")
-            except (ModbusError, MotorFault):
-                bus_voltage = None
-            try:
-                temperature = self.read_register("TEMPERATURE_LOW_RES")
-            except (ModbusError, MotorFault):
-                temperature = None
+            if include_slow:
+                try:
+                    bus_voltage = self.read_register("BUS_VOLTAGE")
+                except (ModbusError, MotorFault):
+                    bus_voltage = None
+                try:
+                    temperature = self.read_register("TEMPERATURE_LOW_RES")
+                except (ModbusError, MotorFault):
+                    temperature = None
+                self._slow_cache = (bus_voltage, temperature)
+            else:
+                bus_voltage, temperature = self._slow_cache
+            supply_volts = self.get_supply_volts(bus_voltage) if bus_voltage else None
             position_mm = self.cfg.counts_to_mm(counts)
             target_mm = self.cfg.counts_to_mm(target)
             return MotorStatus(
@@ -1133,6 +1209,7 @@ class JVLMotor:
                 torque_percent=torque_percent,
                 current_a=current_a,
                 bus_voltage=bus_voltage,
+                supply_volts=supply_volts,
                 temperature=temperature,
                 in_position=(
                     abs(projected - target) <= self._tolerance_counts()

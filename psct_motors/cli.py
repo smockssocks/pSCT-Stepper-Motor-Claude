@@ -73,6 +73,9 @@ def make_platform(args) -> FocalPlanePlatform:
     apply_bench(cfg, getattr(args, "bench", None))
     if getattr(args, "sim_speed", None):
         cfg.simulated_speed_mm_per_s = args.sim_speed
+    if getattr(args, "poll", None):
+        cfg.poll_interval_s = args.poll
+        cfg.idle_poll_interval_s = max(args.poll, cfg.idle_poll_interval_s)
     platform = FocalPlanePlatform(cfg=cfg, simulate=args.simulate, logger=out,
                                   config_path=args.config)
     if platform.is_mixed:
@@ -973,6 +976,109 @@ def cmd_torque_profile(args) -> int:
         platform.disconnect()
 
 
+def cmd_supply(args) -> int:
+    """Record what the supply reads when it is healthy, in raw units and volts.
+
+    Register 97 is in the drive's own units and this software does not know the
+    scale. Two registers in raw units cannot be compared unless they are known
+    to share one, which is why the old check -- register 97 against register
+    139, 'Acceptance Voltage' -- was wrong: on the bench motor they read 1794
+    and 2054, so a motor running happily at 48 V looked like it was below
+    threshold and every move would have been refused.
+
+    So the scale is measured instead: read the register with the supply known
+    good, write down the voltage beside it, and after that the software can
+    both report volts and tell a real supply failure from a healthy reading.
+    """
+    platform = make_platform(args)
+    try:
+        platform.connect()
+    except PlatformError as exc:
+        out(str(exc))
+        return 1
+    try:
+        rule("Supply voltage")
+        out("Register 97 ('Bus voltage') is in the drive's own raw units, and")
+        out("nothing in the register map says what they are worth in volts.")
+        out("This records the pair once, so the software can report volts and")
+        out("recognise a supply that has actually failed.")
+        out("")
+        out("Do this with the supply ON and healthy.")
+        out("")
+
+        wanted = getattr(args, "motor", None)
+        if wanted:
+            chosen = [m for m in platform.motors if m.name == wanted]
+            if not chosen:
+                out(f"No actuator called {wanted!r}. "
+                    f"Configured: {', '.join(platform.names)}.")
+                return 1
+            out(f"Recording for {wanted} only.")
+            out("")
+        else:
+            chosen = list(platform.motors)
+
+        readings = {}
+        for motor in chosen:
+            try:
+                raw = motor.read_register("BUS_VOLTAGE")
+                acceptance = motor.read_register("ACCEPTANCE_VOLTAGE")
+                lowest = motor.read_register("BUS_VOLTAGE_MIN")
+            except (ModbusError, MotorFault) as exc:
+                out(f"  {motor.name:<6} could not be read: {exc}")
+                continue
+            readings[motor.name] = raw
+            existing = motor.cfg.supply_raw_at_nominal
+            out(f"  {motor.name:<6} reads {raw:>8}   "
+                f"(acceptance register {acceptance}, lowest ever {lowest})")
+            if existing:
+                volts = motor.get_supply_volts(raw)
+                out(f"         previously recorded {existing} = "
+                    f"{motor.cfg.supply_nominal_v:g} V"
+                    + (f", so this reading is {volts:.1f} V" if volts else ""))
+
+        if not readings:
+            out("")
+            out("Nothing could be read. Check the connection first.")
+            return 1
+
+        out("")
+        if args.volts is not None:
+            volts = args.volts
+            out(f"Using --volts {volts:g}.")
+        else:
+            volts = ask_float(
+                "What is the supply actually at, in volts (a meter, or the "
+                "supply's own display)?")
+        if not volts or volts <= 0:
+            out("No voltage given, so nothing was recorded.")
+            return 1
+
+        for motor in chosen:
+            raw = readings.get(motor.name)
+            if raw is None:
+                continue
+            motor.cfg.supply_nominal_v = float(volts)
+            motor.cfg.supply_raw_at_nominal = int(raw)
+
+        out("")
+        rule("Recorded")
+        for motor in chosen:
+            if motor.name not in readings:
+                continue
+            floor = readings[motor.name] * motor.cfg.supply_low_fraction
+            out(f"  {motor.name:<6} {readings[motor.name]} raw = {volts:g} V")
+            out(f"         a move will be refused below {floor:.0f} raw "
+                f"({volts * motor.cfg.supply_low_fraction:.1f} V, "
+                f"{motor.cfg.supply_low_fraction:.0%})")
+        out("")
+        if confirm("Save to the configuration file?", args.yes):
+            out(f"  Saved to {platform.save()}")
+        return 0
+    finally:
+        platform.disconnect()
+
+
 def cmd_find_stop(args) -> int:
     """Run all three actuators out together until the travel ends.
 
@@ -1171,7 +1277,8 @@ def cmd_motor_gui(args) -> int:
     """Bench GUI for a single motor."""
     from .single_gui import main as single_main
     return single_main(motor_name=args.motor, config_path=args.config,
-                       simulate=args.simulate, log_path=args.log)
+                       simulate=args.simulate, log_path=args.log,
+                       poll_interval_s=args.poll)
 
 
 def cmd_diagnose(args) -> int:
@@ -1253,7 +1360,8 @@ def cmd_show_log(args) -> int:
 def cmd_gui(args) -> int:
     from .gui import main as gui_main
     return gui_main(config_path=args.config, simulate=args.simulate,
-                    bench=args.bench, sim_speed=args.sim_speed)
+                    bench=args.bench, sim_speed=args.sim_speed,
+                    poll_interval_s=args.poll)
 
 
 # --------------------------------------------------------------------------
@@ -1282,6 +1390,10 @@ def _add_global_args(p: argparse.ArgumentParser,
     p.add_argument("--sim-speed", type=float, metavar="MM_PER_S", **extra,
                    help="how fast a simulated actuator runs at full velocity, "
                         "in mm/s (default 2). Only affects simulated axes.")
+    p.add_argument("--poll", type=float, metavar="SECONDS", **extra,
+                   help="seconds between status polls while moving (default "
+                        "0.15). Lower is more responsive and more Modbus "
+                        "traffic.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1298,6 +1410,9 @@ commissioning order
   check-direction      confirm which way each actuator pushes  (per motor)
   calibrate            measure counts per millimetre           (per motor)
   probe-brake          confirm brake control and polarity      (per motor)
+  supply               record what the bus-voltage register reads with the
+                       supply healthy, so volts can be shown and a failed
+                       supply can be told from a normal reading
   set-zero             define the reference orientation
   status / move        normal operation
 
@@ -1498,6 +1613,27 @@ one motor on a bench
     p.add_argument("--step-mm", type=float, default=0.2)
     p.add_argument("--budget-mm", type=float, default=30.0)
     p.set_defaults(func=cmd_torque_profile)
+
+    p = command(
+        "supply",
+        help="record what the supply reads when healthy, so volts can be shown",
+        description=(
+            "Register 97 is in the drive's own raw units and the register map "
+            "does not say what they are worth. Read it with the supply known "
+            "good, say what the voltage actually is, and the software can then "
+            "report volts and tell a real supply failure from a normal "
+            "reading. Until this is done it cannot do either, and says so "
+            "rather than guessing."
+        ),
+    )
+    p.add_argument("--volts", type=float,
+                   help="the supply voltage, if you would rather not be asked")
+    p.add_argument("--motor",
+                   help="record for this actuator only (default: all of them). "
+                        "Use this on the bench, where only one motor is real: "
+                        "a reading taken from a simulated stand-in is not a "
+                        "measurement of anything")
+    p.set_defaults(func=cmd_supply)
 
     p = command(
         "find-stop",

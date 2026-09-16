@@ -156,10 +156,13 @@ Coverage worth knowing about:
   drift apart -- a lagging axis is not reported as a hard stop.
 - A simulated brake holds the shaft, so "the brake did not release" is a
   condition the tests can actually create; releasing one with the drives
-  passive, and moving with the brake supply or the 60 V off, are each refused
-  with a message naming the cause.
+  passive, and moving with the brake supply or the motor supply off, are each
+  refused with a message naming the cause.
 - Removing a guard makes its safety drill fail, so a drill that stopped
   provoking anything cannot keep reporting PASS.
 - The scale reproduces the measured 0.059 mm per 10,000 counts.
-- Bus voltage below the drive's acceptance threshold blocks, which is the
-  documented "the motor will not move without its 60 V supply".
+- A bus voltage well below the reading recorded for that same motor when its
+  supply was healthy blocks, which is the documented "the motor will not move
+  without its supply". Register 139 ('Acceptance Voltage') is reported but
+  never compared against, because nothing establishes that it shares a scale
+  with register 97 — and on the bench motor it does not.

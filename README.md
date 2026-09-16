@@ -51,8 +51,8 @@ procedure — Top, East and West at 120°. They are a starting point, not a
 substitute for measuring.
 
 Work through **[docs/commissioning.md](docs/commissioning.md)** before trusting
-it: word order, register map, direction, scale, brakes, geometry, zero. It is
-seven steps and each one is a single command.
+it: word order, register map, direction, scale, brakes, supply, geometry, zero.
+It is eight steps and each one is a single command.
 
 Check the connection:
 
@@ -127,6 +127,55 @@ stop, and recommends a threshold from the gap between them — or says plainly
 that there is no gap, in which case torque alone cannot find the stop and the
 "commanded a step and barely moved" check is what does.
 
+### Telling the software what a healthy supply looks like
+
+Run this once per motor, with the supply on and the motor behaving:
+
+```
+python -m psct_motors.cli supply --volts 48                    # all three
+python -m psct_motors.cli --bench Top supply --motor Top --volts 48
+```
+
+On the bench, pass `--motor`: a reading taken from a simulated stand-in is not
+a measurement of anything, and writing one into the configuration would give
+the other two axes a baseline nobody measured.
+
+It reads the drive's bus-voltage register and records that raw number beside
+the voltage you measured. Two things then start working: the readouts show
+actual volts instead of a raw count, and a move is refused when that register
+later reads far below what was recorded — which is what a failed supply looks
+like from software. A JVL with no main supply still answers Modbus from its
+control supply: it accepts a target and quietly does nothing, which presents
+as the software being broken.
+
+It is compared against **its own** recorded reading, never against the drive's
+"Acceptance Voltage" register. Both are in the drive's raw units, but nothing
+establishes that they share a scale — and on the pSCT bench motor they read
+1794 and 2054, so comparing them would refuse every move on a motor running
+perfectly well at 48 V.
+
+Until it has been run there is nothing trustworthy to compare against, so the
+software says so once per session and lets moves proceed rather than blocking
+on a guess.
+
+### How fast the readouts update
+
+Position, torque, mode and following error refresh every `poll_interval_s`
+(0.15 s) while anything is moving and every `idle_poll_interval_s` (0.5 s)
+when nothing is. Bus voltage and temperature change over minutes, so they are
+read once every `slow_poll_every` polls and shown from the last reading in
+between — polling them at the position rate would nearly double the traffic
+for numbers that have not moved.
+
+```
+python -m psct_motors.cli --poll 0.1 gui       # faster, for this run only
+```
+
+Faster is not free: every poll is a set of Modbus TCP transactions per motor,
+three motors at a time on the telescope. If the event log starts reporting
+slow transactions, ease it back — a poll that takes longer than the interval
+is not giving you fresher numbers, it is queueing.
+
 ### Finding the end of travel
 
 The site calibrates by running the actuators out until they stop.
@@ -174,8 +223,9 @@ python -m psct_motors.cli brake status
 ```
 
 `-y` skips confirmations, for scripts. `status --json` is machine-readable.
-`--simulate`, `--config` and `-y` work on either side of the command name.
-`cli --help` lists everything.
+The global flags — `--simulate`, `--config`, `-y`, `--bench`, `--sim-speed`,
+`--poll` — work on either side of the command name. `cli --help` lists
+everything.
 
 ### From Python
 
@@ -289,7 +339,7 @@ See **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 |---|---|
 | **[docs/how-it-works.md](docs/how-it-works.md)** | how the software is put together, the decisions behind it, and what is not verified — read before explaining it to anyone |
 | **[docs/verification.md](docs/verification.md)** | how to know it is alright: what to check, in what order, before it runs unattended |
-| **[docs/commissioning.md](docs/commissioning.md)** | the seven steps to do before trusting any reading |
+| **[docs/commissioning.md](docs/commissioning.md)** | the eight steps to do before trusting any reading |
 | **[docs/troubleshooting.md](docs/troubleshooting.md)** | when a motor stops taking commands: diagnose, event log, bench tools |
 | **[docs/safety.md](docs/safety.md)** | what each guard is for, and what is verified against hardware and what is not |
 | **[docs/reference.md](docs/reference.md)** | the mechanism, the code layout, running the tests |

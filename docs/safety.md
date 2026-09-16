@@ -174,9 +174,12 @@ it. `cli safety-check` drives it through every refusal.
 
 Before any move, the platform also refuses to start when:
 
-- the drive supply is below the motor's own acceptance voltage. A JVL with no
-  60 V still answers Modbus from its control supply, accepts a target, and does
-  nothing — which presents as the software being broken.
+- the drive supply has collapsed, judged against the healthy reading recorded
+  for that motor by `cli supply`. A JVL with no main supply still answers
+  Modbus from its control supply, accepts a target, and does nothing — which
+  presents as the software being broken. Until a healthy reading has been
+  recorded there is nothing trustworthy to compare against, so the software
+  says so once and lets the move proceed rather than blocking on a guess.
 - the brakes read as engaged and will not release, or are commanded to release
   and still read back engaged.
 - the brakes are engaged and the drives are not holding, so releasing them

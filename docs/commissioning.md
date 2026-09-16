@@ -100,7 +100,27 @@ python -m psct_motors.cli probe-brake --motor Top
 Toggles the brake with the drive enabled and holding, and asks you to confirm
 you heard it click. See [brakes](safety.md#brakes) for the modes.
 
-### 6. Set the geometry
+### 6. Record what a healthy supply reads
+
+With the supply on, the motor behaving, and a meter (or the supply's own
+display) telling you the voltage:
+
+```
+python -m psct_motors.cli supply --volts 48
+python -m psct_motors.cli --bench Top supply --motor Top --volts 48
+```
+
+Register 97 `Bus voltage` is in the drive's own raw units and nothing says what
+they are worth in volts, so this records the pair once. After it, the readouts
+report volts, and a supply that has collapsed is refused with a message naming
+it rather than presenting as a motor that accepts targets and ignores them.
+
+It is compared against *its own* recorded reading, never against register 139
+`Acceptance Voltage` — see [supply voltage](troubleshooting.md#supply-voltage-what-the-software-knows-and-what-it-does-not)
+for why that distinction matters. On the bench, pass `--motor`: a reading taken
+from a simulated stand-in is not a measurement of anything.
+
+### 7. Set the geometry
 
 Edit `azimuth_deg` and `radius_mm` for each actuator from the camera drawing.
 `azimuth_deg` is measured counter-clockwise from +x looking along −z;
@@ -109,7 +129,7 @@ Edit `azimuth_deg` and `radius_mm` for each actuator from the camera drawing.
 Getting `radius_mm` wrong scales all your tilt angles by a constant factor, so
 it is worth measuring rather than guessing.
 
-### 7. Set the zero reference
+### 8. Set the zero reference
 
 With the focal plane at a position you have independently established:
 
