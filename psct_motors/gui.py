@@ -227,8 +227,8 @@ class MotorRow:
                                 stall_percent=actuator.stall_torque_percent)
         self.load_bar.grid(row=row, column=7, padx=(8, 2))
         self.load_var = tk.StringVar(value="")
-        ttk.Label(parent, textvariable=self.load_var, width=9, anchor="w",
-                  font=("TkFixedFont", 8), foreground="#555").grid(
+        ttk.Label(parent, textvariable=self.load_var, width=11, anchor="w",
+                  font=("TkFixedFont", 10, "bold"), foreground="#333").grid(
             row=row, column=8, padx=(2, 6), sticky="w")
 
         self.release_btn = ttk.Button(
@@ -288,9 +288,9 @@ class MotorRow:
         if status.torque_percent is None:
             self.load_var.set("no torque")
         elif status.current_a is not None:
-            self.load_var.set(f"~{status.current_a:.2f} A")
+            self.load_var.set(f"{status.torque_percent:>3.0f}% ~{status.current_a:.2f}A")
         else:
-            self.load_var.set(f"{status.torque_percent:.0f}% lim")
+            self.load_var.set(f"{status.torque_percent:>3.0f}% load")
 
         self.error_var.set(status.error_text if status.error_bits else "")
 
@@ -442,6 +442,8 @@ class MotorApp:
         view = tk.Menu(menubar, tearoff=0)
         view.add_command(label="Focal plane picture...",
                          command=self.on_open_plane_view)
+        view.add_command(label="Load and torque...",
+                         command=self.on_open_load_view)
         menubar.add_cascade(label="View", menu=view)
 
         tools = tk.Menu(menubar, tearoff=0)
@@ -669,6 +671,8 @@ class MotorApp:
         self._plane_window = None
         self._hard_stop_window = None
         self._limits_window = None
+        self._load_window = None
+        self._load_rows = {}
         self.plane_view = None
 
     def _build_actuators(self, parent) -> None:
@@ -905,6 +909,8 @@ class MotorApp:
             if self.plane_view is not None:
                 self.plane_view.update_plane(None, message=state.message
                                              or "no reading")
+
+        self._update_load_view(state)
 
         if state.any_error:
             self.conn_lamp.set(COLOR_BAD)
@@ -1187,6 +1193,127 @@ class MotorApp:
         self.run_async(f"Brake {who}", work)
 
     # ---------------------------------------------------- focal plane picture
+
+    def on_open_load_view(self) -> None:
+        """How hard each motor is working, big enough to read across a room.
+
+        The load bars in the actuator table are small by necessity -- they sit
+        in a crowded row. This is the same numbers with space around them, for
+        watching during a move or a calibration run, which is when they matter.
+
+        It updates from the same poll as everything else, so it costs no extra
+        traffic to the motors.
+        """
+        if self._load_window is not None and self._load_window.winfo_exists():
+            self._load_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Load and torque")
+        window.transient(self.root)
+        self._load_window = window
+
+        tk.Label(window, justify="left", anchor="w", wraplength=520, fg="#555",
+                 text=("Torque as a percentage of each drive's current limit "
+                       "(Actual Torque / CL: Current Max). These motors have "
+                       "no register that reports amps, so this is the honest "
+                       "measure of how hard they are working.")
+                 ).grid(row=0, column=0, columnspan=5, sticky="w",
+                        padx=12, pady=(12, 8))
+
+        headers = ("motor", "load now", "", "peak", "temp", "supply")
+        for column, text in enumerate(headers):
+            if text:
+                ttk.Label(window, text=text, foreground="#555",
+                          font=("TkDefaultFont", 8)).grid(row=1, column=column,
+                                                          padx=6)
+
+        self._load_rows = {}
+        for index, actuator in enumerate(self.cfg.actuators):
+            row = 2 + index
+            ttk.Label(window, text=actuator.name,
+                      font=("TkDefaultFont", 13, "bold")).grid(
+                row=row, column=0, sticky="w", padx=(12, 6), pady=6)
+
+            now_var = tk.StringVar(value="--")
+            ttk.Label(window, textvariable=now_var, width=7, anchor="e",
+                      font=("TkFixedFont", 20, "bold")).grid(row=row, column=1,
+                                                             padx=4)
+            bar = LoadBar(window,
+                          warn_percent=actuator.torque_warn_percent,
+                          stall_percent=actuator.stall_torque_percent)
+            bar.configure(width=170, height=20)
+            bar.WIDTH, bar.HEIGHT = 170, 20
+            bar.grid(row=row, column=2, padx=6)
+
+            peak_var = tk.StringVar(value="--")
+            ttk.Label(window, textvariable=peak_var, width=8, anchor="e",
+                      font=("TkFixedFont", 10)).grid(row=row, column=3, padx=6)
+            temp_var = tk.StringVar(value="--")
+            ttk.Label(window, textvariable=temp_var, width=8, anchor="e",
+                      font=("TkFixedFont", 10), foreground="#555").grid(
+                row=row, column=4, padx=6)
+            supply_var = tk.StringVar(value="--")
+            ttk.Label(window, textvariable=supply_var, width=9, anchor="e",
+                      font=("TkFixedFont", 10), foreground="#555").grid(
+                row=row, column=5, padx=(6, 12))
+
+            self._load_rows[actuator.name] = (now_var, bar, peak_var,
+                                              temp_var, supply_var)
+
+        footer = ttk.Frame(window)
+        footer.grid(row=2 + len(self.cfg.actuators), column=0, columnspan=6,
+                    sticky="w", padx=12, pady=(4, 10))
+        actuator = self.cfg.actuators[0]
+        ttk.Label(
+            footer, foreground="#777", wraplength=520, justify="left",
+            text=(f"Amber above {actuator.torque_warn_percent:.0f}%, and a move "
+                  f"is stopped above {actuator.stall_torque_percent:.0f}% held "
+                  f"for {actuator.stall_persist_samples} readings. Run "
+                  f"`cli torque-profile` to set those from this machine rather "
+                  f"than from a default."),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(footer, text="Reset peaks",
+                   command=self._reset_load_peaks).grid(row=0, column=1,
+                                                        padx=12)
+
+        def closed() -> None:
+            self._load_window = None
+            self._load_rows = {}
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", closed)
+
+    def _reset_load_peaks(self) -> None:
+        for _now, bar, _peak, _temp, _supply in self._load_rows.values():
+            bar.reset_peak()
+        for row in self.rows.values():
+            row.load_bar.reset_peak()
+
+    def _update_load_view(self, state) -> None:
+        """Fill the load window from the poll everybody else already used."""
+        if not self._load_rows:
+            return
+        for status in state.motors:
+            entry = self._load_rows.get(status.name)
+            if entry is None:
+                continue
+            now_var, bar, peak_var, temp_var, supply_var = entry
+            if status.comms_error or status.torque_percent is None:
+                now_var.set("--")
+                bar.set(None, "no reading")
+                temp_var.set("--")
+                supply_var.set("--")
+                continue
+            now_var.set(f"{status.torque_percent:.0f}%")
+            label = (f"~{status.current_a:.2f} A" if status.current_a is not None
+                     else f"{status.torque_percent:.1f}%")
+            bar.set(status.torque_percent, label)
+            peak_var.set(f"{bar._peak:.0f}%")
+            temp_var.set("--" if status.temperature is None
+                         else f"{status.temperature} C")
+            supply_var.set("--" if status.bus_voltage is None
+                           else f"{status.bus_voltage}")
 
     def on_open_plane_view(self) -> None:
         """A live picture of the plate on its three actuators.
@@ -1692,12 +1819,12 @@ class MotorApp:
         self.run_async("Find hard stop", work)
 
     def _record_hard_stop(self, direction: int, result) -> None:
-        """Remember where the end of travel is, and draw it on the gauge.
+        """Adopt the end of travel just found as the corresponding limit.
 
-        A hard stop is a fact about the machine, so it is worth keeping. The
-        focus position of the stop is the mean of where the three ended up,
-        which is what the kinematics call focus when the plate is flat -- and
-        it is flat, because the search levels it.
+        The soft limits ship as a guess; a hard stop is a measurement. So the
+        limit becomes the stop, less the configured safety margin, rather than
+        staying at whatever somebody typed before the travel was known. If the
+        total travel is configured, the far end follows from it.
         """
         # stop_mm is where the travel actually ended. positions_mm is where
         # the actuators are *now*, which is half a millimetre short of it,
@@ -1706,33 +1833,31 @@ class MotorApp:
         # of travel in the wrong place by exactly the back-off.
         ends = result.stop_mm or result.positions_mm
         focus_mm = sum(ends.values()) / len(ends)
-        limits = self.cfg.limits
-        if direction > 0:
-            limits.hard_stop_high_mm = focus_mm
-        else:
-            limits.hard_stop_low_mm = focus_mm
-        self._refresh_gauge_limits()
-        self.log(f"End of travel recorded at {focus_mm:+.4f} mm and marked on "
-                 f"the gauge.")
 
-        inside = (limits.min_focus_mm <= focus_mm <= limits.max_focus_mm)
-        if inside:
-            self.log("  That is INSIDE the configured focus limits, which means "
-                     "the limits are wrong -- they should sit inside the travel, "
-                     "not outside it.")
+        try:
+            notes = self.platform.adopt_hard_stop(direction, focus_mm)
+        except PlatformError as exc:
+            messagebox.showerror("Those ends of travel will not do", str(exc))
+            return
+
+        self.log(f"End of travel recorded at {focus_mm:+.4f} mm.")
+        for note in notes:
+            self.log("  " + note)
+        self._refresh_gauge_limits()
+
+        limits = self.cfg.limits
         if messagebox.askyesno(
-            "Save the end of travel?",
+            "Save the new limits?",
             f"The {'upper' if direction > 0 else 'lower'} end of travel was "
             f"found at {focus_mm:+.4f} mm.\n\n"
-            "Save it to the configuration file, so it stays marked on the "
-            "gauge next time?",
+            f"Focus limits are now "
+            f"{limits.min_focus_mm:+.3f} to {limits.max_focus_mm:+.3f} mm.\n\n"
+            "Save them to the configuration file?",
         ):
             try:
-                self.platform.save()
-                self.log("Saved to the configuration file.")
+                self.log(f"Saved to {self.platform.save()}")
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror("Could not save", str(exc))
-
 
     def on_safety_drills(self) -> None:
         """Provoke each dangerous situation and check the software refuses it.

@@ -1031,24 +1031,25 @@ def cmd_find_stop(args) -> int:
         rule("Result")
         for line in result.summary().splitlines():
             out("  " + line if not line.startswith(" ") else line)
-        # Remember where the travel ends. It is a fact about the machine, and
-        # once it is in the config the gauge draws it.
+        # The end of travel is a measurement; the soft limit was a guess. So
+        # the limit follows the stop rather than the other way round.
         focus_mm = sum(result.stop_mm.values()) / len(result.stop_mm)
-        limits = platform.cfg.limits
-        if direction > 0:
-            limits.hard_stop_high_mm = focus_mm
-        else:
-            limits.hard_stop_low_mm = focus_mm
         out("")
-        out(f"End of travel recorded at {focus_mm:+.4f} mm.")
-        if confirm("Save it to the configuration file?", args.yes):
+        rule("Limits")
+        for note in platform.adopt_hard_stop(direction, focus_mm):
+            out(f"  {note}")
+        limits = platform.cfg.limits
+        out("")
+        out(f"  Focus limits are now {limits.min_focus_mm:+.4f} to "
+            f"{limits.max_focus_mm:+.4f} mm.")
+        if confirm("Save the new limits to the configuration file?", args.yes):
             out(f"  Saved to {platform.save()}")
-            out("  It will be drawn on the GUI's gauge from now on.")
+            out("  The ends of travel are drawn on the GUI's gauge from now on.")
 
         out("")
-        out("Next: repeat in the other direction to learn the full travel, then")
-        out("set the focus limits in the config to sit inside what you found, and")
-        out("`set-zero` wherever you want the reference to be.")
+        out("Next: `set-zero` wherever you want the reference to be. If the far")
+        out("end was derived from the published travel rather than measured,")
+        out("run this again in the other direction to confirm it.")
         return 0
     except (PlatformError, MotorFault) as exc:
         out("")

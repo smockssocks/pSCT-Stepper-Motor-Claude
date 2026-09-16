@@ -397,6 +397,22 @@ class PlatformLimits:
     hard_stop_low_mm: Optional[float] = None
     hard_stop_high_mm: Optional[float] = None
 
+    #: How far inside a discovered hard stop the soft limit is placed.
+    #:
+    #: `find-stop` adopts the end of travel it finds as the corresponding focus
+    #: limit, less this margin, so that the limit is a measurement of the
+    #: machine rather than a guess. Half a millimetre keeps an ordinary move
+    #: from reaching the stop while giving up almost none of the travel.
+    safety_margin_mm: float = 0.5
+
+    #: Total travel of the mechanism, if it is known.
+    #:
+    #: The published pSCT figure is 5.08 cm. Once one end has been found, the
+    #: other follows from this, which saves running the search twice -- and
+    #: matters because the second run is the one that drives *towards* M2 with
+    #: the camera's weight behind it. Set to None to insist on measuring both.
+    total_travel_mm: Optional[float] = 50.8
+
     #: How far the three actuators may drift apart during a coordinated
     #: hard-stop search, in millimetres, before it is abandoned.
     #:
@@ -412,6 +428,10 @@ class PlatformLimits:
     def validate(self) -> None:
         if self.min_focus_mm >= self.max_focus_mm:
             raise ValueError("limits.min_focus_mm must be below limits.max_focus_mm")
+        if self.safety_margin_mm < 0:
+            raise ValueError("limits.safety_margin_mm cannot be negative")
+        if self.total_travel_mm is not None and self.total_travel_mm <= 0:
+            raise ValueError("limits.total_travel_mm must be positive, or null")
         for name in ("max_tilt_deg", "max_step_mm", "max_tilt_step_deg",
                      "max_hard_stop_spread_mm"):
             if getattr(self, name) <= 0:

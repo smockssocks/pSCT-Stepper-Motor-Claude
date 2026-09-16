@@ -320,6 +320,60 @@ class TestGui(unittest.TestCase):
         limits.max_focus_mm = 900.0
         MotorApp._check_limits_against_stops(limits)   # nothing to check against
 
+    def test_the_load_window_shows_each_motor(self):
+        """The bars in the table are small by necessity. This is the same
+        numbers with room around them, for watching during a move."""
+        self.app._start_polling()
+        self.app.on_open_load_view()
+        self.pump(0.6)
+        self.assertIsNotNone(self.app._load_window)
+        self.assertEqual(set(self.app._load_rows), {"Top", "East", "West"})
+        for name, (now_var, bar, peak_var, temp_var, supply_var) in \
+                self.app._load_rows.items():
+            self.assertIn("%", now_var.get(), name)
+            self.assertIsNotNone(bar._percent, name)
+            self.assertIn("%", peak_var.get(), name)
+            self.assertIn("C", temp_var.get(), name)
+            self.assertNotEqual(supply_var.get(), "--", name)
+        self.app._load_window.destroy()
+
+    def test_the_load_window_blanks_a_motor_that_stops_answering(self):
+        self.app._start_polling()
+        self.app.on_open_load_view()
+        self.pump(0.4)
+        self.app.platform.motors[0]._transport.set_offline(True)
+        self.pump(0.6)
+        now_var, bar, _peak, temp_var, _supply = self.app._load_rows["Top"]
+        self.assertEqual(now_var.get(), "--")
+        self.assertIsNone(bar._percent)
+        self.assertEqual(temp_var.get(), "--")
+        self.app._load_window.destroy()
+
+    def test_closing_the_load_window_stops_it_being_updated(self):
+        self.app._start_polling()
+        self.app.on_open_load_view()
+        self.pump(0.3)
+        self.app._load_window.protocol("WM_DELETE_WINDOW")  # exists
+        self.app._load_window = None
+        self.app._load_rows = {}
+        self.pump(0.4)          # a poll with no window must not raise
+
+    def test_resetting_peaks_clears_both_views(self):
+        self.app._start_polling()
+        self.app.on_open_load_view()
+        self.pump(0.4)
+        self.app.rows["Top"].load_bar.set(80.0)
+        self.app._load_rows["Top"][1].set(80.0)
+        self.app._reset_load_peaks()
+        self.assertEqual(self.app.rows["Top"].load_bar._peak, 0.0)
+        self.assertEqual(self.app._load_rows["Top"][1]._peak, 0.0)
+        self.app._load_window.destroy()
+
+    def test_the_in_row_reading_shows_the_percentage(self):
+        self.app._start_polling()
+        self.pump(0.5)
+        self.assertIn("%", self.app.rows["Top"].load_var.get())
+
     def test_rows_show_each_actuator(self):
         self.app._start_polling()
         self.pump(0.5)

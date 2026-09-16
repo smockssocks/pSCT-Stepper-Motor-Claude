@@ -285,6 +285,7 @@ class FocalPlanePlatform:
         # Start the simulated actuators mid-travel so relative moves in both
         # directions are possible straight away.
         mid = (self.cfg.limits.min_focus_mm + self.cfg.limits.max_focus_mm) / 2.0
+        low_stop, high_stop = self._simulated_stops()
         return simulated_motor(
             a, start_mm=mid,
             # Mechanical end stops just outside the *focus* limits, which is
@@ -297,10 +298,8 @@ class FocalPlanePlatform:
             # anything, and, when it did find something, a plate parked well
             # outside the limits so every ordinary move afterwards was refused.
             # Soft limits sit inside the mechanism; the simulation has to agree.
-            hard_stop_low=a.mm_to_counts(
-                self.cfg.limits.min_focus_mm - SIMULATED_STOP_MARGIN_MM),
-            hard_stop_high=a.mm_to_counts(
-                self.cfg.limits.max_focus_mm + SIMULATED_STOP_MARGIN_MM),
+            hard_stop_low=a.mm_to_counts(low_stop),
+            hard_stop_high=a.mm_to_counts(high_stop),
             # The load the brakes exist to hold. With the brakes off and the
             # drives passive, a simulated axis falls -- which is the failure the
             # interlocks are there to prevent, and it cannot be rehearsed if
@@ -308,6 +307,29 @@ class FocalPlanePlatform:
             gravity_counts_per_s=a.resolved_counts_per_mm * 2.0,
             brake_held=self._make_brake_hook(a.name),
         )
+
+    def _simulated_stops(self):
+        """Where the simulated mechanism physically ends, in focus mm.
+
+        The span comes from the total travel, not from the soft limits.
+        Deriving the stops from the limits was circular: `find-stop` adopts the
+        stop it finds as the new limit, so the next simulated run put its stop
+        further out again, and repeated rehearsals walked the machine off into
+        the distance.
+
+        They are centred on the middle of the configured focus range rather
+        than on zero, because the zero reference is wherever `set-zero` put it
+        and need not be mid-travel. That centre is stable under adoption: the
+        limits become the stops less a margin at each end, which leaves the
+        midpoint exactly where it was.
+        """
+        limits = self.cfg.limits
+        centre = (limits.min_focus_mm + limits.max_focus_mm) / 2.0
+        if limits.total_travel_mm:
+            half = limits.total_travel_mm / 2.0
+            return centre - half, centre + half
+        return (limits.min_focus_mm - SIMULATED_STOP_MARGIN_MM,
+                limits.max_focus_mm + SIMULATED_STOP_MARGIN_MM)
 
     @property
     def simulated_names(self) -> List[str]:
@@ -527,8 +549,33 @@ class FocalPlanePlatform:
                 )
 
         if current is not None:
+            # A move that brings the focal plane back inside the limits is
+            # never blocked for being too large.
+            #
+            # Without this the software can strand itself, and did: a
+            # hard-stop search leaves the plate just outside the soft limit by
+            # construction, and every move back to the middle is then a step
+            # bigger than the single-step limit. The step limit exists to catch
+            # a typed mistake, and "return to somewhere legal" is not one --
+            # refusing it leaves the operator with no way back except editing
+            # the configuration.
+            recovering = (
+                not self._focus_within_limits(current.focus_mm)
+                and self._focus_within_limits(orientation.focus_mm)
+                and abs(orientation.focus_mm - self._focus_centre())
+                < abs(current.focus_mm - self._focus_centre())
+            )
+            if recovering:
+                self._log(
+                    f"Focus is at {current.focus_mm:+.4f} mm, outside the "
+                    f"{limits.min_focus_mm:.3f}..{limits.max_focus_mm:.3f} mm "
+                    f"limits. Allowing a "
+                    f"{abs(orientation.focus_mm - current.focus_mm):.3f} mm move "
+                    f"back inside them despite the single-step limit."
+                )
+
             d_focus = abs(orientation.focus_mm - current.focus_mm)
-            if d_focus > limits.max_step_mm:
+            if d_focus > limits.max_step_mm and not recovering:
                 problems.append(
                     f"this move changes focus by {d_focus:.3f} mm, more than the "
                     f"{limits.max_step_mm:.3f} mm single-step limit"
@@ -536,7 +583,7 @@ class FocalPlanePlatform:
             d_tip = abs(orientation.tip_deg - current.tip_deg)
             d_tilt = abs(orientation.tilt_deg - current.tilt_deg)
             worst = max(d_tip, d_tilt)
-            if worst > limits.max_tilt_step_deg:
+            if worst > limits.max_tilt_step_deg and not recovering:
                 problems.append(
                     f"this move changes an angle by {worst:.4f} deg, more than the "
                     f"{limits.max_tilt_step_deg:.3f} deg single-step limit"
@@ -547,6 +594,75 @@ class FocalPlanePlatform:
                 "Move refused, nothing was commanded:\n  - " + "\n  - ".join(problems)
             )
         return targets
+
+    def adopt_hard_stop(self, direction: int, stop_mm: float) -> List[str]:
+        """Record an end of travel and make the soft limit follow it.
+
+        The soft limits ship as a guess. A hard stop is a measurement, so once
+        one has been found it is the better number -- the limit becomes the
+        stop, less `safety_margin_mm`, rather than staying wherever it was set
+        before anybody knew where the travel ended.
+
+        If the total travel is known and only one end has been found, the other
+        end follows from it. That saves running the search a second time, which
+        matters because the second run is the one that drives towards M2 with
+        the camera's weight behind it.
+
+        Returns the lines describing what changed, for the log.
+        """
+        limits = self.cfg.limits
+        margin = limits.safety_margin_mm
+        notes: List[str] = []
+
+        if direction > 0:
+            limits.hard_stop_high_mm = stop_mm
+            limits.max_focus_mm = stop_mm - margin
+            notes.append(f"Upper end of travel: {stop_mm:+.4f} mm. Upper focus "
+                         f"limit set to {limits.max_focus_mm:+.4f} mm "
+                         f"({margin:.3f} mm inside it).")
+        else:
+            limits.hard_stop_low_mm = stop_mm
+            limits.min_focus_mm = stop_mm + margin
+            notes.append(f"Lower end of travel: {stop_mm:+.4f} mm. Lower focus "
+                         f"limit set to {limits.min_focus_mm:+.4f} mm "
+                         f"({margin:.3f} mm inside it).")
+
+        travel = limits.total_travel_mm
+        if travel:
+            if direction > 0 and limits.hard_stop_low_mm is None:
+                limits.hard_stop_low_mm = stop_mm - travel
+                limits.min_focus_mm = limits.hard_stop_low_mm + margin
+                notes.append(
+                    f"The other end follows from the {travel:.2f} mm published "
+                    f"travel: {limits.hard_stop_low_mm:+.4f} mm, lower limit "
+                    f"{limits.min_focus_mm:+.4f} mm. That end is DERIVED, not "
+                    f"measured -- run the search downwards to confirm it."
+                )
+            elif direction < 0 and limits.hard_stop_high_mm is None:
+                limits.hard_stop_high_mm = stop_mm + travel
+                limits.max_focus_mm = limits.hard_stop_high_mm - margin
+                notes.append(
+                    f"The other end follows from the {travel:.2f} mm published "
+                    f"travel: {limits.hard_stop_high_mm:+.4f} mm, upper limit "
+                    f"{limits.max_focus_mm:+.4f} mm. That end is DERIVED, not "
+                    f"measured -- run the search upwards to confirm it."
+                )
+
+        if limits.min_focus_mm >= limits.max_focus_mm:
+            raise PlatformError(
+                f"Those ends of travel leave no room: the limits would be "
+                f"{limits.min_focus_mm:+.4f}..{limits.max_focus_mm:+.4f} mm. "
+                f"Check limits.total_travel_mm and the zero reference."
+            )
+        return notes
+
+    def _focus_within_limits(self, focus_mm: float) -> bool:
+        limits = self.cfg.limits
+        return limits.min_focus_mm <= focus_mm <= limits.max_focus_mm
+
+    def _focus_centre(self) -> float:
+        limits = self.cfg.limits
+        return (limits.min_focus_mm + limits.max_focus_mm) / 2.0
 
     def preview(self, orientation: Orientation) -> Dict[str, float]:
         """Actuator targets for an orientation, without checking or moving.

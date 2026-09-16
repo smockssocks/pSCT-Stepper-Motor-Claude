@@ -353,6 +353,135 @@ class TestSimulatedBoundsAreCoherent(unittest.TestCase):
         self.assertLess(focus, platform.cfg.limits.max_focus_mm + 1.0)
 
 
+class TestTheSoftwareCannotStrandItself(unittest.TestCase):
+    """Reported: after find-stop, "I wouldn't move it back down from there."
+
+    The search leaves the plate just outside the soft limit by construction.
+    Every move back to the middle is then a step larger than the single-step
+    limit, so the software refused all of them -- and the only way out was to
+    edit the configuration file.
+    """
+
+    def _platform(self):
+        platform = FocalPlanePlatform(cfg=safety.bench_config(), simulate=True)
+        platform.connect()
+        self.addCleanup(platform.disconnect)
+        return platform
+
+    def test_a_move_back_inside_the_limits_is_always_allowed(self):
+        from psct_motors.kinematics import Orientation
+        platform = self._platform()
+        limits = platform.cfg.limits
+        # Where a hard-stop search leaves you: outside, by less than a step.
+        platform.seek_hard_stop_together(+1, budget_mm=30.0)
+        self.assertGreater(platform.read_orientation().focus_mm,
+                           limits.max_focus_mm - 1.0)
+
+        # A full-travel move home is far more than max_step_mm...
+        home = (limits.min_focus_mm + limits.max_focus_mm) / 2.0
+        self.assertGreater(abs(platform.read_orientation().focus_mm - home),
+                           limits.max_step_mm)
+        # ...and is allowed anyway, because it ends somewhere legal.
+        platform.move_to_orientation(Orientation(home, 0.0, 0.0))
+        self.assertAlmostEqual(platform.read_orientation().focus_mm, home,
+                               places=2)
+
+    def test_an_oversized_move_inside_the_limits_is_still_refused(self):
+        """The step limit still catches a typed mistake."""
+        from psct_motors.kinematics import Orientation
+        platform = self._platform()
+        platform.move_to_orientation(Orientation(0.0, 0.0, 0.0))
+        with self.assertRaises(PlatformError) as ctx:
+            platform.move_to_orientation(
+                Orientation(platform.cfg.limits.max_step_mm * 2, 0.0, 0.0))
+        self.assertIn("single-step limit", str(ctx.exception))
+
+    def test_a_move_further_outside_is_still_refused(self):
+        """Recovery means coming back, not going further out."""
+        from psct_motors.kinematics import Orientation
+        platform = self._platform()
+        platform.seek_hard_stop_together(+1, budget_mm=30.0)
+        with self.assertRaises(PlatformError):
+            platform.move_to_orientation(
+                Orientation(platform.cfg.limits.max_focus_mm + 10.0, 0.0, 0.0))
+
+
+class TestTheFoundStopBecomesTheLimit(unittest.TestCase):
+    """The soft limits ship as a guess; a hard stop is a measurement."""
+
+    def _platform(self):
+        platform = FocalPlanePlatform(cfg=safety.bench_config(), simulate=True)
+        platform.connect()
+        self.addCleanup(platform.disconnect)
+        return platform
+
+    def test_the_upper_limit_follows_the_upper_stop(self):
+        platform = self._platform()
+        limits = platform.cfg.limits
+        platform.adopt_hard_stop(+1, 25.4)
+        self.assertAlmostEqual(limits.hard_stop_high_mm, 25.4)
+        self.assertAlmostEqual(limits.max_focus_mm,
+                               25.4 - limits.safety_margin_mm)
+
+    def test_the_far_end_follows_from_the_known_travel(self):
+        """Saves running the search downwards, which is the run that drives
+        towards M2 with the camera's weight behind it."""
+        platform = self._platform()
+        limits = platform.cfg.limits
+        limits.total_travel_mm = 50.8
+        platform.adopt_hard_stop(+1, 25.4)
+        self.assertAlmostEqual(limits.hard_stop_low_mm, 25.4 - 50.8)
+        self.assertAlmostEqual(limits.min_focus_mm,
+                               limits.hard_stop_low_mm + limits.safety_margin_mm)
+
+    def test_a_measured_far_end_is_not_overwritten_by_the_derived_one(self):
+        platform = self._platform()
+        limits = platform.cfg.limits
+        platform.adopt_hard_stop(-1, -20.0)          # measured
+        platform.adopt_hard_stop(+1, 25.4)           # must not derive over it
+        self.assertAlmostEqual(limits.hard_stop_low_mm, -20.0)
+
+    def test_it_says_which_end_was_derived_rather_than_measured(self):
+        platform = self._platform()
+        notes = " ".join(platform.adopt_hard_stop(+1, 25.4))
+        self.assertIn("DERIVED", notes)
+        self.assertIn("not measured", notes)
+
+    def test_limits_that_leave_no_room_are_refused(self):
+        platform = self._platform()
+        platform.cfg.limits.total_travel_mm = 0.1
+        with self.assertRaises(PlatformError) as ctx:
+            platform.adopt_hard_stop(+1, 25.4)
+        self.assertIn("no room", str(ctx.exception))
+
+    def test_after_a_search_the_plate_is_inside_the_new_limits(self):
+        """The whole point: the run ends somewhere you can move away from."""
+        platform = self._platform()
+        result = platform.seek_hard_stop_together(+1, budget_mm=30.0)
+        platform.adopt_hard_stop(+1, sum(result.stop_mm.values())
+                                 / len(result.stop_mm))
+        focus = platform.read_orientation().focus_mm
+        limits = platform.cfg.limits
+        self.assertLessEqual(focus, limits.max_focus_mm + 1e-6)
+        self.assertGreaterEqual(focus, limits.min_focus_mm)
+
+    def test_repeated_searches_do_not_walk_the_simulated_machine(self):
+        """The stops used to be derived from the limits, which the search then
+        moved -- so each rehearsal found the end further out than the last."""
+        found = []
+        for _ in range(3):
+            platform = FocalPlanePlatform(cfg=safety.bench_config(), simulate=True)
+            platform.connect()
+            try:
+                result = platform.seek_hard_stop_together(+1, budget_mm=30.0)
+                stop = sum(result.stop_mm.values()) / len(result.stop_mm)
+                platform.adopt_hard_stop(+1, stop)
+                found.append(round(stop, 3))
+            finally:
+                platform.disconnect()
+        self.assertEqual(len(set(found)), 1, f"the end of travel moved: {found}")
+
+
 class TestSafetyDrills(unittest.TestCase):
     def test_every_drill_passes(self):
         report = safety.run_all()

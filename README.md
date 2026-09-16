@@ -100,6 +100,7 @@ Behind the menus, so the main window stays about the job:
 |---|---|
 | **Motion → Tip and tilt** | the two tilt angles, with nudges and a Level button |
 | **View → Focal plane picture** | live drawing of the plate on its three actuators |
+| **View → Load and torque** | how hard each motor is working, big enough to read across a room, with peaks, temperature and supply |
 | **Tools → Connection settings** | edit each motor's IP and port, use now or save |
 | **Tools → Motion limits** | focus, tilt and step limits; set them from the ends of travel that Find hard stop discovered |
 | **Tools → Find hard stop** | run the actuators out to the end of travel |
@@ -145,9 +146,20 @@ three retreat half a millimetre so nothing is left resting on the stop.
 There is no way to do this with one actuator. Driving one into its end stop
 tilts the focal plane about the other two ball joints.
 
-Where it finds the end is recorded in the configuration and **drawn on the
-gauge** as a solid red line outside the dashed soft limits, so you can see how
-much room is left.
+**The end it finds becomes the limit.** The soft limits ship as a guess; a hard
+stop is a measurement, so the upper focus limit is set to the stop less
+`safety_margin_mm` (0.5 mm). If `total_travel_mm` is configured — 50.8 mm is the
+published pSCT figure — the far end follows from it, clearly marked as derived
+rather than measured until you run the search downwards too.
+
+Both ends are drawn on the gauge as solid red lines outside the dashed soft
+limits, so you can see how much room is left.
+
+A move that brings the focal plane **back inside** the limits is never blocked
+for being too large. The search leaves the plate just outside the limit by
+construction, and without that rule every move home is a step bigger than the
+single-step limit — which stranded the plate with no way back except editing the
+configuration file.
 
 ### Command line
 
