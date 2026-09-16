@@ -55,9 +55,18 @@ class SimulatedJVLTransport:
                  hard_stop_low: Optional[int] = None,
                  hard_stop_high: Optional[int] = None,
                  brake_held: Optional[Callable[[], bool]] = None,
-                 brake_on_output: bool = False):
+                 brake_on_output: bool = False,
+                 counts_per_second_per_vsoll: Optional[float] = None):
         self.name = name
         self.word_order = word_order
+        #: Per-instance override of the class constant. The class default is
+        #: an arbitrary number of counts per second, which on a 169492
+        #: count/mm actuator works out at half a millimetre per second -- so a
+        #: simulated run to the end of travel crawled for three minutes.
+        #: Callers that know the actuator's scale set this so the simulated
+        #: axis moves at a believable speed in the units a person watches.
+        if counts_per_second_per_vsoll is not None:
+            self.COUNTS_PER_SECOND_PER_VSOLL = float(counts_per_second_per_vsoll)
         self.gravity_counts_per_s = gravity_counts_per_s
         #: Asked, on every physics step, whether an external brake is clamping
         #: this shaft. That is how the brake interlocks become testable: with
@@ -379,19 +388,56 @@ class SimulatedJVLTransport:
             self.registers[number] = words_to_int32(values, self.word_order, signed=True)
 
 
+#: How fast a simulated actuator runs at its configured full velocity, in
+#: millimetres per second. Chosen so that a rehearsal of the calibration takes
+#: tens of seconds rather than minutes, while still being slow enough to watch
+#: the numbers move.
+SIM_FULL_SPEED_MM_PER_S = 6.0
+
+
+def velocity_raw_for_mm_per_s(cfg: ActuatorConfig, mm_per_s: float) -> int:
+    """The raw V_SOLL that makes a simulated actuator run at `mm_per_s`.
+
+    A simulated motor's speed is fixed at construction as counts per second
+    per unit of V_SOLL, derived from the actuator's configured velocity so
+    that full speed means SIM_FULL_SPEED_MM_PER_S. Anything that wants a
+    deliberately slow axis -- a test that needs a move long enough to
+    interrupt, say -- has to ask in millimetres per second rather than
+    guessing a raw number, because the raw number means different things on
+    differently-scaled actuators.
+    """
+    if cfg.velocity_raw <= 0 or SIM_FULL_SPEED_MM_PER_S <= 0:
+        return 1
+    return max(1, int(round(cfg.velocity_raw * mm_per_s / SIM_FULL_SPEED_MM_PER_S)))
+
+
 def simulated_motor(cfg: ActuatorConfig, start_mm: Optional[float] = None,
                     **kwargs) -> JVLMotor:
     """A JVLMotor backed by a simulated transport, positioned at `start_mm`."""
     start_counts = cfg.mm_to_counts(start_mm) if start_mm is not None else cfg.zero_counts
     kwargs.setdefault("brake_on_output", cfg.brake.mode == "output")
+    if "counts_per_second_per_vsoll" not in kwargs and cfg.velocity_raw > 0:
+        # Make the simulated speed mean something in millimetres per second,
+        # whatever counts_per_mm happens to be.
+        kwargs["counts_per_second_per_vsoll"] = (
+            SIM_FULL_SPEED_MM_PER_S * cfg.resolved_counts_per_mm
+            / float(cfg.velocity_raw)
+        )
     transport = SimulatedJVLTransport(
         name=cfg.name,
         word_order=WordOrder.parse(cfg.word_order),
         start_counts=start_counts,
         **kwargs,
     )
+    # Start with the configured velocity in the register, not the class
+    # default. Otherwise the motor's idea of its own speed and the
+    # configuration's disagree, and anything that reads V_SOLL and scales it --
+    # a hard-stop search running at a quarter speed, say -- works from the
+    # wrong number.
+    transport.registers[5] = int(cfg.velocity_raw)
     motor = JVLMotor(cfg, transport=transport)
     return motor
 
 
-__all__ = ["SimulatedJVLTransport", "simulated_motor"]
+__all__ = ["SimulatedJVLTransport", "simulated_motor",
+           "velocity_raw_for_mm_per_s", "SIM_FULL_SPEED_MM_PER_S"]

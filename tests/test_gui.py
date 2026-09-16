@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import tkinter as tk
+    from tkinter import ttk
     HAVE_TK = True
 except ImportError:
     HAVE_TK = False
@@ -79,6 +80,10 @@ class TestGui(unittest.TestCase):
             cfg=self.app.cfg, simulate=True, logger=self.app.log_threadsafe
         )
         self.app.platform.connect()
+        # The gauge was built from whatever configuration was on disk. Point it
+        # at the bench config these tests use, or one test's saved hard stop
+        # leaks into the next one's expectations.
+        self.app._refresh_gauge_limits()
 
     def tearDown(self):
         self.app.shutdown()
@@ -234,6 +239,48 @@ class TestGui(unittest.TestCase):
         self.assertIsNone(self.app.rows["Top"].load_bar._percent)
         self.assertEqual(self.app.rows["Top"].load_var.get(), "")
 
+    def test_the_gauge_marks_where_the_travel_ends(self):
+        """A soft limit is a setting; an end stop is the machine. Seeing how
+        much room is left between them is the point."""
+        gauge = self.app.gauge
+        self.assertIsNone(gauge.hard_stop_low_mm)
+        self.assertIsNone(gauge.hard_stop_high_mm)
+
+        self.app.cfg.limits.hard_stop_high_mm = 52.0
+        self.app.cfg.limits.hard_stop_low_mm = -2.0
+        self.app._refresh_gauge_limits()
+        self.pump(0.2)
+
+        self.assertEqual(gauge.hard_stop_high_mm, 52.0)
+        # The drawn range has to widen to take them in, or a stop beyond the
+        # soft limit lands on top of the limit it is meant to sit outside.
+        low, high = gauge.drawn_range()
+        self.assertLess(low, -2.0)
+        self.assertGreater(high, 52.0)
+
+    def test_the_gauge_range_is_the_soft_limits_until_a_stop_is_found(self):
+        low, high = self.app.gauge.drawn_range()
+        self.assertEqual(low, self.app.cfg.limits.min_focus_mm)
+        self.assertEqual(high, self.app.cfg.limits.max_focus_mm)
+
+    def test_a_found_hard_stop_is_recorded_and_drawn(self):
+        from psct_motors.platform import HardStopResult
+        result = HardStopResult(
+            direction=+1, stopped_by=["Top"], reasons={},
+            start_mm={}, positions_mm={"Top": 48.0, "East": 48.0, "West": 48.0},
+            positions_counts={}, travelled_mm={}, spread_mm=0.0,
+            worst_spread_mm=0.0, peak_torque_percent={},
+            stop_mm={"Top": 49.0, "East": 49.0, "West": 49.0},
+        )
+        # Answer "no" to the save prompt: a test must not write the live
+        # configuration file.
+        self._answer(False, lambda: self.app._record_hard_stop(+1, result))
+        self.pump(0.2)
+        self.assertAlmostEqual(self.app.cfg.limits.hard_stop_high_mm, 49.0)
+        self.assertAlmostEqual(self.app.gauge.hard_stop_high_mm, 49.0)
+        self.assertIn("End of travel recorded",
+                      self.app.log_text.get("1.0", "end"))
+
     def test_rows_show_each_actuator(self):
         self.app._start_polling()
         self.pump(0.5)
@@ -254,16 +301,18 @@ class TestGui(unittest.TestCase):
         self.app._start_polling()
         self.app.platform.set_all_brakes(engaged=True)
         self.pump(0.5)
-        self.assertIn("engaged", self.app.rows["Top"].brake_var.get())
+        self.assertIn("HOLDING", self.app.rows["Top"].brake_var.get())
         self.app.platform.move_to_orientation(Orientation(26.0, 0.0, 0.0))
         self.pump(0.5)
-        self.assertIn("released", self.app.rows["Top"].brake_var.get())
+        self.assertIn("FREE", self.app.rows["Top"].brake_var.get())
 
     # ---- the property that matters ---------------------------------------
 
     def test_stop_button_interrupts_a_move_in_flight(self):
+        from psct_motors.simulator import velocity_raw_for_mm_per_s
         for actuator in self.app.cfg.actuators:
-            actuator.velocity_raw = 20              # ~2 mm/s in the simulator
+            # Slow enough that the move is still running when STOP is pressed.
+            actuator.velocity_raw = velocity_raw_for_mm_per_s(actuator, 2.0)
         self.app.platform.move_to_orientation(Orientation(5.0, 0.0, 0.0))
         self.app._start_polling()
 
@@ -437,6 +486,27 @@ class TestGui(unittest.TestCase):
         for b, a in zip(before, after):
             self.assertAlmostEqual(b, a, places=4)
 
+    def _answer(self, answer, fn):
+        """Call `fn` with every dialog answered `answer`."""
+        from psct_motors import gui
+        original = gui.messagebox
+
+        class _Stub:
+            @staticmethod
+            def showerror(*a, **k): return None
+            @staticmethod
+            def showwarning(*a, **k): return None
+            @staticmethod
+            def showinfo(*a, **k): return None
+            @staticmethod
+            def askyesno(*a, **k): return answer
+
+        gui.messagebox = _Stub()
+        try:
+            return fn()
+        finally:
+            gui.messagebox = original
+
     def _silent(self, fn):
         """Call `fn` with message boxes stubbed out."""
         from psct_motors import gui
@@ -455,6 +525,167 @@ class TestGui(unittest.TestCase):
             return fn()
         finally:
             gui.messagebox = original
+
+
+@unittest.skipUnless(display_available(), "tkinter or a display is unavailable")
+class TestEveryControlWorks(unittest.TestCase):
+    """Click everything, and check nothing raises.
+
+    This exists because of a real near-miss: an edit removed `on_safety_drills`
+    while leaving the menu entry that calls it, and nothing failed until the
+    window was built. A menu command that raises is invisible until somebody
+    clicks it -- which, on the day, is in front of an audience.
+
+    So every menu entry and every button is invoked here against simulated
+    motors. It is a smoke test, not a behaviour test: the assertion is simply
+    that the application is still standing afterwards, with no exception on the
+    UI thread and no error dialog raised.
+    """
+
+    def setUp(self):
+        from psct_motors.gui import MotorApp
+        from psct_motors.platform import FocalPlanePlatform
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = MotorApp(self.root, simulate=True)
+        self.app.cfg = gui_config()
+        self.app.platform = FocalPlanePlatform(
+            cfg=self.app.cfg, simulate=True, logger=self.app.log_threadsafe)
+        self.app.platform.connect()
+        self.app._start_polling()
+
+        # Anything that would block on a person is answered, and anything that
+        # would report a failure is recorded so the test can fail on it.
+        from psct_motors import gui
+        self.errors = []
+        test = self
+
+        class Dialogs:
+            @staticmethod
+            def showerror(title, message, **k):
+                test.errors.append(f"{title}: {message}")
+            @staticmethod
+            def showwarning(*a, **k): return None
+            @staticmethod
+            def showinfo(*a, **k): return None
+            @staticmethod
+            def askyesno(*a, **k): return False      # never save, never destroy
+
+        self._real_messagebox = gui.messagebox
+        gui.messagebox = Dialogs()
+
+        # Tk prints a traceback to stderr and carries on when a callback
+        # raises, so a broken button looks exactly like one that had nothing
+        # to do. Without this hook every test below passes on a dead control.
+        self.callback_errors = []
+
+        def record(exc_type, exc_value, exc_tb):
+            self.callback_errors.append(f"{exc_type.__name__}: {exc_value}")
+
+        self.root.report_callback_exception = record
+
+    def tearDown(self):
+        from psct_motors import gui
+        gui.messagebox = self._real_messagebox
+        self.app.shutdown()
+        self.pump(0.2)
+        for window in list(self.root.winfo_children()):
+            try:
+                if isinstance(window, tk.Toplevel):
+                    window.destroy()
+            except Exception:
+                pass
+        self.root.destroy()
+        self.app = None
+        self.root = None
+        gc.collect()
+
+    def pump(self, seconds: float) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            self.root.update_idletasks()
+            self.root.update()
+            time.sleep(0.01)
+
+    def _menu_commands(self):
+        """(label, callable) for every leaf entry in the menu bar."""
+        found = []
+        bar = self.app.menubar
+        for index in range(bar.index("end") + 1):
+            try:
+                submenu_name = bar.entrycget(index, "menu")
+            except Exception:
+                continue
+            if not submenu_name:
+                continue
+            submenu = self.root.nametowidget(submenu_name)
+            for entry in range(submenu.index("end") + 1):
+                try:
+                    if submenu.type(entry) != "command":
+                        continue
+                    label = submenu.entrycget(entry, "label")
+                except Exception:
+                    continue
+                found.append((label, lambda s=submenu, e=entry: s.invoke(e)))
+        return found
+
+    def test_every_menu_entry_can_be_invoked(self):
+        entries = self._menu_commands()
+        self.assertGreaterEqual(len(entries), 8,
+                                "the menu bar looks emptier than it should be")
+        for label, invoke in entries:
+            with self.subTest(menu=label):
+                invoke()
+                self.pump(0.35)
+                # Close anything it opened, so the next entry starts clean.
+                for child in list(self.root.winfo_children()):
+                    if isinstance(child, tk.Toplevel):
+                        child.destroy()
+                self.pump(0.1)
+                self.assertEqual(self.callback_errors, [],
+                                 f"{label} raised")
+        self.assertEqual(self.errors, [])
+
+    def test_every_button_can_be_pressed(self):
+        pressed = []
+
+        def press(widget):
+            for child in widget.winfo_children():
+                press(child)
+            if isinstance(widget, (ttk.Button, tk.Button)):
+                text = str(widget.cget("text")).replace("\n", " ")
+                # Quitting mid-test would take the window out from under us.
+                if "quit" in text.lower():
+                    return
+                widget.invoke()
+                pressed.append(text)
+                self.pump(0.2)
+                for child in list(self.root.winfo_children()):
+                    if isinstance(child, tk.Toplevel):
+                        child.destroy()
+
+        press(self.root)
+        self.pump(0.5)
+        self.assertGreaterEqual(len(pressed), 10,
+                                f"only found {pressed}")
+        self.assertEqual(self.callback_errors, [])
+        self.assertEqual(self.errors, [])
+
+    def test_the_window_is_still_polling_afterwards(self):
+        """A dead poll loop looks exactly like a frozen application."""
+        for label, invoke in self._menu_commands():
+            invoke()
+            self.pump(0.2)
+            for child in list(self.root.winfo_children()):
+                if isinstance(child, tk.Toplevel):
+                    child.destroy()
+        self.pump(0.4)
+        before = self.app.rows["Top"].position_var.get()
+        self.app.platform.move_to_orientation(Orientation(3.0, 0.0, 0.0))
+        self.pump(0.8)
+        self.assertNotEqual(before, self.app.rows["Top"].position_var.get(),
+                            "the readout stopped updating")
 
 
 if __name__ == "__main__":

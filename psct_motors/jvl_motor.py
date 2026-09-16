@@ -751,8 +751,23 @@ class JVLMotor:
                 # Deliberately not wait_for_in_position: at a hard stop the
                 # move never completes, and that is the expected outcome here
                 # rather than an error.
-                deadline = time.monotonic() + settle_s + 5.0
+                #
+                # The wait is bounded by *progress*, not by a fixed delay. A
+                # fixed allowance has to assume a speed, and gets it wrong in
+                # the dangerous direction: a slow axis, or a large step, does
+                # not finish inside it and is then reported as a hard stop
+                # that is not there -- which would put the calibration
+                # reference somewhere in the middle of the travel.
+                last_moved_at = time.monotonic()
+                last_position = before
+                deadline = time.monotonic() + self.cfg.move_timeout_s
                 while time.monotonic() < deadline:
+                    here = self.get_position_counts()
+                    if abs(here - last_position) >= max(1, step_counts // 100):
+                        last_position = here
+                        last_moved_at = time.monotonic()
+                    elif time.monotonic() - last_moved_at > settle_s + 1.0:
+                        break          # stopped making progress: at a stop
                     stalled = self.check_stall()
                     if stalled is not None:
                         stop_at = self.get_position_counts()

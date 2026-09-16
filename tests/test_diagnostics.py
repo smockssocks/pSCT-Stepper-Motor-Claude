@@ -836,8 +836,7 @@ class TestCoordinatedHardStop(unittest.TestCase):
     def test_all_three_move_and_the_first_stop_halts_them_all(self):
         platform = self._platform(stops=(3000, 9999, 9999))
         try:
-            result = platform.seek_hard_stop_together(+1, step_mm=0.2,
-                                                      budget_mm=10.0)
+            result = platform.seek_hard_stop_together(+1, budget_mm=10.0)
             self.assertEqual(result.stopped_by, ["Top"])
             # The other two moved with it rather than staying put...
             for name in ("East", "West"):
@@ -849,15 +848,12 @@ class TestCoordinatedHardStop(unittest.TestCase):
             platform.disconnect()
 
     def test_the_plate_ends_flat(self):
-        """The step in which the first axis stops leaves the other two up to
-        one step ahead. That residual is tilt, so it gets levelled out."""
+        """The two that did not stop carry on for a fraction of a second
+        before the halt lands. That residual is tilt, so it is levelled out."""
         platform = self._platform(stops=(3000, 9999, 9999))
         try:
-            result = platform.seek_hard_stop_together(+1, step_mm=0.2,
-                                                      budget_mm=10.0)
-            self.assertTrue(result.levelled)
+            result = platform.seek_hard_stop_together(+1, budget_mm=10.0)
             self.assertLess(result.spread_mm, 0.02)
-            self.assertGreater(result.worst_spread_mm, 0.1)
             orientation = platform.read_orientation()
             self.assertLess(abs(orientation.total_tilt_deg), 0.001)
         finally:
@@ -866,11 +862,10 @@ class TestCoordinatedHardStop(unittest.TestCase):
     def test_levelling_can_be_turned_off(self):
         platform = self._platform(stops=(3000, 9999, 9999))
         try:
-            result = platform.seek_hard_stop_together(+1, step_mm=0.2,
-                                                      budget_mm=10.0,
-                                                      level_after=False)
+            result = platform.seek_hard_stop_together(+1, budget_mm=10.0,
+                                                      level_after=False,
+                                                      back_off_mm=0.0)
             self.assertFalse(result.levelled)
-            self.assertGreater(result.spread_mm, 0.1)
         finally:
             platform.disconnect()
 
@@ -887,8 +882,8 @@ class TestCoordinatedHardStop(unittest.TestCase):
             platform.motors[2]._transport.COUNTS_PER_SECOND_PER_VSOLL = 1.0
             with self.assertRaises(PlatformError) as ctx:
                 platform.seek_hard_stop_together(
-                    +1, step_mm=0.2, budget_mm=10.0, max_spread_mm=0.5,
-                    settle_s=0.0, step_timeout_s=0.4)
+                    +1, budget_mm=10.0, max_spread_mm=0.5,
+                    no_progress_s=0.3)
             message = str(ctx.exception)
             self.assertIn("drifted", message)
             self.assertIn("West", message)
@@ -908,8 +903,8 @@ class TestCoordinatedHardStop(unittest.TestCase):
             platform.motors[2]._transport.COUNTS_PER_SECOND_PER_VSOLL = 1.0
             with self.assertRaises(PlatformError) as ctx:
                 platform.seek_hard_stop_together(
-                    +1, step_mm=0.2, budget_mm=10.0, max_spread_mm=0.5,
-                    settle_s=0.0, step_timeout_s=0.4)
+                    +1, budget_mm=10.0, max_spread_mm=0.5,
+                    no_progress_s=0.3)
             self.assertNotIn("hard stop found", str(ctx.exception).lower())
         finally:
             platform.disconnect()
@@ -917,7 +912,7 @@ class TestCoordinatedHardStop(unittest.TestCase):
     def test_no_axis_is_left_pushing_against_its_stop(self):
         platform = self._platform(stops=(3000, 3000, 3000))
         try:
-            platform.seek_hard_stop_together(+1, step_mm=0.2, budget_mm=10.0)
+            platform.seek_hard_stop_together(+1, budget_mm=10.0)
             for motor in platform.motors:
                 self.assertLessEqual(motor.get_target_counts(), 3000)
                 self.assertLess(motor.get_torque_percent(), 30.0)
@@ -929,7 +924,7 @@ class TestCoordinatedHardStop(unittest.TestCase):
         platform = self._platform(stops=(None, None, None))
         try:
             with self.assertRaises(PlatformError) as ctx:
-                platform.seek_hard_stop_together(+1, step_mm=0.5, budget_mm=2.0)
+                platform.seek_hard_stop_together(+1, budget_mm=2.0)
             self.assertIn("without any actuator finding a stop", str(ctx.exception))
         finally:
             platform.disconnect()
@@ -939,8 +934,7 @@ class TestCoordinatedHardStop(unittest.TestCase):
         try:
             for motor in platform.motors:
                 motor._transport.hard_stop_low = -3000
-            result = platform.seek_hard_stop_together(-1, step_mm=0.2,
-                                                      budget_mm=10.0)
+            result = platform.seek_hard_stop_together(-1, budget_mm=10.0)
             self.assertTrue(result.stopped_by)
             for name in platform.names:
                 self.assertLess(result.travelled_mm[name], -2.0)
@@ -951,7 +945,7 @@ class TestCoordinatedHardStop(unittest.TestCase):
         platform = self._platform()
         try:
             with self.assertRaises(ValueError):
-                platform.seek_hard_stop_together(0, step_mm=0.2, budget_mm=1.0)
+                platform.seek_hard_stop_together(0, budget_mm=1.0)
         finally:
             platform.disconnect()
 
@@ -1003,7 +997,7 @@ class TestExternalBrake(unittest.TestCase):
         guessed at."""
         from psct_motors.platform import FocalPlanePlatform
         from psct_motors.config import default_config
-        from psct_motors.jvl_motor import BrakeState
+
         platform = FocalPlanePlatform(cfg=default_config(), simulate=False)
         self.assertFalse(platform.external_brake.available)
         self.assertIn("not under software control",

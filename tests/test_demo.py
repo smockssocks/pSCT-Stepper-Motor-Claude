@@ -336,7 +336,10 @@ class TestHaltOnFault(unittest.TestCase):
                     f"{motor.name} is still driving after the timeout",
                 )
             # C was commanded back to the stale reading, not stopped in place.
-            self.assertEqual(platform.motors[2].get_target_counts(), frozen_at)
+            # Within a few counts: the halt commands the projected position,
+            # sampled a moment after the frozen reading this test took.
+            self.assertLess(
+                abs(platform.motors[2].get_target_counts() - frozen_at), 5)
             # Crucially, it is NOT still driving to the original target.
             self.assertLess(platform.motors[2].get_target_mm(), 29.0)
             # And the drive was left enabled rather than dropped.

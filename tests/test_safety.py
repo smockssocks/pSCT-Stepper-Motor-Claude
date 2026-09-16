@@ -15,7 +15,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from psct_motors import safety  # noqa: E402
-from psct_motors.config import default_config  # noqa: E402
+
 from psct_motors.external_brake import BrakeError, SimulatedBrakeController  # noqa: E402
 from psct_motors.jvl_motor import BrakeState  # noqa: E402
 from psct_motors.platform import FocalPlanePlatform, PlatformError  # noqa: E402

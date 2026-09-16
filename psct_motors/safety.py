@@ -346,7 +346,7 @@ def drill_hard_stop_keeps_the_plate_flat() -> DrillResult:
         # One axis reaches its stop well before the others.
         platform.motors[0]._transport.hard_stop_high = (
             platform.motors[0].cfg.mm_to_counts(3.0))
-        result = platform.seek_hard_stop_together(+1, step_mm=0.2, budget_mm=10.0)
+        result = platform.seek_hard_stop_together(+1, budget_mm=10.0)
         flat = result.spread_mm < 0.05
         stopped_together = all(
             abs(result.positions_mm[name] - result.positions_mm["Top"]) < 0.05
@@ -355,7 +355,7 @@ def drill_hard_stop_keeps_the_plate_flat() -> DrillResult:
             "the hard-stop search keeps all three together",
             flat and stopped_together,
             "gave the Top actuator an end stop 3 mm out and ran the "
-            "calibration search",
+            "calibration search, all three moving together",
             f"stopped by {', '.join(result.stopped_by)}; the three ended "
             f"{result.spread_mm:.4f} mm apart (worst during the search "
             f"{result.worst_spread_mm:.4f} mm)",

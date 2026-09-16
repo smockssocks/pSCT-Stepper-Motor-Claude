@@ -943,19 +943,12 @@ def cmd_torque_profile(args) -> int:
 
 
 def cmd_find_stop(args) -> int:
-    """Run the actuators out until the travel ends, under torque supervision.
+    """Run all three actuators out together until the travel ends.
 
-    This is the site's calibration procedure. All three go together by
-    default, because taking one actuator to its stop on its own tilts the
-    focal plane about the other two ball joints.
+    Always all three. Driving one actuator into its end stop on its own tilts
+    the focal plane about the other two ball joints, and the site's experience
+    is that this can break something, so there is no option to do it.
     """
-    if not args.motor:
-        return _find_stop_together(args)
-    return _find_stop_single(args)
-
-
-def _find_stop_together(args) -> int:
-    """The normal case: all three out together, halting on the first stop."""
     platform = make_platform(args)
     try:
         platform.connect()
@@ -969,7 +962,8 @@ def _find_stop_together(args) -> int:
 
         rule("Find hard stop -- all three actuators together")
         out(f"  direction     {args.direction}  towards {towards}")
-        out(f"  step          {args.step_mm} mm, on every actuator")
+        out(f"  speed         {args.speed:.0%} of the configured velocity, "
+            f"matched in mm/s across all three")
         out(f"  give up after {args.budget_mm} mm")
         out(f"  torque limit  "
             f"{platform.cfg.actuators[0].stall_torque_percent:.0f}% of the "
@@ -980,24 +974,48 @@ def _find_stop_together(args) -> int:
         for name, mm in zip(platform.names, platform.read_actuator_positions_mm()):
             out(f"  starting at   {name:<5} {mm:+9.4f} mm")
         out("")
-        out("All three walk out together. The first one to stop halts the other")
-        out("two, which are then backed off to match it so the plate ends flat.")
+        out("All three run out together, continuously, at the same speed. The")
+        out("first one to stop halts the other two in the same instant, and they")
+        out("are then backed off to match it so the plate ends flat.")
         if not confirm("Run them into the stop?", args.yes):
             return 1
 
+        last = [0.0]
+
         def progress(step):
+            # Continuous motion produces a reading every 50 ms; printing all of
+            # them would bury the numbers that matter.
+            now = time.monotonic()
+            if now - last[0] < 0.5:
+                return
+            last[0] = now
             out("    " + "  ".join(f"{n} {mm:+9.4f}"
                                    for n, mm in step.positions_mm.items())
-                + f"   apart by {step.spread_mm:.4f} mm")
+                + f"   apart by {step.spread_mm:.4f} mm"
+                + f"   load {max(step.torque_percent.values()):.0f}%")
 
         result = platform.seek_hard_stop_together(
-            direction=direction, step_mm=args.step_mm,
-            budget_mm=args.budget_mm, progress=progress,
+            direction=direction, budget_mm=args.budget_mm,
+            speed_fraction=args.speed, progress=progress,
         )
         out("")
         rule("Result")
         for line in result.summary().splitlines():
             out("  " + line if not line.startswith(" ") else line)
+        # Remember where the travel ends. It is a fact about the machine, and
+        # once it is in the config the gauge draws it.
+        focus_mm = sum(result.stop_mm.values()) / len(result.stop_mm)
+        limits = platform.cfg.limits
+        if direction > 0:
+            limits.hard_stop_high_mm = focus_mm
+        else:
+            limits.hard_stop_low_mm = focus_mm
+        out("")
+        out(f"End of travel recorded at {focus_mm:+.4f} mm.")
+        if confirm("Save it to the configuration file?", args.yes):
+            out(f"  Saved to {platform.save()}")
+            out("  It will be drawn on the GUI's gauge from now on.")
+
         out("")
         out("Next: repeat in the other direction to learn the full travel, then")
         out("set the focus limits in the config to sit inside what you found, and")
@@ -1009,66 +1027,6 @@ def _find_stop_together(args) -> int:
         return 1
     finally:
         platform.disconnect()
-
-
-def _find_stop_single(args) -> int:
-    """One actuator alone. Tilts the plate, so it has to be asked for."""
-    from .demo import build_motor
-
-    motor = build_motor(args.config, args.motor, args.simulate)
-    try:
-        motor.connect(verify_word_order=False)
-    except (ModbusError, MotorFault) as exc:
-        out(f"Could not connect to motor {args.motor}: {exc}")
-        return 1
-    try:
-        scale = motor.cfg.resolved_counts_per_mm
-        step_counts = max(1, int(round(args.step_mm * scale)))
-        budget_counts = max(step_counts, int(round(args.budget_mm * scale)))
-        direction = 1 if args.direction == "+" else -1
-        towards = "M1 (primary)" if direction > 0 else "M2 (secondary)"
-
-        rule(f"Find hard stop -- {motor.name}")
-        out(f"  direction     {args.direction}  towards {towards}")
-        out(f"  step          {args.step_mm} mm  ({step_counts} counts)")
-        out(f"  give up after {args.budget_mm} mm  ({budget_counts} counts)")
-        out(f"  torque limit  {motor.cfg.stall_torque_percent:.0f}% of the "
-            f"drive's current limit, over "
-            f"{motor.cfg.stall_persist_samples} consecutive readings")
-        out(f"  starting at   {motor.get_position_counts()} counts")
-        out("")
-        out("This moves ONE actuator while the other two stay put, which tilts")
-        out("the focal plane about their ball joints -- the site's guidance is")
-        out("that all three should move together, which is what this command")
-        out("does when you leave --motor off. When it stops, the command is")
-        out("backed off so it is not left pressed against the end.")
-        if not confirm(f"Drive {motor.name} alone into the stop, tilting the "
-                       f"plane?", args.yes):
-            return 1
-
-        def progress(counts, torque):
-            out(f"    {counts:>12} counts   peak torque {torque:5.1f}%")
-
-        stop_counts = motor.seek_hard_stop(
-            direction=direction, step_counts=step_counts,
-            max_counts=budget_counts, progress=progress,
-        )
-        out("")
-        rule("Result")
-        out(f"  hard stop at {stop_counts} counts "
-            f"({motor.cfg.counts_to_mm(stop_counts):+.4f} mm on the current zero)")
-        out(f"  peak torque  {motor.peak_torque_percent or 0.0:.1f}%")
-        out("")
-        out("Next: repeat in the other direction to learn the full travel, then")
-        out("set the soft limits in the config to sit inside what you found, and")
-        out("`set-zero` wherever you want the reference to be.")
-        return 0
-    except MotorFault as exc:
-        out("")
-        out(f"Search stopped: {exc}")
-        return 1
-    finally:
-        motor.disconnect()
 
 
 def cmd_motor_report(args) -> int:
@@ -1513,20 +1471,17 @@ one motor on a bench
         description=(
             "The site's calibration procedure -- run the actuators out until "
             "they stop -- with torque watched so they stop when something "
-            "resists rather than continuing to push. All three move together "
-            "unless you name one with --motor, because taking a single "
-            "actuator to its stop tilts the focal plane about the other two "
-            "ball joints."
+            "resists rather than continuing to push. All three move together, "
+            "continuously and at a matched speed; there is no way to do it "
+            "with one, because taking a single actuator to its stop tilts the "
+            "focal plane about the other two ball joints."
         ),
     )
-    p.add_argument("--motor", default=None,
-                   help="drive ONE actuator alone, tilting the plane (omit "
-                        "this to move all three together, which is what the "
-                        "calibration procedure wants)")
     p.add_argument("--direction", choices=["+", "-"], default="+",
                    help="+ towards M1 (primary), - towards M2 (secondary)")
-    p.add_argument("--step-mm", type=float, default=0.2,
-                   help="how far to move between torque checks (default 0.2)")
+    p.add_argument("--speed", type=float, default=0.25,
+                   help="fraction of each actuator's configured velocity to "
+                        "use, matched in mm/s across all three (default 0.25)")
     p.add_argument("--budget-mm", type=float, default=30.0,
                    help="give up after this much travel (default 30)")
     p.set_defaults(func=cmd_find_stop)

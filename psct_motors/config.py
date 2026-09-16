@@ -378,6 +378,18 @@ class PlatformLimits:
     max_step_mm: float = 10.0
     max_tilt_step_deg: float = 0.5
 
+    #: Where `find-stop` actually found the ends of travel, in focus mm.
+    #:
+    #: None until the calibration has been run. Once set, they are drawn on the
+    #: gauge as solid lines beyond the dashed soft limits, so the operator can
+    #: see how much room is left before the mechanism stops -- which is the
+    #: thing you most want to know while nudging focus near the end.
+    #:
+    #: Written by `find-stop`; nothing else changes them, because a hard stop
+    #: is a physical fact about the machine and not a preference.
+    hard_stop_low_mm: Optional[float] = None
+    hard_stop_high_mm: Optional[float] = None
+
     #: How far the three actuators may drift apart during a coordinated
     #: hard-stop search, in millimetres, before it is abandoned.
     #:

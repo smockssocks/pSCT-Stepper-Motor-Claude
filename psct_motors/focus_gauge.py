@@ -41,6 +41,10 @@ COLOR_TARGET = "#c77700"
 COLOR_TEXT = "#222222"
 COLOR_MUTED = "#777777"
 COLOR_BAND = "#cfe0f2"
+#: The hard stops are drawn in the same red as the STOP controls, solid rather
+#: than dashed: a soft limit is a setting and can be changed, an end stop is
+#: the machine and cannot.
+COLOR_HARD_STOP = "#b3231f"
 
 
 class FocusGauge(tk.Canvas):
@@ -52,6 +56,12 @@ class FocusGauge(tk.Canvas):
                          highlightthickness=0, bg="white", **kw)
         self.min_mm = float(min_mm)
         self.max_mm = float(max_mm)
+        #: Where the mechanism actually stops, once `find-stop` has found it.
+        #: Drawn solid, outside the dashed soft limits, because the distance
+        #: between the two is the margin you have left -- and that is the thing
+        #: worth seeing while nudging focus near the end of travel.
+        self.hard_stop_low_mm: Optional[float] = None
+        self.hard_stop_high_mm: Optional[float] = None
         self._position_mm: Optional[float] = None
         self._target_mm: Optional[float] = None
         self._valid = False
@@ -60,8 +70,12 @@ class FocusGauge(tk.Canvas):
 
     # ------------------------------------------------------------------ api
 
-    def set_limits(self, min_mm: float, max_mm: float) -> None:
+    def set_limits(self, min_mm: float, max_mm: float,
+                   hard_stop_low_mm: Optional[float] = None,
+                   hard_stop_high_mm: Optional[float] = None) -> None:
         self.min_mm, self.max_mm = float(min_mm), float(max_mm)
+        self.hard_stop_low_mm = hard_stop_low_mm
+        self.hard_stop_high_mm = hard_stop_high_mm
         self._redraw()
 
     def update_position(self, position_mm: Optional[float],
@@ -82,12 +96,32 @@ class FocusGauge(tk.Canvas):
         centre_x = width * 0.42
         return width, height, top, bottom, centre_x
 
+    def drawn_range(self):
+        """The millimetre range the track covers.
+
+        The soft limits, widened to take in the hard stops when they are
+        known. Without this a stop found beyond the soft limit -- which is
+        where stops always are -- would be drawn clamped onto the end of the
+        track, exactly on top of the limit it is supposed to sit outside.
+        """
+        low, high = self.min_mm, self.max_mm
+        for stop in (self.hard_stop_low_mm, self.hard_stop_high_mm):
+            if stop is None:
+                continue
+            low = min(low, stop)
+            high = max(high, stop)
+        if (low, high) != (self.min_mm, self.max_mm):
+            margin = (high - low) * 0.04
+            low, high = low - margin, high + margin
+        return low, high
+
     def _y_for(self, mm: float, top: float, bottom: float) -> float:
         """Millimetres to a y coordinate. Positive is up, as the label says."""
-        span = self.max_mm - self.min_mm
+        low, high = self.drawn_range()
+        span = high - low
         if span <= 0:
             return (top + bottom) / 2.0
-        fraction = (mm - self.min_mm) / span
+        fraction = (mm - low) / span
         fraction = min(1.0, max(0.0, fraction))
         return bottom - fraction * (bottom - top)
 
@@ -140,6 +174,17 @@ class FocusGauge(tk.Canvas):
             self.create_line(cx - track_half - 4, y, cx + track_half + 4, y,
                              fill=COLOR_LIMIT, width=2, dash=(3, 2))
 
+        # --- hard stops, where the mechanism physically ends -----------------
+        for stop in (self.hard_stop_low_mm, self.hard_stop_high_mm):
+            if stop is None:
+                continue
+            y = self._y_for(stop, top, bottom)
+            self.create_line(cx - track_half - 10, y, cx + track_half + 10, y,
+                             fill=COLOR_HARD_STOP, width=3)
+            self.create_text(cx, y + (7 if stop < 0 else -7),
+                             text="END OF TRAVEL", fill=COLOR_HARD_STOP,
+                             font=("TkDefaultFont", 7, "bold"))
+
         # --- target, drawn only when it differs from where we are -----------
         if (self._valid and self._target_mm is not None
                 and self._position_mm is not None
@@ -183,20 +228,20 @@ class FocusGauge(tk.Canvas):
 
     def _tick_values(self):
         """Round tick positions across the range, including zero."""
-        span = self.max_mm - self.min_mm
+        low, high = self.drawn_range()
+        span = high - low
         if span <= 0:
             return [0.0]
         for step in (1, 2, 5, 10, 20, 25, 50, 100):
             if span / step <= 10:
                 break
         values = []
-        first = int(self.min_mm // step) * step
-        value = first
-        while value <= self.max_mm + 1e-9:
-            if value >= self.min_mm - 1e-9:
+        value = int(low // step) * step
+        while value <= high + 1e-9:
+            if value >= low - 1e-9:
                 values.append(float(value))
             value += step
-        if not any(abs(v) < 1e-9 for v in values) and self.min_mm <= 0 <= self.max_mm:
+        if not any(abs(v) < 1e-9 for v in values) and low <= 0 <= high:
             values.append(0.0)
         return sorted(values)
 

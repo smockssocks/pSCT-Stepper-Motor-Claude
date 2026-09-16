@@ -88,7 +88,10 @@ drives.
   sizes down to 1 µm.
 - A **distance-from-zero gauge** down the right: 0 in the middle, + towards M1
   above, − towards M2 below, travel limits marked, target shown while moving.
-- Per-actuator position, mode, brake lamp and jog.
+- Per-actuator position, mode, brake lamp and jog, with a **key underneath**
+  spelling out what every lamp and colour means. The brake lamps are blue for
+  HOLDING and amber for FREE, deliberately not green/red: a released brake is
+  not "good", it means the camera is hanging on the drives.
 - A timestamped log of everything the application did.
 
 Behind the menus, so the main window stays about the job:
@@ -132,12 +135,18 @@ python -m psct_motors.cli find-stop                    # all three, together
 python -m psct_motors.cli find-stop --direction -      # the other way
 ```
 
-All three go out **together**, in small steps, with each motor's torque watched
-after every step. The first axis to reach its stop halts the other two in the
-same poll, and they are then backed off to match it so the plate ends flat.
-Running a single actuator into its stop tilts the focal plane about the other
-two ball joints, so it takes an explicit `--motor Top` and warns before it does
-anything.
+All three run out **together and continuously**, at a speed matched in
+millimetres per second so the plate stays flat the whole way. Torque and
+progress are watched throughout; the first axis to reach its stop halts the
+other two in the same instant, they are backed off to match it, and then all
+three retreat half a millimetre so nothing is left resting on the stop.
+
+There is no way to do this with one actuator. Driving one into its end stop
+tilts the focal plane about the other two ball joints.
+
+Where it finds the end is recorded in the configuration and **drawn on the
+gauge** as a solid red line outside the dashed soft limits, so you can see how
+much room is left.
 
 ### Command line
 

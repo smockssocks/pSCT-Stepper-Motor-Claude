@@ -150,6 +150,11 @@ class HardStopResult:
     worst_spread_mm: float
     peak_torque_percent: Dict[str, float]
     levelled: bool = False
+    #: Where each actuator was when the travel ended -- which is not where it
+    #: is now, because the search backs off afterwards rather than leaving the
+    #: mechanism resting on its stop.
+    stop_mm: Dict[str, float] = field(default_factory=dict)
+    backed_off_mm: float = 0.0
 
     def summary(self) -> str:
         towards = "M1 (primary)" if self.direction > 0 else "M2 (secondary)"
@@ -172,6 +177,12 @@ class HardStopResult:
         if self.levelled:
             lines.append("  The other actuators were backed off to match the one "
                          "that stopped, so the plate is flat again.")
+        if self.backed_off_mm:
+            lines.append(f"  Then all three retreated {self.backed_off_mm:.3f} mm "
+                         f"from the stop, so nothing is left resting on it.")
+        if self.stop_mm:
+            ends = ", ".join(f"{n} {v:+.4f}" for n, v in self.stop_mm.items())
+            lines.append(f"  The travel ends at: {ends} mm")
         return "\n".join(lines)
 
     def as_dict(self) -> dict:
@@ -187,6 +198,8 @@ class HardStopResult:
             "worst_spread_mm": self.worst_spread_mm,
             "peak_torque_percent": dict(self.peak_torque_percent),
             "levelled": self.levelled,
+            "stop_mm": dict(self.stop_mm),
+            "backed_off_mm": self.backed_off_mm,
         }
 
 
@@ -840,47 +853,49 @@ class FocalPlanePlatform:
     def seek_hard_stop_together(
         self,
         direction: int,
-        step_mm: float = 0.2,
         budget_mm: float = 30.0,
         max_spread_mm: Optional[float] = None,
-        settle_s: float = 0.4,
-        step_timeout_s: float = 5.0,
+        speed_fraction: float = 0.25,
+        no_progress_s: float = 0.6,
+        no_progress_mm: float = 0.003,
+        poll_s: float = 0.05,
         level_after: bool = True,
+        back_off_mm: float = 0.5,
         progress: Optional[Callable[["HardStopProgress"], None]] = None,
     ) -> "HardStopResult":
         """Run all three actuators out together until the travel ends.
 
         This is the site's calibration procedure -- drive to the end and let it
-        stop -- done to all three axes at once, which is the only safe way to
-        do it. Sending one actuator to its end stop on its own tilts the focal
-        plane about the other two ball joints, and the site's own experience is
-        that this can break something.
+        stop. It is done to all three at once because that is the only safe way:
+        sending one actuator to its end stop on its own tilts the focal plane
+        about the other two ball joints, and the site's experience is that this
+        can break something. There is deliberately no way to ask this for a
+        single axis.
 
-        So the three are walked out in lockstep, in millimetres rather than
-        counts, so they cover the same distance even if their calibrations
-        differ. After every step three things are checked:
+        The three move **continuously and together**, not in steps. One target
+        is written to each -- the same distance in millimetres -- at a speed
+        scaled so they all travel at the same millimetres per second even if
+        their calibrations differ. They then run smoothly to the end while this
+        watches, every `poll_s`:
 
-        * torque on each axis, which climbs when something starts to resist;
-        * whether each shaft actually moved, because at a stop it will not;
+        * torque on each axis, which climbs when something resists;
+        * whether each axis is still making progress, because at a stop it
+          is not;
         * how far apart the three have drifted, because divergence *is* tilt.
 
-        The first axis to reach its stop ends the search for all three: every
-        motor is immediately commanded to hold where it is, so no axis keeps
-        pushing and no axis keeps travelling past the others. The two that did
-        not stop are then backed off to match the one that did (`level_after`),
-        because the step in which the first axis stopped left them up to one
-        step ahead of it -- which is a tilt, and the whole point is to not
-        leave one in the plate.
+        The first axis to stop ends the run for all three: every motor is
+        commanded to hold where it is, in the same poll, so no axis keeps
+        pushing and none keeps travelling past the others. The two that did not
+        stop are then backed off to match the one that did (`level_after`),
+        because they carry on for a fraction of a second before the halt lands
+        and that difference is a tilt.
 
         `direction` is +1 or -1: + drives the camera towards M1, - towards M2.
-        Returns a HardStopResult describing where the plate ended up. Raises
-        PlatformError if the axes diverge past `max_spread_mm`, or if the
-        budget is exhausted without finding a stop.
+        Raises PlatformError if the axes diverge past `max_spread_mm`, or if
+        the budget is used up without anything stopping.
         """
         if direction not in (1, -1):
             raise ValueError(f"direction must be +1 or -1, got {direction}")
-        if step_mm <= 0:
-            raise ValueError("step_mm must be positive")
         if budget_mm <= 0:
             raise ValueError("budget_mm must be positive")
 
@@ -898,61 +913,88 @@ class FocalPlanePlatform:
         for motor in self.motors:
             motor.peak_torque_percent = None
 
-        travelled_mm = 0.0
         worst_spread = 0.0
         stopped_by: List[str] = []
         reasons: Dict[str, str] = {}
 
         try:
-            # Deliberately slow. Meeting a mechanical stop at speed is how a
-            # lead screw gets damaged, and a slow approach makes the torque
-            # rise easy to tell apart from an acceleration transient.
-            for motor in self.motors:
-                motor.set_velocity(max(1, original_velocity[motor.name] // 4))
+            self._set_synchronised_seek_speed(original_velocity, speed_fraction)
 
-            while travelled_mm < budget_mm:
+            # One target each, the same distance, written as close together as
+            # three Modbus writes allow. From here they simply run.
+            for motor in self.motors:
+                target = start_mm[motor.name] + direction * budget_mm
+                motor.command_position_counts(motor.cfg.mm_to_counts(target))
+
+            last_movement = {m.name: time.monotonic() for m in self.motors}
+            last_position = dict(start_mm)
+            deadline = time.monotonic() + self._seek_timeout_s(budget_mm)
+
+            while True:
                 if self._abort.is_set():
                     self._settle_all_where_they_are()
                     raise PlatformError(
                         "Hard-stop search stopped by the operator. All three "
                         "actuators are holding where they were halted."
                     )
+                if time.monotonic() > deadline:
+                    self._settle_all_where_they_are()
+                    raise PlatformError(
+                        f"Hard-stop search gave up after "
+                        f"{self._seek_timeout_s(budget_mm):.0f} s without any "
+                        "actuator reaching a stop. All three are holding where "
+                        "they are. Either the axes are moving far slower than "
+                        "their configured velocity, or something is not moving "
+                        "at all."
+                    )
 
-                before = {m.name: m.get_position_mm() for m in self.motors}
+                now = time.monotonic()
+                here = {m.name: m.get_position_mm() for m in self.motors}
+
                 for motor in self.motors:
-                    target = before[motor.name] + direction * step_mm
-                    motor.command_position_counts(motor.cfg.mm_to_counts(target))
+                    name = motor.name
+                    # --- torque ---
+                    torque = motor.check_stall()
+                    if torque is not None and name not in reasons:
+                        stopped_by.append(name)
+                        reasons[name] = f"torque reached {torque:.0f}%"
+                        continue
+                    # --- a drive fault ---
+                    errors = motor.get_errors()
+                    if errors and name not in reasons:
+                        stopped_by.append(name)
+                        reasons[name] = f"drive faulted: {motor.error_text()}"
+                        continue
+                    # --- progress ---
+                    if abs(here[name] - last_position[name]) >= no_progress_mm:
+                        last_position[name] = here[name]
+                        last_movement[name] = now
+                    elif (now - last_movement[name] > no_progress_s
+                            and name not in reasons):
+                        travelled_so_far = abs(here[name] - start_mm[name])
+                        if travelled_so_far < budget_mm - 0.05:
+                            stopped_by.append(name)
+                            reasons[name] = (
+                                f"stopped moving {no_progress_s:.1f} s after "
+                                f"{travelled_so_far:.3f} mm, with "
+                                f"{budget_mm - travelled_so_far:.3f} mm still "
+                                f"commanded")
 
-                stopped_by, reasons = self._wait_out_hard_stop_step(
-                    settle_s + step_timeout_s)
-
-                after = {m.name: m.get_position_mm() for m in self.motors}
-                moved = {name: abs(after[name] - before[name]) for name in after}
-
-                # An axis that was told to move and barely did has reached its
-                # stop, whether or not the torque reading noticed.
-                for motor in self.motors:
-                    if (motor.name not in reasons
-                            and moved[motor.name] < step_mm * 0.25):
-                        stopped_by.append(motor.name)
-                        reasons[motor.name] = (
-                            f"commanded {step_mm:.3f} mm, moved "
-                            f"{moved[motor.name]:.4f} mm")
-
-                travelled = {name: after[name] - start_mm[name] for name in after}
+                travelled = {n: here[n] - start_mm[n] for n in here}
                 spread = max(travelled.values()) - min(travelled.values())
                 worst_spread = max(worst_spread, spread)
 
                 if progress is not None:
                     progress(HardStopProgress(
-                        positions_mm=dict(after),
+                        positions_mm=dict(here),
                         travelled_mm=max(abs(v) for v in travelled.values()),
                         spread_mm=spread,
-                        torque_percent={m.name: (m.peak_torque_percent or 0.0)
+                        torque_percent={m.name: (m.get_torque_percent() or 0.0)
                                         for m in self.motors},
                     ))
 
                 if stopped_by:
+                    # In this same poll, before anything else moves further.
                     self._settle_all_where_they_are()
                     break
 
@@ -970,16 +1012,18 @@ class FocalPlanePlatform:
                         f"wrong counts_per_mm before trying again."
                     )
 
-                travelled_mm = max(abs(v) for v in travelled.values())
-            else:
-                self._settle_all_where_they_are()
-                raise PlatformError(
-                    f"Travelled {travelled_mm:.2f} mm without any actuator "
-                    f"finding a stop, and gave up at the {budget_mm:.1f} mm "
-                    "budget. Either the travel is longer than expected, or the "
-                    "stall torque threshold is too high for the end stop to "
-                    "register. All three actuators are holding where they are."
-                )
+                if all(abs(travelled[m.name]) >= budget_mm - 0.05
+                       for m in self.motors):
+                    self._settle_all_where_they_are()
+                    raise PlatformError(
+                        f"Travelled the whole {budget_mm:.1f} mm budget without "
+                        "any actuator finding a stop. Either the travel is "
+                        "longer than expected, or the stall threshold is too "
+                        "high for the end stop to register. All three actuators "
+                        "are holding where they are."
+                    )
+
+                time.sleep(poll_s)
         finally:
             for motor in self.motors:
                 try:
@@ -987,7 +1031,9 @@ class FocalPlanePlatform:
                 except (ModbusError, MotorFault):
                     pass
 
+        stop_mm = {m.name: m.get_position_mm() for m in self.motors}
         levelled = self._level_after_stop(start_mm, direction) if level_after else False
+        backed_off = self._back_off_from_stop(direction, back_off_mm)
 
         end_mm = {m.name: m.get_position_mm() for m in self.motors}
         travelled = {name: end_mm[name] - start_mm[name] for name in end_mm}
@@ -1004,9 +1050,68 @@ class FocalPlanePlatform:
             peak_torque_percent={m.name: (m.peak_torque_percent or 0.0)
                                  for m in self.motors},
             levelled=levelled,
+            stop_mm=stop_mm,
+            backed_off_mm=backed_off,
         )
         self._log(result.summary())
         return result
+
+    def _back_off_from_stop(self, direction: int, back_off_mm: float) -> float:
+        """Retreat a little from the end of travel.
+
+        Leaving the mechanism resting against its stop is how a lead screw
+        gets damaged over time, and it also leaves the focal plane parked
+        outside the soft limits, so the next ordinary move is refused. Backing
+        off is always a move away from the stop, so it cannot press anything
+        harder.
+        """
+        if back_off_mm <= 0:
+            return 0.0
+        targets = {}
+        for motor in self.motors:
+            targets[motor.name] = motor.get_position_mm() - direction * back_off_mm
+        self._log(f"Backing off {back_off_mm:.3f} mm from the stop.")
+        for motor in self.motors:
+            motor.command_position_mm(targets[motor.name])
+        deadline = time.monotonic() + max(m.cfg.move_timeout_s for m in self.motors)
+        while time.monotonic() < deadline:
+            if all(m.is_in_position() for m in self.motors):
+                return back_off_mm
+            if self._abort.is_set():
+                break
+            time.sleep(0.05)
+        self._log("The retreat from the stop did not complete; the actuators may "
+                  "still be resting against it.")
+        return 0.0
+
+    def _set_synchronised_seek_speed(self, original: Dict[str, int],
+                                     fraction: float) -> None:
+        """Set a slow speed that is the same in millimetres per second.
+
+        Equal raw velocity only means equal speed when the actuators have the
+        same counts per millimetre. Scaling by that ratio is what keeps them
+        together in the units that matter -- and staying together is the whole
+        point of running all three at once.
+
+        Deliberately slow. Meeting a mechanical stop at speed is how a lead
+        screw gets damaged, and a slow approach makes the torque rise easy to
+        tell apart from an acceleration transient.
+        """
+        reference = max(m.cfg.resolved_counts_per_mm for m in self.motors)
+        for motor in self.motors:
+            scale = motor.cfg.resolved_counts_per_mm / reference
+            raw = int(round(original[motor.name] * fraction * scale))
+            motor.set_velocity(max(self.cfg.min_velocity_raw, raw))
+
+    def _seek_timeout_s(self, budget_mm: float) -> float:
+        """How long the whole run may take before it is abandoned.
+
+        Generous: this is a backstop against a poll loop that would otherwise
+        run for ever, not a performance target. The real endings are a stop
+        being found, the budget being covered, or the axes diverging.
+        """
+        return max(m.cfg.move_timeout_s for m in self.motors) + budget_mm * 20.0
+
 
     def _level_after_stop(self, start_mm: Dict[str, float], direction: int) -> bool:
         """Bring the axes that did not stop back to match the one that did.
