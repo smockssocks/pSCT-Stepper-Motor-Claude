@@ -451,6 +451,19 @@ class PlatformConfig:
     min_velocity_raw: int = 20
 
     #: Seconds between live status polls.
+    #: How fast a *simulated* actuator travels at its configured full
+    #: velocity, in millimetres per second.
+    #:
+    #: Only affects `--simulate` and the stood-in axes of `--bench`; it cannot
+    #: change what a real motor does. It exists because the simulated speed has
+    #: to be chosen by somebody: the motor's V_SOLL is in the drive's own
+    #: units, and how many millimetres per second those come to on this
+    #: mechanism has not been measured. Two millimetres per second is slow
+    #: enough to watch the gauge and the load bars move, which is the point of
+    #: rehearsing. Raise it to shorten a long rehearsal, lower it to watch
+    #: something closely.
+    simulated_speed_mm_per_s: float = 2.0
+
     poll_interval_s: float = 0.5
     #: Modbus socket timeout, seconds.
     modbus_timeout_s: float = 2.0
@@ -486,6 +499,8 @@ class PlatformConfig:
         self.external_brake.validate()
         if self.min_velocity_raw < 1:
             raise ValueError("min_velocity_raw must be >= 1")
+        if self.simulated_speed_mm_per_s <= 0:
+            raise ValueError("simulated_speed_mm_per_s must be positive")
         if self.poll_interval_s <= 0:
             raise ValueError("poll_interval_s must be positive")
 

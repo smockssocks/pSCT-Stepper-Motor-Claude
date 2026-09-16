@@ -217,6 +217,19 @@ python -m psct_motors.cli --simulate gui
 Nothing can touch hardware with that flag set, so it is the place to learn the
 window, rehearse a procedure, or show someone what a fault looks like.
 
+**How fast it moves is a setting**, because it has to be chosen by somebody:
+the drive's own velocity units have never been measured against millimetres on
+this mechanism. A simulated actuator runs at `simulated_speed_mm_per_s` (2 mm/s)
+at full velocity, which is slow enough to watch the gauge and the load bars
+move. Change it in the configuration, or for one run:
+
+```
+python -m psct_motors.cli --simulate --sim-speed 0.5 gui    # slow, to watch closely
+python -m psct_motors.cli --simulate --sim-speed 20 gui     # quick, to get through it
+```
+
+It only affects simulated axes. It cannot change what a real motor does.
+
 Worth trying:
 
 - **View → Focal plane picture** — the plate on its three actuators. The dashed

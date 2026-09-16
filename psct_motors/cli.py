@@ -71,6 +71,8 @@ def ask_float(prompt: str) -> Optional[float]:
 def make_platform(args) -> FocalPlanePlatform:
     cfg = load_config(args.config)
     apply_bench(cfg, getattr(args, "bench", None))
+    if getattr(args, "sim_speed", None):
+        cfg.simulated_speed_mm_per_s = args.sim_speed
     platform = FocalPlanePlatform(cfg=cfg, simulate=args.simulate, logger=out,
                                   config_path=args.config)
     if platform.is_mixed:
@@ -1251,7 +1253,7 @@ def cmd_show_log(args) -> int:
 def cmd_gui(args) -> int:
     from .gui import main as gui_main
     return gui_main(config_path=args.config, simulate=args.simulate,
-                    bench=args.bench)
+                    bench=args.bench, sim_speed=args.sim_speed)
 
 
 def cmd_server(args) -> int:
@@ -1283,6 +1285,9 @@ def _add_global_args(p: argparse.ArgumentParser,
                    help="bench mode: MOTOR is real, the other two are "
                         "simulated. Lets the whole three-axis application be "
                         "exercised against the one motor you have.")
+    p.add_argument("--sim-speed", type=float, metavar="MM_PER_S", **extra,
+                   help="how fast a simulated actuator runs at full velocity, "
+                        "in mm/s (default 2). Only affects simulated axes.")
 
 
 def build_parser() -> argparse.ArgumentParser:

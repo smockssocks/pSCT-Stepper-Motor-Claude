@@ -395,7 +395,8 @@ class SimulatedJVLTransport:
 SIM_FULL_SPEED_MM_PER_S = 6.0
 
 
-def velocity_raw_for_mm_per_s(cfg: ActuatorConfig, mm_per_s: float) -> int:
+def velocity_raw_for_mm_per_s(cfg: ActuatorConfig, mm_per_s: float,
+                              full_speed_mm_per_s: Optional[float] = None) -> int:
     """The raw V_SOLL that makes a simulated actuator run at `mm_per_s`.
 
     A simulated motor's speed is fixed at construction as counts per second
@@ -406,12 +407,14 @@ def velocity_raw_for_mm_per_s(cfg: ActuatorConfig, mm_per_s: float) -> int:
     guessing a raw number, because the raw number means different things on
     differently-scaled actuators.
     """
-    if cfg.velocity_raw <= 0 or SIM_FULL_SPEED_MM_PER_S <= 0:
+    full = full_speed_mm_per_s or SIM_FULL_SPEED_MM_PER_S
+    if cfg.velocity_raw <= 0 or full <= 0:
         return 1
-    return max(1, int(round(cfg.velocity_raw * mm_per_s / SIM_FULL_SPEED_MM_PER_S)))
+    return max(1, int(round(cfg.velocity_raw * mm_per_s / full)))
 
 
 def simulated_motor(cfg: ActuatorConfig, start_mm: Optional[float] = None,
+                    full_speed_mm_per_s: Optional[float] = None,
                     **kwargs) -> JVLMotor:
     """A JVLMotor backed by a simulated transport, positioned at `start_mm`."""
     start_counts = cfg.mm_to_counts(start_mm) if start_mm is not None else cfg.zero_counts
@@ -419,9 +422,9 @@ def simulated_motor(cfg: ActuatorConfig, start_mm: Optional[float] = None,
     if "counts_per_second_per_vsoll" not in kwargs and cfg.velocity_raw > 0:
         # Make the simulated speed mean something in millimetres per second,
         # whatever counts_per_mm happens to be.
+        full = full_speed_mm_per_s or SIM_FULL_SPEED_MM_PER_S
         kwargs["counts_per_second_per_vsoll"] = (
-            SIM_FULL_SPEED_MM_PER_S * cfg.resolved_counts_per_mm
-            / float(cfg.velocity_raw)
+            full * cfg.resolved_counts_per_mm / float(cfg.velocity_raw)
         )
     transport = SimulatedJVLTransport(
         name=cfg.name,

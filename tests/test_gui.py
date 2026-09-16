@@ -61,6 +61,9 @@ def gui_config(velocity_raw=8000):
                                 max_tilt_deg=1.0, max_step_mm=25.0,
                                 max_tilt_step_deg=1.0)
     cfg.poll_interval_s = 0.1
+    # Faster than the default: these tests are not watching the motion, and at
+    # 2 mm/s each one would spend most of its time waiting.
+    cfg.simulated_speed_mm_per_s = 30.0
     cfg.validate()
     return cfg
 

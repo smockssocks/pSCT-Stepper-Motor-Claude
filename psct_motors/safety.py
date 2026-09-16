@@ -94,6 +94,10 @@ def bench_config() -> PlatformConfig:
     cfg.limits.min_focus_mm = -24.0
     cfg.limits.max_focus_mm = 24.0
     cfg.poll_interval_s = 0.1
+    # Deliberately much faster than the default. A drill is watched by a test
+    # runner, not by a person, and at the default 2 mm/s a single run to the
+    # end of travel would take the best part of a minute.
+    cfg.simulated_speed_mm_per_s = 30.0
     cfg.validate()
     return cfg
 

@@ -302,7 +302,8 @@ class MotorRow:
 
 class MotorApp:
     def __init__(self, root: tk.Tk, config_path: Optional[str] = None,
-                 simulate: bool = False, bench: Optional[str] = None):
+                 simulate: bool = False, bench: Optional[str] = None,
+                 sim_speed: Optional[float] = None):
         self.root = root
         self.simulate = simulate
         self.bench = bench
@@ -312,6 +313,8 @@ class MotorApp:
         if bench:
             from .cli import apply_bench
             apply_bench(self.cfg, bench)
+        if sim_speed:
+            self.cfg.simulated_speed_mm_per_s = sim_speed
         self.platform = FocalPlanePlatform(
             cfg=self.cfg, simulate=simulate, logger=self.log_threadsafe,
             config_path=config_path,
@@ -330,6 +333,11 @@ class MotorApp:
         self.log(f"Configuration: {config_path or default_config_path()}")
         if simulate:
             self.log("SIMULATION MODE -- no hardware is being touched.")
+            self.log(f"Simulated actuators run at "
+                     f"{self.cfg.simulated_speed_mm_per_s:g} mm/s at full "
+                     f"velocity. Change simulated_speed_mm_per_s in the "
+                     f"configuration, or pass --sim-speed, to slow it down or "
+                     f"speed it up.")
         elif self.platform.is_mixed:
             self.log("BENCH MODE: "
                      + ", ".join(self.platform.simulated_names)
@@ -1973,9 +1981,10 @@ class MotorApp:
 
 
 def main(config_path: Optional[str] = None, simulate: bool = False,
-         bench: Optional[str] = None) -> int:
+         bench: Optional[str] = None, sim_speed: Optional[float] = None) -> int:
     root = tk.Tk()
-    MotorApp(root, config_path=config_path, simulate=simulate, bench=bench)
+    MotorApp(root, config_path=config_path, simulate=simulate, bench=bench,
+             sim_speed=sim_speed)
     root.mainloop()
     return 0
 

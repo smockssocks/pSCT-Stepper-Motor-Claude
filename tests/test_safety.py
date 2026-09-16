@@ -482,6 +482,62 @@ class TestTheFoundStopBecomesTheLimit(unittest.TestCase):
         self.assertEqual(len(set(found)), 1, f"the end of travel moved: {found}")
 
 
+class TestSimulatedSpeed(unittest.TestCase):
+    """How fast a stand-in axis moves is a choice, so it is a setting.
+
+    Reported as "in the simulated, it moves really fast": the speed was a
+    module constant picked to keep the test suite quick, which made a
+    rehearsal finish before anybody could watch it.
+    """
+
+    def test_the_default_is_slow_enough_to_watch(self):
+        from psct_motors.config import default_config
+        cfg = default_config()
+        # A 1 mm nudge should take a noticeable fraction of a second, not be
+        # over before the gauge redraws.
+        self.assertLessEqual(cfg.simulated_speed_mm_per_s, 3.0)
+        self.assertGreater(cfg.simulated_speed_mm_per_s, 0.0)
+
+    def test_the_setting_actually_changes_the_speed(self):
+        from psct_motors.config import default_config
+        speeds = {}
+        for requested in (1.0, 8.0):
+            cfg = default_config()
+            cfg.simulated_speed_mm_per_s = requested
+            platform = FocalPlanePlatform(cfg=cfg, simulate=True)
+            actuator = cfg.actuators[0]
+            transport = platform.motors[0]._transport
+            speeds[requested] = (
+                actuator.velocity_raw * transport.COUNTS_PER_SECOND_PER_VSOLL
+                / actuator.resolved_counts_per_mm
+            )
+        for requested, actual in speeds.items():
+            self.assertAlmostEqual(actual, requested, places=3)
+
+    def test_a_non_positive_speed_is_refused(self):
+        from psct_motors.config import default_config
+        cfg = default_config()
+        cfg.simulated_speed_mm_per_s = 0.0
+        with self.assertRaises(ValueError):
+            cfg.validate()
+
+    def test_a_move_takes_about_as_long_as_the_speed_says(self):
+        from psct_motors.kinematics import Orientation
+        cfg = safety.bench_config()
+        cfg.simulated_speed_mm_per_s = 10.0
+        platform = FocalPlanePlatform(cfg=cfg, simulate=True)
+        platform.connect()
+        self.addCleanup(platform.disconnect)
+        platform.move_to_orientation(Orientation(0.0, 0.0, 0.0))
+
+        started = time.monotonic()
+        platform.move_to_orientation(Orientation(5.0, 0.0, 0.0))
+        elapsed = time.monotonic() - started
+        # 5 mm at 10 mm/s is half a second, plus the settle poll.
+        self.assertGreater(elapsed, 0.3)
+        self.assertLess(elapsed, 3.0)
+
+
 class TestSafetyDrills(unittest.TestCase):
     def test_every_drill_passes(self):
         report = safety.run_all()

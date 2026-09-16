@@ -288,6 +288,10 @@ class FocalPlanePlatform:
         low_stop, high_stop = self._simulated_stops()
         return simulated_motor(
             a, start_mm=mid,
+            # What "full speed" means for a stand-in axis. Chosen by a person,
+            # in the units a person watches, because the drive's own velocity
+            # units have never been measured against millimetres.
+            full_speed_mm_per_s=self.cfg.simulated_speed_mm_per_s,
             # Mechanical end stops just outside the *focus* limits, which is
             # the range the operator and the gauge think in.
             #
