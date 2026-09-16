@@ -76,6 +76,13 @@ drives.
 
 - **STOP** across the top, always live. Neither STOP nor EMERGENCY asks for
   confirmation — they act, then say what they did on the red bar and in the log.
+  **EMERGENCY halts and keeps holding.** It engages the brakes and only removes
+  drive power if they read back engaged, because on this telescope the drives
+  are usually the only thing holding the camera.
+- A **load bar per motor**: torque as a percentage of the drive's current
+  limit, with the warning and stall thresholds marked and the peak of the last
+  move held. These motors report no amps; set `rated_current_a` from the data
+  plate and an approximate figure appears too.
 - Focus readout in mm and microns, and which way it is from zero.
 - Absolute focus moves with **Preview**, nudge buttons, and one-click step
   sizes down to 1 µm.
@@ -99,6 +106,21 @@ port. "Use for this session" applies them until you close the window; "Use and
 save" writes them to the configuration file. Either way the connection is
 rebuilt, because a motor object holds the address it was created with — editing
 only the label would change nothing.
+
+### Checking the over-torque protection
+
+The stall limit ships at 45%, which is a guess from one motor's idle reading.
+Measure it on your machine instead:
+
+```
+python -m psct_motors.cli torque-profile --mm 0.5              # safe anywhere
+python -m psct_motors.cli torque-profile --to-stop             # drives to the end
+```
+
+It reports what torque reads at rest, moving freely and pressed against the
+stop, and recommends a threshold from the gap between them — or says plainly
+that there is no gap, in which case torque alone cannot find the stop and the
+"commanded a step and barely moved" check is what does.
 
 ### Finding the end of travel
 
@@ -193,11 +215,11 @@ Worth trying:
 python -m psct_motors.cli safety-check
 ```
 
-Eleven drills, each one setting up a situation that could damage the camera and
-checking the software refuses it, with a message an operator can act on:
-brakes on, brake supply off, no drive power, a brake released with nothing
-holding the load, focus and tilt and step limits, an obstruction, a
-hard stop, and a motor unplugged mid-move. It runs against its own simulated
+Thirteen drills, each one setting up a situation that could damage the camera
+and checking the software refuses it, with a message an operator can act on:
+EMERGENCY over a camera nothing else is holding, brakes on, brake supply off,
+no drive power, a brake released with nothing holding the load, focus and tilt
+and step limits, an obstruction, a hard stop, and a motor unplugged mid-move. It runs against its own simulated
 platform, so it is safe to run while connected to the telescope — and
 *Tools → Run safety drills* does the same from the window.
 
@@ -222,6 +244,7 @@ See **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 
 | | |
 |---|---|
+| **[docs/verification.md](docs/verification.md)** | how to know it is alright: what to check, in what order, before it runs unattended |
 | **[docs/commissioning.md](docs/commissioning.md)** | the seven steps to do before trusting any reading |
 | **[docs/troubleshooting.md](docs/troubleshooting.md)** | when a motor stops taking commands: diagnose, event log, bench tools |
 | **[docs/safety.md](docs/safety.md)** | what each guard is for, and what is verified against hardware and what is not |

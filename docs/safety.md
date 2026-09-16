@@ -14,11 +14,38 @@ Two separate controls, because they do different things:
 | | what it does | when |
 |---|---|---|
 | **STOP** | Sets each target to its current position. Motors decelerate on their own ramp and **actively hold**. | Normal "stop now". |
-| **EMERGENCY** | Engages the brakes, then sets `MODE_REG = 0`. Drive output off. | You want the drive electrically off. |
+| **EMERGENCY** | Does that too, then engages the brakes, reads them back, and sets `MODE_REG = 0` **only if they are confirmed engaged**. | Something is wrong and you want everything safe. |
 
 Cutting the drive is the more drastic action, not the safer one: with the drive
 passive the motor holds nothing, and the load rests on the brakes and screw
 friction. STOP keeps the axis under control.
+
+### EMERGENCY dropped the focal plane once
+
+It used to write `MODE_REG = 0` straight away. On this installation every brake
+mode is `none` -- the brakes are switched by a separate device this software
+cannot command -- so that removed the only thing holding the camera. Reported
+from the telescope as *"the emergency stop doesn't stop, instead it just moves
+the motors all the way down with no stopping and continues to keep going down
+till the end of time"*: the camera sinking, back-driving the screws, with the
+encoder running down until it ran out of travel.
+
+The order is now hold first, and give up holding only once something else has
+taken over:
+
+1. Stop every axis and keep it powered and holding. Unconditional, and first.
+2. Engage the brakes, if anything here can engage them.
+3. Read them back. Passivate only if every one is confirmed engaged.
+
+When the brakes cannot be confirmed the drives stay on and the result says so
+in as many words. A powered drive holding position is a safe state, and a far
+better one than an unpowered drive over a falling camera. If an axis is found
+already passive with no confirmed brake -- nothing holding it at all -- the
+drive is enabled at its present position so that something is.
+
+`cli passivate --force` remains for a shutdown where somebody has checked the
+brakes by hand. Nothing reachable from the EMERGENCY button can cut power over
+an unbraked camera.
 
 **Neither asks for confirmation.** A safety control that stops to ask a
 question is not a safety control. Both act immediately and then report what
