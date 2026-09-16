@@ -124,6 +124,15 @@ class MotorStatus:
     error_text: str = ""
     brake: BrakeStatus = BrakeStatus(BrakeState.UNKNOWN, True)
     in_position: bool = False
+    #: Torque as a percentage of the drive's current limit, or None when the
+    #: motor does not report it. This is the closest thing these motors have
+    #: to "how hard is it working" -- there is no amps register.
+    torque_percent: Optional[float] = None
+    #: Approximate phase current, only when rated_current_a is configured.
+    current_a: Optional[float] = None
+    #: Raw bus voltage (97) and drive temperature (26), for the health row.
+    bus_voltage: Optional[int] = None
+    temperature: Optional[int] = None
     #: Populated when the read itself failed, in which case the numeric fields
     #: are stale/zero and must not be displayed as live values.
     comms_error: str = ""
@@ -150,6 +159,10 @@ class MotorStatus:
             "brake": self.brake.state.value,
             "brake_inferred": self.brake.inferred,
             "in_position": self.in_position,
+            "torque_percent": self.torque_percent,
+            "current_a": self.current_a,
+            "bus_voltage": self.bus_voltage,
+            "temperature": self.temperature,
             "comms_error": self.comms_error,
             "healthy": self.healthy,
         }
@@ -180,6 +193,9 @@ class JVLMotor:
         self._connected = False
         self._warned_no_encoder = False
         self._over_torque_samples = 0
+        #: CL: Current Max (212), cached. A configuration value, not a
+        #: measurement, so it is read once rather than on every poll.
+        self._current_limit: Optional[int] = None
         #: Highest torque percentage seen during the most recent move, so a
         #: move that finished can still say how hard it had to work.
         self.peak_torque_percent: Optional[float] = None
@@ -232,6 +248,7 @@ class JVLMotor:
         """
         with self._lock:
             self._connected = False
+            self._current_limit = None
             self._transport.reconnect()
             self._connected = True
             self._cancel.clear()
@@ -455,6 +472,24 @@ class JVLMotor:
 
     # -------------------------------------------------------------- torque
 
+    def get_current_limit(self) -> Optional[int]:
+        """CL: Current Max (212), cached.
+
+        It is a configuration value, not a measurement -- it does not change
+        while the motor runs -- so reading it on every poll would double the
+        cost of the torque reading for nothing. Cached on first use and
+        cleared on reconnect.
+        """
+        if self._current_limit is None:
+            try:
+                limit = self.read_register("CURRENT_MAX")
+            except (ModbusError, MotorFault):
+                return None
+            if limit <= 0:
+                return None
+            self._current_limit = limit
+        return self._current_limit
+
     def get_torque_percent(self) -> Optional[float]:
         """Motor torque as a percentage of its current limit.
 
@@ -468,14 +503,36 @@ class JVLMotor:
         not report torque degrades to no stall protection rather than to a
         move that refuses to start.
         """
+        limit = self.get_current_limit()
+        if not limit:
+            return None
         try:
             torque = abs(self.read_register("ACTUAL_TORQUE"))
-            limit = self.read_register("CURRENT_MAX")
         except (ModbusError, MotorFault):
             return None
-        if limit <= 0:
-            return None
         return 100.0 * torque / limit
+
+    def get_current_amps(self, percent: Optional[float] = None) -> Optional[float]:
+        """Approximate phase current, in amps, or None if it cannot be stated.
+
+        There is no register on this motor that reports amps. What there is is
+        Actual Torque as a fraction of the current limit, so amps can only be
+        inferred by scaling that fraction by the motor's rated current -- which
+        this software cannot know and will not guess. Set
+        `rated_current_a` in the actuator's configuration, from the motor's
+        own data plate, and this starts answering.
+
+        Treat the number as indicative. It is a linear scaling of the drive's
+        internal current demand, not a measurement from a current probe.
+        """
+        rated = self.cfg.rated_current_a
+        if not rated:
+            return None
+        if percent is None:
+            percent = self.get_torque_percent()
+        if percent is None:
+            return None
+        return rated * percent / 100.0
 
     def get_position_mm(self) -> float:
         return self.cfg.counts_to_mm(self.get_position_counts())
@@ -1029,6 +1086,18 @@ class JVLMotor:
             except ModbusError:
                 follow_error = 0
             brake = self.get_brake_status()
+            # Load and health. Each is optional: a motor that does not report
+            # one of them should show a blank indicator, not fail the poll.
+            torque_percent = self.get_torque_percent()
+            current_a = self.get_current_amps(torque_percent)
+            try:
+                bus_voltage = self.read_register("BUS_VOLTAGE")
+            except (ModbusError, MotorFault):
+                bus_voltage = None
+            try:
+                temperature = self.read_register("TEMPERATURE_LOW_RES")
+            except (ModbusError, MotorFault):
+                temperature = None
             position_mm = self.cfg.counts_to_mm(counts)
             target_mm = self.cfg.counts_to_mm(target)
             return MotorStatus(
@@ -1046,6 +1115,10 @@ class JVLMotor:
                 error_bits=errors,
                 error_text=describe_errors(errors),
                 brake=brake,
+                torque_percent=torque_percent,
+                current_a=current_a,
+                bus_voltage=bus_voltage,
+                temperature=temperature,
                 in_position=(
                     abs(projected - target) <= self._tolerance_counts()
                     and abs(follow_error) <= self.cfg.follow_error_window_counts

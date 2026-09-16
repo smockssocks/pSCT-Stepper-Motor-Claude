@@ -92,6 +92,80 @@ def pixels_for(font_spec, *samples: str) -> int:
     return max(font.measure(s) for s in samples) + 8
 
 
+class LoadBar(tk.Canvas):
+    """How hard one motor is working, as a bar plus a number.
+
+    These motors do not report amps. What they report is Actual Torque as a
+    fraction of the drive's current limit, so that is what is drawn -- and the
+    label says "load", not "current", because calling a torque fraction an
+    ammeter reading would be inventing a measurement. When the actuator's
+    rated current is configured, an approximate figure in amps is shown beside
+    it and marked with a tilde.
+
+    Two marks matter and are drawn on the bar: the amber warning level and the
+    red line at which a move is aborted. Seeing where a healthy move sits
+    relative to those is the whole point -- it is how you tell whether the
+    stall threshold is set sensibly for this machine.
+    """
+
+    WIDTH = 86
+    HEIGHT = 14
+
+    def __init__(self, parent, warn_percent: float = 30.0,
+                 stall_percent: float = 45.0, **kw):
+        super().__init__(parent, width=self.WIDTH, height=self.HEIGHT,
+                         highlightthickness=1, highlightbackground="#bbb",
+                         bg="#f4f4f4", **kw)
+        self.warn_percent = warn_percent
+        self.stall_percent = stall_percent
+        self._percent = None
+        self._peak = 0.0
+        self._bar = self.create_rectangle(1, 1, 1, self.HEIGHT - 1,
+                                          fill=COLOR_OK, width=0)
+        self._peak_mark = self.create_line(0, 0, 0, 0, fill="#444", width=1,
+                                           state="hidden")
+        for percent, colour in ((warn_percent, "#c77700"),
+                                (stall_percent, COLOR_BAD)):
+            x = self._x(percent)
+            self.create_line(x, 0, x, self.HEIGHT, fill=colour, width=1,
+                             dash=(2, 2))
+        self._text = self.create_text(self.WIDTH // 2, self.HEIGHT // 2,
+                                      text="--", font=("TkDefaultFont", 7))
+
+    def _x(self, percent: float) -> float:
+        return max(1.0, min(self.WIDTH, self.WIDTH * percent / 100.0))
+
+    def set(self, percent, label: str = "") -> None:
+        """`percent` of None means the motor does not report torque."""
+        self._percent = percent
+        if percent is None:
+            self.coords(self._bar, 1, 1, 1, self.HEIGHT - 1)
+            self.itemconfigure(self._text, text=label or "n/a")
+            self.itemconfigure(self._peak_mark, state="hidden")
+            return
+        self.coords(self._bar, 1, 1, self._x(percent), self.HEIGHT - 1)
+        if percent >= self.stall_percent:
+            colour = COLOR_BAD
+        elif percent >= self.warn_percent:
+            colour = COLOR_WARN
+        else:
+            colour = COLOR_OK
+        self.itemconfigure(self._bar, fill=colour)
+        self.itemconfigure(self._text, text=label or f"{percent:.0f}%")
+        # A high-water mark, because the peak of a move is what tells you
+        # whether the threshold has margin -- and it is gone by the time you
+        # look at a settled axis.
+        if percent > self._peak:
+            self._peak = percent
+        x = self._x(self._peak)
+        self.coords(self._peak_mark, x, 1, x, self.HEIGHT - 1)
+        self.itemconfigure(self._peak_mark, state="normal")
+
+    def reset_peak(self) -> None:
+        self._peak = 0.0
+        self.itemconfigure(self._peak_mark, state="hidden")
+
+
 class MotorRow:
     """One actuator's line in the actuator table."""
 
@@ -131,29 +205,41 @@ class MotorRow:
         ttk.Label(parent, textvariable=self.brake_var,
                   anchor="w").grid(row=row, column=6, padx=2, sticky="w")
 
+        actuator = app.cfg.actuator(name)
+        self.load_bar = LoadBar(parent,
+                                warn_percent=actuator.torque_warn_percent,
+                                stall_percent=actuator.stall_torque_percent)
+        self.load_bar.grid(row=row, column=7, padx=(8, 2))
+        self.load_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self.load_var, width=9, anchor="w",
+                  font=("TkFixedFont", 8), foreground="#555").grid(
+            row=row, column=8, padx=(2, 6), sticky="w")
+
         self.release_btn = ttk.Button(
             parent, text="Release", width=8,
             command=lambda: app.on_brake(name, engage=False))
-        self.release_btn.grid(row=row, column=7, padx=2)
+        self.release_btn.grid(row=row, column=9, padx=2)
         self.engage_btn = ttk.Button(
             parent, text="Engage", width=8,
             command=lambda: app.on_brake(name, engage=True))
-        self.engage_btn.grid(row=row, column=8, padx=2)
+        self.engage_btn.grid(row=row, column=10, padx=2)
 
         ttk.Button(parent, text="▼", width=3,
-                   command=lambda: app.on_jog(name, -1)).grid(row=row, column=9, padx=(10, 1))
+                   command=lambda: app.on_jog(name, -1)).grid(row=row, column=11, padx=(10, 1))
         ttk.Button(parent, text="▲", width=3,
-                   command=lambda: app.on_jog(name, +1)).grid(row=row, column=10, padx=1)
+                   command=lambda: app.on_jog(name, +1)).grid(row=row, column=12, padx=1)
 
         self.error_var = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.error_var, foreground=COLOR_BAD,
-                  anchor="w").grid(row=row, column=11, padx=(10, 6), sticky="w")
+                  anchor="w").grid(row=row, column=13, padx=(10, 6), sticky="w")
 
     def update(self, status) -> None:
         if status.comms_error:
             self.position_var.set("--")
             self.counts_var.set("")
             self.mode_var.set("no comms")
+            self.load_bar.set(None, "--")
+            self.load_var.set("")
             self.mode_lamp.set(COLOR_BAD)
             self.brake_var.set("unknown")
             self.brake_lamp.set(COLOR_IDLE)
@@ -178,6 +264,14 @@ class MotorRow:
             self.brake_lamp.set(COLOR_OK)
         else:
             self.brake_lamp.set(COLOR_IDLE)
+
+        self.load_bar.set(status.torque_percent)
+        if status.torque_percent is None:
+            self.load_var.set("no torque")
+        elif status.current_a is not None:
+            self.load_var.set(f"~{status.current_a:.2f} A")
+        else:
+            self.load_var.set(f"{status.torque_percent:.0f}% lim")
 
         self.error_var.set(status.error_text if status.error_bits else "")
 
@@ -433,7 +527,7 @@ class MotorApp:
         frame.grid(row=1, column=0, sticky="nsew", pady=3)
 
         headers = ["", "position", "counts", "", "mode", "", "brake",
-                   "", "", "", "jog", ""]
+                   "load", "", "", "", "jog", "", ""]
         for col, text in enumerate(headers):
             if text:
                 ttk.Label(frame, text=text, foreground="#555",

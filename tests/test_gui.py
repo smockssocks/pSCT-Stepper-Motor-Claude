@@ -184,6 +184,56 @@ class TestGui(unittest.TestCase):
         self.assertEqual(self.app.platform.motors[0].cfg.ip, "10.1.2.3")
         self.assertFalse(self.app.platform.connected)
 
+    def test_each_motor_shows_how_hard_it_is_working(self):
+        """There is no amps register on these motors. Load is Actual Torque
+        over the drive's current limit, and it has to be labelled as that."""
+        self.app._start_polling()
+        self.pump(0.5)
+        for name, row in self.app.rows.items():
+            self.assertIsNotNone(row.load_bar._percent,
+                                 f"{name} reports no load")
+            # The simulator idles at 337/2048 = 16.5%, as the real motor does.
+            self.assertAlmostEqual(row.load_bar._percent, 100 * 337 / 2048,
+                                   places=1)
+            self.assertIn("%", row.load_var.get())
+
+    def test_the_load_bar_marks_the_thresholds_it_is_judged_against(self):
+        row = self.app.rows["Top"]
+        actuator = self.app.cfg.actuator("Top")
+        self.assertEqual(row.load_bar.stall_percent, actuator.stall_torque_percent)
+        self.assertEqual(row.load_bar.warn_percent, actuator.torque_warn_percent)
+
+    def test_the_load_bar_keeps_a_peak(self):
+        """The peak of a move is what says whether the stall threshold has
+        margin, and it is gone by the time you look at a settled axis."""
+        row = self.app.rows["Top"]
+        row.load_bar.set(12.0)
+        row.load_bar.set(70.0)
+        row.load_bar.set(12.0)
+        self.assertAlmostEqual(row.load_bar._peak, 70.0)
+        row.load_bar.reset_peak()
+        self.assertEqual(row.load_bar._peak, 0.0)
+
+    def test_load_shows_amps_only_when_the_rating_is_configured(self):
+        """Inventing an amps figure from a torque fraction would be inventing
+        a measurement."""
+        self.app._start_polling()
+        self.pump(0.4)
+        self.assertIn("%", self.app.rows["Top"].load_var.get())
+        for actuator in self.app.cfg.actuators:
+            actuator.rated_current_a = 2.0
+        self.pump(0.5)
+        self.assertIn("A", self.app.rows["Top"].load_var.get())
+        self.assertIn("~", self.app.rows["Top"].load_var.get())
+
+    def test_a_lost_motor_shows_no_load_rather_than_a_stale_one(self):
+        self.app._start_polling()
+        self.pump(0.4)
+        self.app.platform.motors[0]._transport.set_offline(True)
+        self.pump(0.6)
+        self.assertIsNone(self.app.rows["Top"].load_bar._percent)
+        self.assertEqual(self.app.rows["Top"].load_var.get(), "")
+
     def test_rows_show_each_actuator(self):
         self.app._start_polling()
         self.pump(0.5)

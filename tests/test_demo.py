@@ -386,10 +386,12 @@ class TestDrillSelection(unittest.TestCase):
 class DemoHarness:
     """Runs the demo against a simulated motor and captures the output."""
 
-    def __init__(self, allow_motion=True, answer=True, **actuator_kw):
+    def __init__(self, allow_motion=True, answer=True, passivate_at_end=False,
+                 **actuator_kw):
         self.buffer = io.StringIO()
         self.motor = simulated_motor(bench_actuator(**actuator_kw), start_mm=0.0)
         self.motor.connect()
+        self.motor.release_brake(force=True)   # bench_actuator wires one to an output
         self.answer = answer
         self.runner = DemoRunner(
             self.motor,
@@ -397,6 +399,7 @@ class DemoHarness:
             ask=lambda prompt: self.answer,
             allow_motion=allow_motion,
             range_revs=2.0,
+            passivate_at_end=passivate_at_end,
         )
 
     def run(self, names):
@@ -453,13 +456,31 @@ class TestDemoRuns(unittest.TestCase):
         body = harness.text.split("What to do")[0]
         self.assertNotIn(" mm", body)
 
-    def test_the_shaft_is_returned_and_left_passive(self):
+    def test_the_shaft_is_returned_and_left_holding(self):
+        """Left holding, not passive.
+
+        This is a bench tool, but nothing stops it being pointed at a motor
+        that is carrying the camera, and passivating a loaded vertical axis
+        takes away the only thing holding it -- which is exactly how the
+        EMERGENCY button dropped the focal plane.
+        """
         harness = DemoHarness(allow_motion=True)
         harness.run(["small-move", "repeatability"])
         self.assertEqual(harness.motor._transport.inner.registers[2],
-                         int(MotorMode.PASSIVE))
+                         int(MotorMode.POSITION))
+        self.assertIn("holding position", harness.text)
         position = harness.motor._transport.inner.position_counts
         self.assertLess(abs(position), 500, "shaft not returned near its start")
+        # ...and the target is where it is, so "holding" does not mean
+        # "still driving somewhere".
+        target = harness.motor._transport.inner.registers[3]
+        self.assertLess(abs(target - position), 500)
+
+    def test_passivate_at_end_still_turns_the_drive_off(self):
+        harness = DemoHarness(allow_motion=True, passivate_at_end=True)
+        harness.run(["small-move"])
+        self.assertEqual(harness.motor._transport.inner.registers[2],
+                         int(MotorMode.PASSIVE))
 
     def test_a_drill_that_raises_is_reported_not_fatal(self):
         harness = DemoHarness(allow_motion=False)

@@ -18,8 +18,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .config import (
     default_config, default_config_path, load_config, save_config,
@@ -376,7 +377,11 @@ def cmd_probe_brake(args) -> int:
             return 1
 
         motor.ensure_position_mode()
-        motor.command_position_counts(motor.get_position_counts())  # hold still
+        # stop() freezes the PROFILE output. Commanding the encoder reading
+        # instead would step the axis by the standing following error -- a
+        # "hold still" that moves, which is the last thing wanted while the
+        # brake is being taken off and put back on.
+        motor.stop()
         for _ in range(args.cycles):
             motor.release_brake()
             out(f"  released -- reads back {motor.get_brake_status().state.value}")
@@ -687,16 +692,23 @@ def cmd_demo(args) -> int:
 
     runner = DemoRunner(motor, out=out, ask=ask,
                         allow_motion=args.allow_motion,
-                        range_revs=args.range_revs)
+                        range_revs=args.range_revs,
+                        passivate_at_end=args.passivate_at_end)
     try:
         return runner.run(drills)
     except KeyboardInterrupt:
         out("")
-        out("Interrupted. Stopping the motor and leaving it passive.")
+        out("Interrupted. Stopping the motor and leaving it holding.")
         try:
             runner.injector.clear()
             motor.stop()
-            motor.passivate()
+            # Deliberately not passivate(): on a loaded axis the drive is the
+            # only thing holding it. Ctrl-C should not drop the camera.
+            if args.passivate_at_end:
+                motor.passivate()
+                out("Drive off, as --passivate-at-end asked.")
+            else:
+                out("The motor is stopped and still holding position.")
         except (ModbusError, MotorFault) as exc:
             out(f"Could not stop cleanly: {exc}")
             out("If the shaft is still turning, remove drive power.")
@@ -744,6 +756,190 @@ def cmd_safety_check(args) -> int:
     out("  known yet. They show the interlock logic is right, not that the")
     out("  wiring is.")
     return 0
+
+
+def cmd_torque_profile(args) -> int:
+    """Measure what each motor's torque actually does, and set the threshold.
+
+    The stall limit ships at 45% because that is a reasonable guess from one
+    motor's idle reading. A guess is not good enough for the thing that stops
+    the actuators driving into their end stops, so this measures the real
+    numbers on this machine: what torque reads at rest, what it reads while
+    moving freely, and -- if asked -- what it reads pressed against the end.
+    A threshold is then recommended from the gap between them.
+    """
+    import statistics
+
+    platform = make_platform(args)
+    try:
+        platform.connect()
+    except PlatformError as exc:
+        out(str(exc))
+        return 1
+
+    samples: Dict[str, Dict[str, List[float]]] = {
+        m.name: {"at rest": [], "moving out": [], "moving back": [],
+                 "at the stop": []}
+        for m in platform.motors
+    }
+    # Sampling runs in its own thread throughout, so the interesting moment --
+    # the instant an axis meets the stop and torque climbs -- is caught even
+    # though it happens in the middle of a blocking call. Sampling only
+    # between steps misses it entirely and makes the stop look like a normal
+    # move.
+    phase = ["at rest"]
+    sampling = threading.Event()
+    sampling.set()
+
+    def sampler() -> None:
+        while sampling.is_set():
+            current = phase[0]
+            for motor in platform.motors:
+                try:
+                    percent = motor.get_torque_percent()
+                except (ModbusError, MotorFault):
+                    percent = None
+                if percent is not None:
+                    samples[motor.name][current].append(percent)
+            time.sleep(0.05)
+
+    sampler_thread = threading.Thread(target=sampler, name="torque-sampler",
+                                      daemon=True)
+
+    try:
+        rule("Torque profile")
+        out("Measures what torque actually reads on these motors, so the stall")
+        out("threshold is set from data rather than from a default.")
+        out("")
+        out(f"  move size     {args.mm} mm, all three together")
+        out(f"  current limit "
+            f"{platform.motors[0].get_current_limit()} (CL: Current Max, reg 212)")
+        if args.to_stop:
+            out(f"  and then      approach the end stop in the "
+                f"{args.direction} direction")
+        out("")
+        if not confirm("Run the torque profile?", args.yes):
+            return 1
+
+        platform._prepare_for_motion()
+        platform.stop()
+        sampler_thread.start()
+
+        out("  holding still...")
+        time.sleep(2.0)
+
+        out(f"  moving {args.mm:+.3f} mm...")
+        phase[0] = "moving out"
+        platform.move_relative(d_focus_mm=args.mm)
+
+        out(f"  moving {-args.mm:+.3f} mm back...")
+        phase[0] = "moving back"
+        platform.move_relative(d_focus_mm=-args.mm)
+
+        found_a_stop = False
+        if args.to_stop:
+            out("  approaching the end stop...")
+            phase[0] = "at the stop"
+            direction = 1 if args.direction == "+" else -1
+            try:
+                result = platform.seek_hard_stop_together(
+                    direction=direction, step_mm=args.step_mm,
+                    budget_mm=args.budget_mm)
+                found_a_stop = bool(result.stopped_by)
+                out(f"  stopped by {', '.join(result.stopped_by)}.")
+            except (PlatformError, MotorFault) as exc:
+                out(f"  the search ended without finding a stop: {exc}")
+
+        sampling.clear()
+        sampler_thread.join(timeout=2.0)
+
+        # ---------------------------------------------------------- report
+        out("")
+        rule("What torque read")
+        out(f"{'motor':<7}{'phase':<14}{'n':>5}{'min':>8}{'median':>8}{'max':>8}")
+        peaks: Dict[str, float] = {}
+        stop_peaks: Dict[str, float] = {}
+        for name, phases in samples.items():
+            for phase, values in phases.items():
+                if not values:
+                    continue
+                out(f"{name:<7}{phase:<14}{len(values):>5}"
+                    f"{min(values):>7.1f}%{statistics.median(values):>7.1f}%"
+                    f"{max(values):>7.1f}%")
+                if phase.startswith("moving"):
+                    peaks[name] = max(peaks.get(name, 0.0), max(values))
+                elif phase == "at the stop":
+                    stop_peaks[name] = max(stop_peaks.get(name, 0.0), max(values))
+            out("")
+
+        rule("What to set")
+        if not peaks:
+            out("  No torque readings at all. These motors are not reporting")
+            out("  Actual Torque (217) or CL: Current Max (212), so stall")
+            out("  protection cannot work and `stall_protection` should be set")
+            out("  false rather than left on and trusted.")
+            return 1
+
+        worst_moving = max(peaks.values())
+        # Never below what a healthy move already draws, whatever the stop
+        # data says -- a threshold under that aborts ordinary moves.
+        floor = max(worst_moving * 1.3, worst_moving + 5.0)
+        recommended = min(95.0, max(floor, worst_moving * 1.5))
+        out(f"  Hardest a free move worked:  {worst_moving:.1f}%"
+            f"  (worst of {', '.join(f'{n} {v:.1f}%' for n, v in peaks.items())})")
+
+        if not args.to_stop:
+            out("  No end-stop reading taken; re-run with --to-stop to get one.")
+            out("  Without it this recommendation has margin above normal moves")
+            out("  but is not known to be below what an obstruction produces.")
+        elif not found_a_stop:
+            out("  The search did not reach a stop, so nothing was measured")
+            out("  pressed against the end. Re-run with a larger --budget-mm.")
+        elif not stop_peaks:
+            out("  A stop was found but no torque was sampled there.")
+        else:
+            worst_stop = min(stop_peaks.values())
+            out(f"  Lowest reading at the stop:  {worst_stop:.1f}%")
+            if worst_stop <= worst_moving * 1.2:
+                out("")
+                out("  ** These overlap. Torque against the end stop is not")
+                out("  ** clearly higher than during a normal move, so no")
+                out("  ** threshold separates them: set it low and ordinary")
+                out("  ** moves abort, set it high and the stop is never")
+                out("  ** noticed. On this machine the 'commanded a step and")
+                out("  ** barely moved' check is what will find the stop.")
+                out("  ** Keep stall_protection on as a backstop; do not rely")
+                out("  ** on it alone, and do not lower the threshold to try")
+                out("  ** to make it fire.")
+            else:
+                midpoint = (worst_moving + worst_stop) / 2
+                recommended = min(max(floor, midpoint), 95.0)
+                out("  Clear separation: a threshold between them will work.")
+
+        out("")
+        out(f"  Recommended stall_torque_percent: {recommended:.0f}")
+        out(f"  Currently configured:             "
+            f"{platform.motors[0].cfg.stall_torque_percent:.0f}")
+        out("")
+        out("  Put it in the config under each actuator:")
+        out(f'      "stall_torque_percent": {recommended:.0f},')
+        out(f'      "torque_warn_percent": {max(worst_moving * 1.2, 5.0):.0f},')
+        out("")
+        out("  The second one only colours the GUI's load bars; it stops")
+        out("  nothing. It is worth setting so that 'normal' on the bars means")
+        out("  normal for this machine.")
+        return 0
+    except (PlatformError, MotorFault) as exc:
+        out("")
+        out(f"Stopped: {exc}")
+        return 1
+    finally:
+        sampling.clear()
+        try:
+            platform.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        platform.disconnect()
 
 
 def cmd_find_stop(args) -> int:
@@ -1255,6 +1451,10 @@ one motor on a bench
     p.add_argument("--no-operator", action="store_true",
                    help="skip drills that ask you to unplug things")
     p.add_argument("--list", action="store_true", help="list the drills and exit")
+    p.add_argument("--passivate-at-end", action="store_true",
+                   help="turn the drive off when the run finishes. Off by "
+                        "default: on a loaded axis, passivating removes the "
+                        "only thing holding it")
     p.set_defaults(func=cmd_demo)
 
     p = command(
@@ -1283,6 +1483,29 @@ one motor on a bench
     p.add_argument("--only", help="comma-separated words to match drill names")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(func=cmd_safety_check)
+
+    p = command(
+        "torque-profile",
+        help="measure what torque really reads, and set the stall threshold",
+        description=(
+            "The stall limit ships at 45%, which is a guess from one motor's "
+            "idle reading. This measures the real numbers on your machine -- "
+            "at rest, moving freely, and optionally pressed against the end "
+            "stop -- and recommends a threshold from the gap between them. "
+            "Run it before trusting the over-torque protection, and again "
+            "after anything mechanical changes."
+        ),
+    )
+    p.add_argument("--mm", type=float, default=0.5,
+                   help="how far to move while sampling (default 0.5)")
+    p.add_argument("--to-stop", action="store_true",
+                   help="also approach the end stop, to see what it reads "
+                        "there. Moves all three together.")
+    p.add_argument("--direction", choices=["+", "-"], default="+",
+                   help="which end to approach with --to-stop")
+    p.add_argument("--step-mm", type=float, default=0.2)
+    p.add_argument("--budget-mm", type=float, default=30.0)
+    p.set_defaults(func=cmd_torque_profile)
 
     p = command(
         "find-stop",

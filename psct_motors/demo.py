@@ -125,13 +125,19 @@ class DemoContext:
 
     def __init__(self, motor: JVLMotor, injector: FaultInjectingTransport,
                  out: Callable[[str], None], ask: Callable[[str], bool],
-                 allow_motion: bool, range_revs: float):
+                 allow_motion: bool, range_revs: float,
+                 passivate_at_end: bool = False):
         self.motor = motor
         self.injector = injector
         self.out = out
         self.ask = ask
         self.allow_motion = allow_motion
         self.range_revs = range_revs
+        #: Whether to turn the drive off when the run finishes. Off by
+        #: default: this is a bench tool, but nothing stops it being pointed
+        #: at a motor carrying the camera, and passivating a loaded vertical
+        #: axis removes the only thing holding it.
+        self.passivate_at_end = passivate_at_end
 
         self.counts_per_rev = float(motor.cfg.counts_per_rev)
         self.home_counts: int = 0
@@ -594,7 +600,7 @@ def drill_brake(ctx: DemoContext) -> DrillResult:
 
     # mode == "output"
     motor.ensure_position_mode()
-    motor.command_position_counts(motor.get_position_counts())
+    motor.stop()          # freeze the profile output, do not step by FLWERR
     for _ in range(2):
         motor.release_brake()
         released = motor.get_brake_status()
@@ -1141,12 +1147,13 @@ def all_drills() -> List[Drill]:
 class DemoRunner:
     def __init__(self, motor: JVLMotor, out: Callable[[str], None],
                  ask: Callable[[str], bool], allow_motion: bool = False,
-                 range_revs: float = 2.0):
+                 range_revs: float = 2.0, passivate_at_end: bool = False):
         self.motor = motor
         self.out = out
         self.injector = wrap_motor(motor)
         self.ctx = DemoContext(motor, self.injector, out, ask,
-                               allow_motion, range_revs)
+                               allow_motion, range_revs,
+                               passivate_at_end=passivate_at_end)
         self.results: List[tuple] = []
 
     def run(self, drills: List[Drill]) -> int:
@@ -1253,8 +1260,18 @@ class DemoRunner:
                 self.ctx.return_home()
                 self.out(f"  Returned to {self.motor.get_position_counts()} counts "
                          f"(started at {self.ctx.home_counts}).")
-            self.motor.write_register("MODE_REG", int(MotorMode.PASSIVE))
-            self.out("  Motor left in Passive mode.")
+            if self.ctx.passivate_at_end:
+                self.motor.write_register("MODE_REG", int(MotorMode.PASSIVE))
+                self.out("  Motor left in Passive mode, drive off.")
+            else:
+                # Deliberately NOT passive. This is a bench tool, but nothing
+                # stops it being pointed at a motor that is carrying the
+                # camera, and passivating a loaded vertical axis takes away
+                # the only thing holding it. Leaving it holding is safe on a
+                # bench too -- an idle motor holding position harms nothing.
+                self.motor.stop()
+                self.out("  Motor left ENABLED and holding position. Pass "
+                         "--passivate-at-end to turn the drive off instead.")
         except (ModbusError, MotorFault) as exc:
             self.out(f"  Cleanup could not complete: {exc}")
 

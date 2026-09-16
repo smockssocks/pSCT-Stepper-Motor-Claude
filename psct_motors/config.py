@@ -223,6 +223,18 @@ class ActuatorConfig:
     #: Whether to watch torque at all. Turn it off only if the torque registers
     #: turn out to mean something different on your drive.
     stall_protection: bool = True
+    #: Torque percentage above which the GUI's load bar turns amber, as a
+    #: warning that the axis is working harder than usual well before the
+    #: stall threshold stops it.
+    torque_warn_percent: float = 30.0
+    #: Rated phase current of this motor in amps, from its data plate.
+    #:
+    #: These motors have no register that reports amps. What they report is
+    #: Actual Torque as a fraction of the current limit, so amps can only be
+    #: inferred by scaling that fraction -- which needs a number this software
+    #: cannot know. Left at 0, the GUI shows load as a percentage only, which
+    #: is honest. Set it and an approximate current is shown beside it.
+    rated_current_a: float = 0.0
 
     brake: BrakeConfig = field(default_factory=BrakeConfig)
 
@@ -287,6 +299,14 @@ class ActuatorConfig:
             raise ValueError(
                 f"Actuator {self.name}: stall_torque_percent must be in 0..100, "
                 f"got {self.stall_torque_percent}"
+            )
+        if self.torque_warn_percent <= 0 or self.torque_warn_percent > 100:
+            raise ValueError(
+                f"Actuator {self.name}: torque_warn_percent must be in 0..100"
+            )
+        if self.rated_current_a < 0:
+            raise ValueError(
+                f"Actuator {self.name}: rated_current_a cannot be negative"
             )
         if self.stall_persist_samples < 1:
             raise ValueError(
