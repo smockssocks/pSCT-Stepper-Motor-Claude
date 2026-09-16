@@ -57,9 +57,9 @@ Both are guarded on *any* motor being reachable, not all three. One motor
 dropping off the network must not disarm STOP for the two still running.
 
 STOP never queues. `FocalPlanePlatform.stop()` takes no move lock, the GUI runs
-it on its own thread regardless of what else is busy, and the TCP bridge exempts
-it from the command lock. A stop button that waits its turn is not a stop
-button. There is a test for this on both the bridge and the GUI.
+it on its own thread regardless of what else is busy. A stop button that waits
+its turn is not a stop button, and there is a test that starts a move and then
+presses it.
 
 ### Nothing moves until the whole move is checked
 

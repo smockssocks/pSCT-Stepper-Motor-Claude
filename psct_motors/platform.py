@@ -1529,9 +1529,10 @@ class FocalPlanePlatform:
             )
         return taken
 
-    #: Kept because the server and the LabVIEW API call it by this name. It is
-    #: the same safe sequence -- there is deliberately no way to reach the old
-    #: "cut power immediately" behaviour through an emergency control.
+    #: An older name for the same safe sequence, kept so that any caller
+    #: written against it gets the interlocked behaviour rather than a missing
+    #: attribute. There is deliberately no way to reach the old "cut power
+    #: immediately" behaviour through an emergency control.
     emergency_passivate = emergency_stop
 
     def _engage_brakes_for_emergency(self):

@@ -188,19 +188,6 @@ with FocalPlanePlatform() as platform:
     platform.move_relative(d_focus_mm=0.5)
 ```
 
-### From LabVIEW
-
-Run the bridge and talk to it over TCP — one JSON object per line, one back:
-
-```
-python -m psct_motors.cli server --simulate
-```
-
-LabVIEW's TCP primitives do not care which Python is installed or whether it is
-32- or 64-bit, which is the usual reason a LabVIEW/Python integration refuses to
-load. Details, and a `lv_*` function API for LabVIEW's native Python node, in
-**[labview/README.md](labview/README.md)**.
-
 ---
 
 ## Run the simulation
@@ -305,7 +292,6 @@ See **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 | **[docs/troubleshooting.md](docs/troubleshooting.md)** | when a motor stops taking commands: diagnose, event log, bench tools |
 | **[docs/safety.md](docs/safety.md)** | what each guard is for, and what is verified against hardware and what is not |
 | **[docs/reference.md](docs/reference.md)** | the mechanism, the code layout, running the tests |
-| **[labview/README.md](labview/README.md)** | the TCP bridge and the LabVIEW function API |
 
 ---
 

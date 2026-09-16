@@ -1256,12 +1256,6 @@ def cmd_gui(args) -> int:
                     bench=args.bench, sim_speed=args.sim_speed)
 
 
-def cmd_server(args) -> int:
-    from .server import serve
-    return serve(host=args.host, port=args.port, config_path=args.config,
-                 simulate=args.simulate, bench=args.bench)
-
-
 # --------------------------------------------------------------------------
 # Argument parsing
 # --------------------------------------------------------------------------
@@ -1566,10 +1560,6 @@ one motor on a bench
     p = command("gui", help="launch the three-motor focal-plane application")
     p.set_defaults(func=cmd_gui)
 
-    p = command("server", help="run the JSON-over-TCP bridge (for LabVIEW)")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=5020)
-    p.set_defaults(func=cmd_server)
 
     return parser
 

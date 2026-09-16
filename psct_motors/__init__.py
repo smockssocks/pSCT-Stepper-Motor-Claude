@@ -18,8 +18,6 @@ and on top of those::
 
     gui.py         desktop application
     cli.py         commissioning, calibration and scripted moves
-    server.py      JSON-over-TCP bridge (this is what LabVIEW should talk to)
-    labview_api.py flat function API for LabVIEW's native Python node
 
 Start with the README; `python -m psct_motors.cli --help` is the quickest way
 in once the config is filled out.

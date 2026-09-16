@@ -11,7 +11,7 @@ be exercised the moment something makes the motor appear to fail.
 
 `FaultInjectingTransport` wraps a real (or simulated) transport and tampers
 with the register traffic on the way past. Everything above it -- the driver,
-the platform, the GUI, the bridge -- sees exactly what it would see if the
+the platform and the GUI -- sees exactly what it would see if the
 motor really had that fault, and reacts exactly as it would in the field.
 
 What this does and does not prove

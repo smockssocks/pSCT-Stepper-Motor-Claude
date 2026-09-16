@@ -2,7 +2,7 @@
 A fake JVL motor that behaves like the real one over the same interface.
 
 This exists so the whole stack -- kinematics, coordinated moves, limit checks,
-the GUI, the LabVIEW bridge -- can be exercised with no hardware attached, and
+and the GUI -- can be exercised with no hardware attached, and
 so you can rehearse a procedure at your desk before running it on the
 telescope.
 

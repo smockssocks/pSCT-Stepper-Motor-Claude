@@ -83,9 +83,6 @@ psct_motors/
   plane_view.py   live picture of the plate on its three actuators
   single_gui.py   one-motor bench GUI: errors, fault injection, live log
   cli.py          commissioning, calibration and scripted moves
-  server.py       JSON-over-TCP bridge
-  labview_api.py  flat function API for LabVIEW's Python node
-labview/          how to wire it up in LabVIEW
 tests/            unit and end-to-end tests
 config/           your configuration lives here
 ```
@@ -123,13 +120,12 @@ Coverage worth knowing about:
 - Kinematics round-trip exactly, on symmetric and lopsided triangles.
 - Sign conventions are pinned: positive tip raises +y, positive tilt lowers +x.
 - Refused moves command **nothing** — actuator positions are checked unchanged.
-- STOP interrupts an in-flight move, on both the TCP bridge and the GUI, and
+- STOP interrupts an in-flight move in the GUI, and
   the interrupted move reports failure rather than claiming success.
 - A wrong word order is caught at connect.
 - A mode that will not stick is reported as a fighting client.
 - Brake polarity, both ways round, plus the passive-drive interlock.
 - Losing a motor mid-poll withholds the orientation instead of guessing it.
-- Malformed JSON on the bridge gets an error reply and the connection survives.
 - A fault detected mid-move halts **all three** axes, not just the faulting one.
 - Injected fault values are encoded in the motor's own word order, so a drill
   exercises the error bit it claims to.
