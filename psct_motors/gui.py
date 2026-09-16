@@ -302,7 +302,7 @@ class MotorApp:
         ).grid(row=0, column=0, sticky="ew", padx=4, pady=4)
 
         tk.Button(
-            bar, text="EMERGENCY\nbrakes on, drives off", command=self.on_passivate,
+            bar, text="EMERGENCY\nhalt + brakes on", command=self.on_passivate,
             bg="#3a3a3a", fg="white", activebackground="#111", activeforeground="white",
             font=("TkDefaultFont", 9, "bold"), height=2,
         ).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
@@ -310,7 +310,9 @@ class MotorApp:
         tk.Label(
             bar,
             text="STOP decelerates and holds position with the drives still on. "
-                 "EMERGENCY cuts drive power -- the load is then held by the brakes alone. "
+                 "EMERGENCY does that too, then engages the brakes, and turns the "
+                 "drives off ONLY if the brakes are confirmed holding -- otherwise "
+                 "they stay on, because they are the only thing holding the camera. "
                  "Neither asks for confirmation.",
             bg=COLOR_STOP_DARK, fg="#ffd7d7", font=("TkDefaultFont", 8),
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2))
@@ -723,14 +725,20 @@ class MotorApp:
 
     def on_passivate(self) -> None:
         """No confirmation. An emergency control that stops to ask a question
-        is not an emergency control -- it acts, then reports what it did."""
+        is not an emergency control -- it acts, then reports what it did.
+
+        What it does is *hold*, not cut power. See
+        `FocalPlanePlatform.emergency_stop`: the drives are the only thing
+        holding this camera unless the brakes are confirmed on, so they are
+        the last thing to be turned off and only once something else has
+        taken over."""
         if not self.platform.any_connected:
             self.log("EMERGENCY pressed, but no motor is reachable.")
             self._announce("EMERGENCY pressed, but no motor is reachable -- "
-                           "nothing could be turned off.", COLOR_BAD)
+                           "nothing could be stopped.", COLOR_BAD)
             return
-        self.log("EMERGENCY pressed: engaging brakes and turning the drives off.")
-        self._announce("EMERGENCY: engaging brakes, turning drives off...",
+        self.log("EMERGENCY pressed: halting all three and engaging the brakes.")
+        self._announce("EMERGENCY: halting all three, engaging brakes...",
                        COLOR_WARN)
         threading.Thread(target=self._passivate_worker, name="passivate",
                          daemon=True).start()
@@ -738,55 +746,37 @@ class MotorApp:
     def _passivate_worker(self) -> None:
         stamp = time.strftime("%H:%M:%S")
         try:
-            problems = self.platform.emergency_passivate()
+            result = self.platform.emergency_stop()
         except Exception as exc:  # noqa: BLE001
             self.log_threadsafe(f"EMERGENCY had trouble: {exc}")
             self._announce_threadsafe(
-                f"{stamp}  EMERGENCY did not complete: {exc}", COLOR_BAD)
+                f"{stamp}  EMERGENCY did not complete: {exc}. Check the focal "
+                f"plane physically.", COLOR_BAD)
             self.post(lambda: self._set_busy(False))
             return
 
         # Report what is true now, read back from the motors, rather than what
         # was commanded. On an emergency control the difference matters.
-        for line in self._passivate_report(stamp, problems):
+        self.log_threadsafe(f"EMERGENCY at {stamp}:")
+        for line in result.summary().splitlines():
             self.log_threadsafe(line)
-        if problems:
+
+        if not result.stopped:
             self._announce_threadsafe(
-                f"{stamp}  EMERGENCY incomplete -- {len(problems)} motor(s) did "
-                f"not answer. See the log.", COLOR_BAD)
+                f"{stamp}  EMERGENCY incomplete -- "
+                f"{len(result.stop_problems)} motor(s) did not answer and may "
+                f"still be moving. See the log.", COLOR_BAD)
+        elif result.drives_off:
+            self._announce_threadsafe(
+                f"{stamp}  EMERGENCY done: stopped, brakes engaged, drives off. "
+                f"The brakes are holding the focal plane.", COLOR_BAD)
         else:
             self._announce_threadsafe(
-                f"{stamp}  EMERGENCY done: brakes engaged, drives off. The load "
-                f"is on the brakes now. A move command re-enables the drives.",
-                COLOR_BAD)
+                f"{stamp}  EMERGENCY done: stopped and HOLDING. The drives are "
+                f"still on, on purpose -- the brakes are not confirmed, and "
+                f"cutting power would leave the focal plane held by nothing.",
+                COLOR_STOP)
         self.post(lambda: self._set_busy(False))
-
-    def _passivate_report(self, stamp: str, problems: List[str]) -> List[str]:
-        """The lines that go in the log after an emergency stop."""
-        lines = [f"EMERGENCY at {stamp}: brakes engaged, drives off."]
-        for problem in problems:
-            lines.append(f"  ** could NOT passivate {problem}")
-        try:
-            state = self.platform.read_state()
-        except Exception as exc:  # noqa: BLE001
-            lines.append(f"  (could not read back the result: {exc})")
-            return lines
-        for motor in state.motors:
-            if motor.comms_error:
-                lines.append(f"  {motor.name:<5} no comms -- state unknown: "
-                             f"{motor.comms_error}")
-                continue
-            lines.append(
-                f"  {motor.name:<5} stopped at {motor.position_mm:+8.4f} mm  "
-                f"({motor.position_counts} ct)  {motor.mode_text}  "
-                f"brake {motor.brake.state.value}"
-                + ("  [inferred]" if motor.brake.inferred else "")
-            )
-        lines.append("  The drives are no longer holding position: the load rests "
-                     "on the brakes and screw friction.")
-        lines.append("  To resume, command a move -- that re-enables the drives "
-                     "and releases the brakes.")
-        return lines
 
     # ----------------------------------------------------------------- moves
 

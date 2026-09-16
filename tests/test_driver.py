@@ -473,8 +473,13 @@ class TestPlatform(unittest.TestCase):
             )
 
     def test_emergency_passivate_engages_brakes_and_kills_drive(self):
+        """With a brake that is actually under software control, EMERGENCY can
+        safely finish the job: brakes on, then drives off."""
         self.platform.move_to_orientation(Orientation(27.0, 0.0, 0.0))
-        self.platform.emergency_passivate()
+        result = self.platform.emergency_stop()
+        self.assertTrue(result.stopped)
+        self.assertTrue(result.brakes_engaged, result.summary())
+        self.assertTrue(result.drives_off, result.summary())
         for motor in self.platform.motors:
             self.assertEqual(motor.get_mode(), int(MotorMode.PASSIVE))
             self.assertIs(motor.get_brake_status().state, BrakeState.ENGAGED)

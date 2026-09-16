@@ -799,8 +799,27 @@ class JVLMotor:
             )
             return False
 
-    def passivate(self, engage_brake_first: bool = True) -> None:
-        """Drive off. Engages the brake first when the brake is controllable."""
+    def passivate(self, engage_brake_first: bool = True,
+                  stop_first: bool = True) -> None:
+        """Drive off. Engages the brake first when the brake is controllable.
+
+        `stop_first` brings the axis to a controlled halt before the drive is
+        cut, which matters whenever this is called on a motor that is still
+        moving: passivating mid-move takes the power away from a shaft that is
+        turning, and it then coasts, or -- on a loaded vertical axis -- runs
+        away under the load.
+
+        On a loaded axis this whole method is the dangerous one. With the
+        drive passive the motor holds nothing at all. If the brake is not
+        actually holding, the load is on screw friction alone. `stop()` is
+        what you want for "stop now"; `FocalPlanePlatform.emergency_stop()`
+        handles the ordering and the brake interlock for the whole platform.
+        """
+        if stop_first:
+            try:
+                self.stop()
+            except (ModbusError, MotorFault) as exc:
+                self._log(f"{self.name}: could not stop before passivating: {exc}")
         self._cancel.set()
         if engage_brake_first and self.cfg.brake.mode == "output":
             try:

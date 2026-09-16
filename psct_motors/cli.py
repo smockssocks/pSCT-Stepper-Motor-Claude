@@ -555,13 +555,29 @@ def cmd_passivate(args) -> int:
         out(str(exc))
         return 1
     try:
-        out("This engages the brakes and turns the drives OFF. With the drives off,")
-        out("the load is held by the brakes and screw friction alone.")
-        if not confirm("Passivate all three motors?", args.yes):
+        if args.force:
+            out("--force: the drives will be turned OFF whatever the brakes say.")
+            out("With the drives off and the brakes not holding, the focal plane")
+            out("rests on screw friction alone and can sink.")
+            if not confirm("Turn the drives off anyway?", args.yes):
+                return 1
+            problems = platform.passivate_all(force=True)
+            if problems:
+                out("Trouble on: " + "; ".join(problems))
+                return 1
+            out("Drives off.")
+            return 0
+
+        out("Halts all three, engages the brakes, and turns the drives off only")
+        out("if the brakes are confirmed holding. Use --force to turn them off")
+        out("regardless.")
+        if not confirm("Emergency stop all three motors?", args.yes):
             return 1
-        platform.emergency_passivate()
-        out("Done.")
-        return 0
+        result = platform.emergency_stop()
+        out("")
+        for line in result.summary().splitlines():
+            out(line)
+        return 0 if result.stopped and result.holding else 1
     finally:
         platform.disconnect()
 
@@ -1194,7 +1210,20 @@ one motor on a bench
     p = command("stop", help="controlled stop: decelerate and hold")
     p.set_defaults(func=cmd_stop)
 
-    p = command("passivate", help="brakes on, drives off")
+    p = command(
+        "passivate",
+        help="emergency stop: halt, brakes on, drives off only if it is safe",
+        description=(
+            "Halts all three actuators and keeps them holding, engages the "
+            "brakes, and removes drive power only when the brakes are "
+            "confirmed engaged. On this telescope the drives are usually the "
+            "only thing holding the focal plane, so turning them off with the "
+            "brakes released lets it sink. --force overrides that check."
+        ),
+    )
+    p.add_argument("--force", action="store_true",
+                   help="turn the drives off even if the brakes cannot be "
+                        "confirmed (for maintenance, after checking by hand)")
     p.set_defaults(func=cmd_passivate)
 
     p = command("brake", help="engage, release or report the brakes")

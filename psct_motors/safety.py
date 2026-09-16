@@ -15,6 +15,8 @@ out what the telescope does when the refusal is missing.
 
 What is covered
 ---------------
+emergency       that EMERGENCY halts and keeps holding rather than cutting
+                power over a camera nothing else is holding
 brakes          moving with the brakes on, a brake supply that is off, and
                 releasing a brake with nothing holding the load
 power           moving with no drive supply, which a motor accepts silently
@@ -130,6 +132,65 @@ def _expect_refusal(name: str, what: str, expected: str,
 # --------------------------------------------------------------------------
 # Brakes
 # --------------------------------------------------------------------------
+
+def drill_emergency_does_not_drop_the_camera() -> DrillResult:
+    """The failure reported from the telescope.
+
+    EMERGENCY used to write MODE_REG = 0 immediately. On this machine the
+    brakes are on a separate device the software cannot command, so that took
+    away the only thing holding the camera: it sank, back-driving the screws,
+    with the encoder running down until it ran out of travel.
+    """
+    from .external_brake import BrakeController, ExternalBrakeConfig
+    from .registers import MotorMode
+
+    platform = _platform()
+    try:
+        # Exactly the site's situation: no brake this software can drive.
+        platform.external_brake = BrakeController(ExternalBrakeConfig(mode="none"))
+        platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+
+        result = platform.emergency_stop()
+        settled = platform.read_actuator_positions_mm()
+        time.sleep(0.8)
+        after = platform.read_actuator_positions_mm()
+        drift = max(abs(a - b) for a, b in zip(settled, after))
+
+        still_holding = all(m.get_mode() == int(MotorMode.POSITION)
+                            for m in platform.motors)
+        passed = drift < 0.05 and still_holding and not result.drives_off
+        return DrillResult(
+            "EMERGENCY holds the camera instead of dropping it", passed,
+            "removed every brake this software can command, moved to 1 mm, "
+            "pressed EMERGENCY, then watched for 0.8 s",
+            f"the actuators moved {drift:.3f} mm afterwards; drives "
+            f"{'OFF' if result.drives_off else 'left ON and holding'}",
+            "halt and keep holding: with no confirmed brake, cutting drive "
+            "power leaves the focal plane on screw friction alone")
+    finally:
+        platform.disconnect()
+
+
+def drill_emergency_cuts_power_once_brakes_hold() -> DrillResult:
+    """The interlock must not become a blanket refusal."""
+    from .registers import MotorMode
+
+    platform = _platform()
+    try:
+        platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+        result = platform.emergency_stop()
+        all_passive = all(m.get_mode() == int(MotorMode.PASSIVE)
+                          for m in platform.motors)
+        return DrillResult(
+            "EMERGENCY does turn the drives off when the brakes hold",
+            result.drives_off and all_passive,
+            "pressed EMERGENCY with a brake controller that reads back engaged",
+            f"brakes engaged: {result.brakes_engaged}; drives off: "
+            f"{result.drives_off}",
+            "engage the brakes, confirm them, then passivate")
+    finally:
+        platform.disconnect()
+
 
 def drill_move_releases_the_brakes() -> DrillResult:
     platform = _platform()
@@ -376,6 +437,8 @@ def drill_a_lost_motor_halts_the_others() -> DrillResult:
 
 
 DRILLS: List[Callable[[], DrillResult]] = [
+    drill_emergency_does_not_drop_the_camera,
+    drill_emergency_cuts_power_once_brakes_hold,
     drill_move_releases_the_brakes,
     drill_move_refused_when_brakes_will_not_release,
     drill_release_refused_when_drives_are_passive,

@@ -273,10 +273,13 @@ def lv_stop() -> str:
 
 
 def lv_passivate() -> str:
-    """Brakes on, drives off. The load then rests on the brakes alone."""
-    return _guard(
-        lambda: (_require_platform().emergency_passivate(), {"passivated": True})[1]
-    )
+    """Emergency stop: halt and hold, brakes on, drives off only if it is safe.
+
+    The reply carries `drives_off` and `holding`. Do not assume the drives
+    were turned off -- when the brakes cannot be confirmed they are left on
+    deliberately, because they are the only thing holding the focal plane.
+    """
+    return _guard(lambda: _require_platform().emergency_stop().as_dict())
 
 
 def lv_brake(action: str) -> str:

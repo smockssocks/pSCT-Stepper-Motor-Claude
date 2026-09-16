@@ -197,9 +197,15 @@ class CommandDispatcher:
         return {"stopped": True}
 
     def do_passivate(self) -> Dict[str, Any]:
-        self._log("passivate requested")
-        self.platform.emergency_passivate()
-        return {"passivated": True}
+        """Emergency stop. Note that this may deliberately leave the drives on.
+
+        The reply says what actually happened rather than just "ok", because
+        "the drives are still powered and holding" is a different state from
+        "the brakes are holding" and a caller that cannot tell them apart
+        cannot make a safe decision next.
+        """
+        self._log("emergency stop requested")
+        return self.platform.emergency_stop().as_dict()
 
     def do_brake(self, action: str) -> Dict[str, Any]:
         action = str(action).lower()

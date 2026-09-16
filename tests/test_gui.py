@@ -267,27 +267,50 @@ class TestGui(unittest.TestCase):
         finally:
             gui.messagebox = original
 
-        # It did the thing.
+        # It halted and is holding. The gui_config brakes are motor outputs,
+        # so the brakes can be confirmed and the drives may go off.
         for motor in self.app.platform.motors:
-            self.assertEqual(motor.get_mode(), 0)
+            self.assertLess(abs(motor.get_target_mm() - motor.get_position_mm()), 0.5)
         # ...and then said so, both on the red bar and in the log.
         self.assertIn("EMERGENCY done", self.app.action_var.get())
         log = self.app.log_text.get("1.0", "end")
-        self.assertIn("brakes engaged, drives off", log)
-        self.assertIn("The drives are no longer holding position", log)
+        self.assertIn("halted and holding", log)
+        self.assertIn("brakes:", log)
+        self.assertIn("drives:", log)
         # The report names every actuator and where it came to rest, read back
         # from the motors rather than assumed.
         for name in ("Top", "East", "West"):
             self.assertIn(f"{name:<5} stopped at", log)
+
+    def test_emergency_leaves_the_drives_on_when_nothing_else_holds(self):
+        """The reported failure: EMERGENCY cut drive power on a machine whose
+        brakes this software cannot command, and the camera sank."""
+        from psct_motors.external_brake import BrakeController, ExternalBrakeConfig
+        from psct_motors.config import BrakeConfig
+
+        for actuator in self.app.cfg.actuators:
+            actuator.brake = BrakeConfig(mode="none")
+        self.app.platform.external_brake = BrakeController(
+            ExternalBrakeConfig(mode="none"))
+
+        self.app._start_polling()
+        self.app.on_passivate()
+        self.pump(1.5)
+
+        for motor in self.app.platform.motors:
+            self.assertEqual(motor.get_mode(), 2,
+                             f"{motor.name} was passivated with nothing holding it")
+        self.assertIn("still on", self.app.action_var.get())
+        self.assertIn("drives: ON", self.app.log_text.get("1.0", "end"))
 
     def test_emergency_report_says_which_motor_did_not_answer(self):
         self.app._start_polling()
         self.pump(0.3)
         self.app.platform.motors[1]._transport.set_offline(True)
         self.app.on_passivate()
-        self.pump(1.2)
+        self.pump(1.5)
         log = self.app.log_text.get("1.0", "end")
-        self.assertIn("could NOT passivate East", log)
+        self.assertIn("East", log)
         self.assertIn("EMERGENCY incomplete", self.app.action_var.get())
 
     def test_stop_reports_where_it_stopped(self):

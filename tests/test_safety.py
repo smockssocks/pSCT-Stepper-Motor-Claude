@@ -8,6 +8,8 @@ each one is made to fail on purpose by removing the guard it covers.
 
 import os
 import sys
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -118,6 +120,136 @@ class TestBrakeInterlocks(unittest.TestCase):
         for motor in platform.motors:
             self.assertEqual(motor.get_mode(), int(MotorMode.POSITION),
                              f"{motor.name} was left passive")
+
+
+class TestEmergencyDoesNotDropTheCamera(unittest.TestCase):
+    """The failure this class exists for, reported from the telescope:
+
+        "The emergency stop doesn't stop, instead it just moves the motors all
+         the way down with no stopping and continues to keep going down till
+         the end of time."
+
+    EMERGENCY wrote MODE_REG = 0 straight away. The focal plane hangs on three
+    screws; the site's brakes are on a separate device this software cannot
+    command; so cutting drive power removed the only thing holding the camera
+    and it sank, back-driving the screws, with the encoder running down for as
+    long as there was travel left.
+    """
+
+    def _platform(self, brakes_controllable: bool):
+        cfg = safety.bench_config()
+        if brakes_controllable:
+            from psct_motors.config import BrakeConfig
+            for actuator in cfg.actuators:
+                actuator.brake = BrakeConfig(mode="output", settle_s=0.0)
+        platform = FocalPlanePlatform(cfg=cfg, simulate=True)
+        if not brakes_controllable:
+            # Exactly the site's situation: no brake this software can drive.
+            from psct_motors.external_brake import BrakeController, ExternalBrakeConfig
+            platform.external_brake = BrakeController(ExternalBrakeConfig(mode="none"))
+        platform.connect()
+        self.addCleanup(platform.disconnect)
+        return platform
+
+    def test_it_does_not_cut_power_when_nothing_else_is_holding(self):
+        from psct_motors.kinematics import Orientation
+        from psct_motors.registers import MotorMode
+
+        platform = self._platform(brakes_controllable=False)
+        platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+
+        result = platform.emergency_stop()
+
+        self.assertTrue(result.stopped)
+        self.assertFalse(result.drives_off, result.summary())
+        self.assertTrue(result.holding)
+        for motor in platform.motors:
+            self.assertEqual(motor.get_mode(), int(MotorMode.POSITION),
+                             f"{motor.name} was passivated with nothing holding it")
+
+    def test_the_camera_does_not_move_after_an_emergency_stop(self):
+        """The symptom itself: watch the axes afterwards and see them stay put.
+
+        The simulated actuators are loaded and fall when nothing holds them,
+        so this fails loudly against the old behaviour.
+        """
+        from psct_motors.kinematics import Orientation
+
+        platform = self._platform(brakes_controllable=False)
+        platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+        platform.emergency_stop()
+
+        settled = platform.read_actuator_positions_mm()
+        time.sleep(1.0)
+        after = platform.read_actuator_positions_mm()
+        drift = max(abs(a - b) for a, b in zip(settled, after))
+        self.assertLess(drift, 0.05,
+                        f"the focal plane moved {drift:.3f} mm after EMERGENCY")
+
+    def test_it_says_in_plain_words_that_the_drives_are_still_on(self):
+        from psct_motors.kinematics import Orientation
+        platform = self._platform(brakes_controllable=False)
+        platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+        summary = platform.emergency_stop().summary()
+        self.assertIn("drives: ON", summary)
+        self.assertIn("sink", summary.lower())
+        self.assertIn("brake", summary.lower())
+
+    def test_it_does_cut_power_once_the_brakes_are_confirmed(self):
+        """The interlock must not be a blanket refusal -- with brakes that read
+        back engaged, EMERGENCY still finishes the job."""
+        from psct_motors.kinematics import Orientation
+        from psct_motors.registers import MotorMode
+
+        platform = self._platform(brakes_controllable=True)
+        platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+        result = platform.emergency_stop()
+        self.assertTrue(result.brakes_engaged, result.summary())
+        self.assertTrue(result.drives_off, result.summary())
+        for motor in platform.motors:
+            self.assertEqual(motor.get_mode(), int(MotorMode.PASSIVE))
+
+    def test_motion_is_halted_before_power_is_touched(self):
+        """Passivating a moving shaft takes the power off something turning."""
+        from psct_motors.kinematics import Orientation
+
+        platform = self._platform(brakes_controllable=True)
+        for actuator in platform.cfg.actuators:
+            actuator.velocity_raw = 40
+        platform.move_to_orientation(Orientation(0.0, 0.0, 0.0))
+
+        done = threading.Event()
+
+        def mover():
+            try:
+                platform.move_to_orientation(Orientation(20.0, 0.0, 0.0))
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        threading.Thread(target=mover, daemon=True).start()
+        time.sleep(0.7)
+        result = platform.emergency_stop()
+        done.wait(timeout=20)
+
+        # It stopped where it was, nowhere near the commanded 20 mm.
+        self.assertLess(platform.read_orientation().focus_mm, 19.0)
+        for motor in platform.motors:
+            self.assertLess(abs(motor.get_target_mm() - motor.get_position_mm()), 1.0,
+                            f"{motor.name} was left commanded away from where it is")
+        self.assertTrue(result.stopped)
+
+    def test_passivate_all_refuses_unless_forced(self):
+        from psct_motors.registers import MotorMode
+        platform = self._platform(brakes_controllable=False)
+        with self.assertRaises(PlatformError) as ctx:
+            platform.passivate_all()
+        self.assertIn("Refusing to turn the drives off", str(ctx.exception))
+        # ...and the escape hatch still works, for a checked-by-hand shutdown.
+        self.assertEqual(platform.passivate_all(force=True), [])
+        for motor in platform.motors:
+            self.assertEqual(motor.get_mode(), int(MotorMode.PASSIVE))
 
 
 class TestSafetyDrills(unittest.TestCase):

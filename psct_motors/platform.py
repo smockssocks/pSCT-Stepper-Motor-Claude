@@ -47,6 +47,79 @@ class PlatformError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class EmergencyResult:
+    """What the EMERGENCY control actually did.
+
+    Every field is read back or observed, not assumed. The whole point of this
+    type is that an operator who pressed the button can be told the truth
+    about the state the machine is now in -- including, in particular, that
+    the drives were deliberately left on.
+    """
+
+    stop_problems: List[str]
+    brakes_engaged: bool
+    brake_message: str
+    drives_off: bool
+    drive_problems: List[str]
+    why_drives_are_still_on: str
+    positions_mm: Dict[str, float]
+    #: Axes that were passive with no confirmed brake, and were re-enabled so
+    #: that something is holding them.
+    took_hold: List[str] = field(default_factory=list)
+
+    @property
+    def holding(self) -> bool:
+        """True when something is holding the focal plane: brakes, or drives."""
+        return self.brakes_engaged or not self.drives_off
+
+    @property
+    def stopped(self) -> bool:
+        return not self.stop_problems
+
+    def summary(self) -> str:
+        lines = []
+        if self.stop_problems:
+            lines.append("EMERGENCY: motion halted, EXCEPT on "
+                         + "; ".join(self.stop_problems))
+        else:
+            lines.append("EMERGENCY: all three actuators halted and holding.")
+        for name, mm in self.positions_mm.items():
+            lines.append(f"  {name:<5} stopped at {mm:+9.4f} mm")
+        lines.append(f"  brakes: {self.brake_message}")
+        if self.drives_off:
+            lines.append("  drives: OFF. The brakes are holding the focal plane.")
+        else:
+            lines.append("  drives: ON and holding position. "
+                         + (self.why_drives_are_still_on or
+                            "The brakes are not confirmed, so the drives keep "
+                            "holding the load."))
+        if self.took_hold:
+            lines.append("  took hold of " + ", ".join(self.took_hold)
+                         + ": they were passive with no confirmed brake, so "
+                         "the drives were enabled to hold them where they are.")
+        if self.drive_problems:
+            lines.append("  could not passivate: " + "; ".join(self.drive_problems))
+        if not self.holding:
+            lines.append("  ** NOTHING IS CONFIRMED HOLDING THE FOCAL PLANE. "
+                         "Check it physically. **")
+        return "\n".join(lines)
+
+    def as_dict(self) -> dict:
+        return {
+            "stopped": self.stopped,
+            "stop_problems": list(self.stop_problems),
+            "brakes_engaged": self.brakes_engaged,
+            "brake_message": self.brake_message,
+            "drives_off": self.drives_off,
+            "drive_problems": list(self.drive_problems),
+            "why_drives_are_still_on": self.why_drives_are_still_on,
+            "positions_mm": dict(self.positions_mm),
+            "took_hold": list(self.took_hold),
+            "holding": self.holding,
+        }
+
+
+@dataclass(frozen=True)
 class HardStopProgress:
     """One step's worth of a coordinated hard-stop search, for a live display."""
 
@@ -1054,17 +1127,191 @@ class FocalPlanePlatform:
             self._log("STOP: all three actuators holding position.")
         return problems
 
-    def emergency_passivate(self) -> List[str]:
-        """Brakes on, drive off. The last resort.
+    def emergency_stop(self, force_drives_off: bool = False) -> "EmergencyResult":
+        """The EMERGENCY control: stop, engage the brakes, and only then --
+        if the brakes are confirmed holding -- cut drive power.
 
-        Note what this gives up: with the drive passive the motor is not
-        holding anything. If the brakes are not actually wired and working,
-        the load is then held only by screw friction. Prefer `stop()`.
+        This used to write MODE_REG = 0 straight away, and on this telescope
+        that was the worst thing it could do. The focal plane hangs on three
+        screws; the brakes are on a separate device this software cannot
+        command; so removing drive power left the camera held by nothing but
+        screw friction, and it sank -- back-driving the screws, with the
+        encoder count running down, for as long as there was travel left.
+        The drives were the only thing holding it, and EMERGENCY turned them
+        off.
 
-        Returns the motors it could not passivate, one string each, so a
-        caller can report what actually happened rather than assuming it
-        worked. An empty list means every motor was passivated.
+        So the order is now: hold first, give up holding only if something
+        else has taken over.
+
+        1. Stop every axis and keep it powered and holding. Always. This is
+           the part that is unconditionally safe and it happens first.
+        2. Engage the brakes, if there is anything here that can engage them.
+        3. Read the brakes back. Only if every one of them is *confirmed*
+           engaged are the drives passivated.
+
+        If the brakes cannot be confirmed, the drives stay on and holding and
+        the result says so in as many words. That is not a failure: a powered
+        drive holding position is a safe state, and it is a far better one
+        than an unpowered drive over a falling camera.
+
+        `force_drives_off` overrides step 3 for the case where somebody has
+        engaged the brakes by hand and genuinely wants the drives off. It is
+        never set by the EMERGENCY button.
         """
+        self._abort.set()
+        stamp_positions: Dict[str, float] = {}
+
+        # --- 1. stop, under power -----------------------------------------
+        stop_problems = self.stop()
+
+        # --- 2. brakes -----------------------------------------------------
+        brakes_engaged, brake_message = self._engage_brakes_for_emergency()
+
+        # --- 3. drives off only if something else is holding ---------------
+        drives_off = False
+        drive_problems: List[str] = []
+        why_still_on = ""
+        took_hold: List[str] = []
+        if brakes_engaged or force_drives_off:
+            for motor in self.motors:
+                try:
+                    # Already stopped above; passivate must not re-stop and
+                    # must not wait, because this is the emergency path.
+                    motor.passivate(engage_brake_first=True, stop_first=False)
+                except (ModbusError, MotorFault) as exc:
+                    drive_problems.append(f"{motor.name}: {exc}")
+            drives_off = not drive_problems
+        else:
+            took_hold = self._take_hold()
+            why_still_on = (
+                "The drives are still ON and holding position, deliberately. "
+                f"{brake_message} With the drives off and nothing holding the "
+                "brakes, the focal plane would be supported only by screw "
+                "friction and could sink. Engage the brakes from the brake "
+                "page, then use `cli passivate --force` if you need the drives "
+                "electrically off."
+            )
+
+        for motor in self.motors:
+            try:
+                stamp_positions[motor.name] = motor.get_position_mm()
+            except (ModbusError, MotorFault):
+                pass
+
+        result = EmergencyResult(
+            stop_problems=stop_problems,
+            brakes_engaged=brakes_engaged,
+            brake_message=brake_message,
+            drives_off=drives_off,
+            drive_problems=drive_problems,
+            why_drives_are_still_on=why_still_on,
+            positions_mm=stamp_positions,
+            took_hold=took_hold,
+        )
+        self._log(result.summary())
+        return result
+
+    def _take_hold(self) -> List[str]:
+        """Enable any drive that is passive, so it holds where it is.
+
+        If EMERGENCY is pressed while a drive is already passive and the
+        brakes are not confirmed, nothing at all is holding that axis -- the
+        camera is on screw friction and may already be sinking. Enabling the
+        drive is what stops that, so the emergency control does it rather than
+        reporting an unsafe state it could have fixed.
+
+        The target is written *before* the mode change, so the motor holds the
+        position it is at instead of jumping to whatever stale P_SOLL it was
+        left with. Returns the axes it took hold of.
+        """
+        from .registers import MotorMode
+
+        taken = []
+        for motor in self.motors:
+            try:
+                if motor.get_mode() == int(MotorMode.POSITION):
+                    continue
+                motor.command_position_counts(motor.get_projected_position_counts())
+                motor.ensure_position_mode()
+                taken.append(motor.name)
+            except (ModbusError, MotorFault) as exc:
+                self._log(
+                    f"{motor.name}: could not take hold of a passive axis: {exc}. "
+                    "If the brakes are also off, this actuator is held by "
+                    "nothing -- check the focal plane physically."
+                )
+        if taken:
+            self._log(
+                "EMERGENCY: " + ", ".join(taken) + " were passive with no "
+                "confirmed brake, so the drives were enabled to hold them "
+                "where they are."
+            )
+        return taken
+
+    #: Kept because the server and the LabVIEW API call it by this name. It is
+    #: the same safe sequence -- there is deliberately no way to reach the old
+    #: "cut power immediately" behaviour through an emergency control.
+    emergency_passivate = emergency_stop
+
+    def _engage_brakes_for_emergency(self):
+        """Try to engage the brakes. Returns (confirmed_engaged, message)."""
+        from .external_brake import BrakeError
+
+        if self.external_brake.available:
+            try:
+                self.external_brake.engage()
+            except BrakeError as exc:
+                return False, f"The brakes could not be engaged ({exc})."
+            try:
+                state = self.external_brake.read_state()
+            except BrakeError as exc:
+                return False, f"The brakes were commanded on but cannot be read back ({exc})."
+            if state is BrakeState.ENGAGED:
+                return True, "The brakes are engaged and read back engaged."
+            return False, f"The brakes were commanded on but read back {state.value}."
+
+        controllable = [m for m in self.motors if m.brake_is_software_controlled]
+        if not controllable:
+            return False, (
+                "There are no brakes under software control on this "
+                "installation -- they are switched by a separate device."
+            )
+
+        problems = []
+        for motor in controllable:
+            try:
+                motor.engage_brake()
+            except (ModbusError, MotorFault) as exc:
+                problems.append(f"{motor.name}: {exc}")
+        if problems:
+            return False, "Some brakes did not engage: " + "; ".join(problems) + "."
+        if len(controllable) != len(self.motors):
+            missing = [m.name for m in self.motors if not m.brake_is_software_controlled]
+            return False, (
+                f"Only some actuators have a software-controlled brake; "
+                f"{', '.join(missing)} do not."
+            )
+        return True, "The brakes are engaged and read back engaged."
+
+    def passivate_all(self, force: bool = False) -> List[str]:
+        """Deliberately remove drive power from all three motors.
+
+        For maintenance, not for an emergency -- `emergency_stop` is the
+        button. Refuses unless the brakes are confirmed engaged, because with
+        the drives off and the brakes off the focal plane is held by nothing.
+        `force=True` overrides that, for somebody who has checked the brakes
+        by hand.
+        """
+        if not force:
+            engaged, message = self._engage_brakes_for_emergency()
+            if not engaged:
+                raise PlatformError(
+                    f"Refusing to turn the drives off. {message} With the "
+                    "drives off and the brakes not holding, the focal plane "
+                    "rests on screw friction alone and can sink. Engage the "
+                    "brakes first, or pass --force if you have checked them "
+                    "by hand."
+                )
         self._abort.set()
         problems = []
         for motor in self.motors:
@@ -1072,10 +1319,6 @@ class FocalPlanePlatform:
                 motor.passivate(engage_brake_first=True)
             except (ModbusError, MotorFault) as exc:
                 problems.append(f"{motor.name}: {exc}")
-        if problems:
-            self._log("EMERGENCY PASSIVATE had trouble on: " + "; ".join(problems))
-        else:
-            self._log("EMERGENCY PASSIVATE: brakes engaged, drives off.")
         return problems
 
     # ---------------------------------------------------------------- brakes
