@@ -536,7 +536,33 @@ class PlatformConfig:
     external_brake: "ExternalBrakeSettings" = field(
         default_factory=lambda: ExternalBrakeSettings())
 
+    # --- what the gauge measures from ------------------------------------
+    #: Distance along the optical axis from the zero reference to each
+    #: mirror, in millimetres, so the gauge can show "distance to M1" or
+    #: "distance to M2" instead of "distance from zero".
+    #:
+    #: None until somebody enters them: nobody has the figures yet, and they
+    #: change whenever the zero is re-set or the mirrors are re-surveyed, so
+    #: they are settings rather than constants. With them unset the gauge says
+    #: "distance not set" in those references rather than inventing a number.
+    #: Every command is still expressed in focus millimetres from zero; these
+    #: only change what the gauge's labels say.
+    zero_to_m1_mm: Optional[float] = None
+    zero_to_m2_mm: Optional[float] = None
+    #: Which reference the gauge opens showing: "zero", "m1" or "m2".
+    gauge_reference: str = "zero"
+
     def validate(self) -> None:
+        if self.gauge_reference not in ("zero", "m1", "m2"):
+            raise ValueError(
+                f"gauge_reference must be 'zero', 'm1' or 'm2', got "
+                f"{self.gauge_reference!r}")
+        for name in ("zero_to_m1_mm", "zero_to_m2_mm"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(
+                    f"{name} must be a positive distance in millimetres, or "
+                    f"null if it is not known; got {value}")
         if len(self.actuators) != 3:
             raise ValueError(
                 f"The focal plane is a three-point mount: expected 3 actuators, "

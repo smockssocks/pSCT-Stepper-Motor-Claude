@@ -47,6 +47,32 @@ def display_available() -> bool:
     return True
 
 
+class ScratchConfig:
+    """Point the default configuration at a scratch directory for a test.
+
+    The application writes the machine's position record beside its
+    configuration. The tests below build the app against the default
+    configuration path, so without this every simulated move they make would
+    leave a line in the real telescope's record.
+    """
+
+    def __enter__(self):
+        import tempfile
+        self._previous = os.environ.get("PSCT_MOTORS_CONFIG")
+        self._dir = tempfile.mkdtemp()
+        os.environ["PSCT_MOTORS_CONFIG"] = os.path.join(self._dir, "psct_motors.json")
+        return self
+
+    def __exit__(self, *exc):
+        if self._previous is None:
+            os.environ.pop("PSCT_MOTORS_CONFIG", None)
+        else:
+            os.environ["PSCT_MOTORS_CONFIG"] = self._previous
+        for name in os.listdir(self._dir):
+            os.remove(os.path.join(self._dir, name))
+        os.rmdir(self._dir)
+
+
 def gui_config(velocity_raw=8000):
     cfg = default_config()
     for a in cfg.actuators:
@@ -74,6 +100,7 @@ class TestGui(unittest.TestCase):
         from psct_motors.gui import MotorApp
         from psct_motors.platform import FocalPlanePlatform
 
+        self._scratch = ScratchConfig().__enter__()
         self.root = tk.Tk()
         self.root.withdraw()
         self.app = MotorApp(self.root, simulate=True)
@@ -99,6 +126,7 @@ class TestGui(unittest.TestCase):
         self.app = None
         self.root = None
         gc.collect()
+        self._scratch.__exit__(None, None, None)
 
     def pump(self, seconds: float) -> None:
         """Run the tk event loop for a while without blocking on mainloop."""
@@ -582,6 +610,120 @@ class TestGui(unittest.TestCase):
         for b, a in zip(before, after):
             self.assertAlmostEqual(b, a, places=4)
 
+    # ---- supply column ---------------------------------------------------
+
+    def test_each_row_shows_the_supply(self):
+        """Raw until `cli supply` has recorded the scale, volts afterwards."""
+        self.app._start_polling()
+        self.pump(0.5)
+        for row in self.app.rows.values():
+            self.assertIn("raw", row.supply_var.get())
+        for actuator in self.app.cfg.actuators:
+            actuator.supply_nominal_v = 48.0
+            actuator.supply_raw_at_nominal = 4485       # what the simulator reads
+        self.pump(1.5)                  # more than one idle poll interval
+        self.assertEqual(self.app.rows["Top"].supply_var.get(), "48.0 V")
+
+    # ---- gauge reference ---------------------------------------------------
+
+    def test_the_gauge_can_measure_from_m1_or_m2(self):
+        gauge = self.app.gauge
+        self.app.cfg.zero_to_m1_mm = 1000.0
+        self.app._apply_gauge_reference("m1")
+        self.assertEqual(gauge.format_value(3.0), "997.0000 mm")
+        self.assertEqual(self.app.gauge_frame.cget("text"), "Distance to M1")
+        # Ticks are round numbers in the units shown, not in focus mm.
+        values = [value for value, _mm in gauge._ticks()]
+        self.assertTrue(all(abs(v - round(v)) < 1e-9 for v in values), values)
+        self.assertTrue(all(abs(v - gauge.display_value(mm)) < 1e-9
+                            for v, mm in gauge._ticks()))
+
+        self.app.cfg.zero_to_m2_mm = 500.0
+        self.app._apply_gauge_reference("m2")
+        self.assertEqual(gauge.format_value(-2.0), "498.0000 mm")
+
+        self.app._apply_gauge_reference("zero")
+        self.assertEqual(gauge.format_value(-2.0), "-2.0000 mm")
+
+    def test_the_gauge_says_so_when_a_distance_is_not_known(self):
+        """No invented numbers: until the distance is entered, the reference
+        is shown as unavailable rather than measured from a guess."""
+        self.app.cfg.zero_to_m1_mm = None
+        self.app._apply_gauge_reference("m1")
+        self.assertFalse(self.app.gauge.reference_available)
+        self.assertIn("distance not set", self.app.gauge_frame.cget("text"))
+        self.assertIsNone(self.app.gauge.display_value(1.0))
+        self.assertEqual(self.app.gauge.format_value(1.0), "distance not set")
+
+    def test_the_reference_chooser_drives_the_gauge(self):
+        self.app.cfg.zero_to_m1_mm = 800.0
+        self.app.gauge_reference_var.set(self.app.REFERENCE_CHOICES["m1"])
+        self.app.on_gauge_reference_changed()
+        self.assertEqual(self.app.gauge.reference, "m1")
+        self.assertEqual(self.app.cfg.gauge_reference, "m1")
+
+    # ---- position log ------------------------------------------------------
+
+    def test_the_position_log_lists_moves_and_can_go_back(self):
+        self.app._start_polling()
+        self.app.on_open_position_log()
+        self.pump(0.2)
+        start = self.app.platform.read_orientation().focus_mm
+        self.app.platform.move_to_orientation(Orientation(start + 2.0, 0.0, 0.0))
+        self.pump(0.4)
+        tree = self.app._history_tree
+        rows = tree.get_children()
+        self.assertEqual(len(rows), 1)
+        cells = tree.item(rows[0])["values"]
+        self.assertEqual(cells[1], "move")
+        self.assertIn(f"{start + 2.0:+.4f}", str(cells[4]))       # 'after'
+
+        self._answer(True, self.app.on_go_back)
+        self.pump(2.5)
+        self.assertAlmostEqual(self.app.platform.read_orientation().focus_mm,
+                               start, places=2)
+        rows = tree.get_children()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(tree.item(rows[0])["values"][1], "go-back")
+
+    def test_go_back_with_nothing_recorded_does_not_move(self):
+        before = self.app.platform.read_orientation().focus_mm
+        self._answer(True, self.app.on_go_back)
+        self.pump(0.3)
+        self.assertAlmostEqual(self.app.platform.read_orientation().focus_mm,
+                               before, places=4)
+        self.assertEqual(len(self.app.platform.history), 0)
+
+    # ---- layout --------------------------------------------------------------
+
+    def test_nothing_in_the_actuator_table_shares_a_row_with_the_legend(self):
+        """The jog footer used to be gridded on the same row as the brake key,
+        so the key was drawn underneath it and only its tail showed."""
+        from psct_motors.gui import MotorRow
+        rows_used = {}
+        for child in self.app.actuator_frame.winfo_children():
+            info = child.grid_info()
+            if int(info.get("columnspan", 1)) == MotorRow.NCOLS:
+                rows_used.setdefault(int(info["row"]), []).append(child)
+        clashes = {row: kids for row, kids in rows_used.items() if len(kids) > 1}
+        self.assertEqual(clashes, {}, "full-width frames on the same grid row")
+
+    def test_the_stop_bar_text_wraps_rather_than_widening_the_window(self):
+        self.root.deiconify()
+        self.pump(0.3)
+        # A window that fits a 1600-pixel screen. The unwrapped explanation
+        # pushed it to about 1700, with the gauge and Clear button off-screen.
+        self.assertLess(self.root.winfo_reqwidth(), 1500,
+                        f"window wants {self.root.winfo_reqwidth()} px")
+        self.assertGreater(int(self.app.action_label.cget("wraplength")), 0)
+
+    def test_a_second_start_does_not_double_the_polling(self):
+        self.app._start_polling()
+        self.app._start_polling()
+        self.pump(0.3)
+        pollers = [t for t in threading.enumerate() if t.name == "poll" and t.is_alive()]
+        self.assertEqual(len(pollers), 1)
+
     def _answer(self, answer, fn):
         """Call `fn` with every dialog answered `answer`."""
         from psct_motors import gui
@@ -642,6 +784,7 @@ class TestEveryControlWorks(unittest.TestCase):
         from psct_motors.gui import MotorApp
         from psct_motors.platform import FocalPlanePlatform
 
+        self._scratch = ScratchConfig().__enter__()
         self.root = tk.Tk()
         self.root.withdraw()
         self.app = MotorApp(self.root, simulate=True)
@@ -696,6 +839,7 @@ class TestEveryControlWorks(unittest.TestCase):
         self.app = None
         self.root = None
         gc.collect()
+        self._scratch.__exit__(None, None, None)
 
     def pump(self, seconds: float) -> None:
         end = time.monotonic() + seconds

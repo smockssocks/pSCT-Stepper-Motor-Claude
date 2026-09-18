@@ -86,12 +86,20 @@ drives.
 - Focus readout in mm and microns, and which way it is from zero.
 - Absolute focus moves with **Preview**, nudge buttons, and one-click step
   sizes down to 1 µm.
-- A **distance-from-zero gauge** down the right: 0 in the middle, + towards M1
-  above, − towards M2 below, travel limits marked, target shown while moving.
-- Per-actuator position, mode, brake lamp and jog, with a **key underneath**
-  spelling out what every lamp and colour means. The brake lamps are blue for
-  HOLDING and amber for FREE, deliberately not green/red: a released brake is
-  not "good", it means the camera is hanging on the drives.
+- A **position gauge** down the right: + towards M1 above, − towards M2 below,
+  travel limits and found ends of travel marked, target shown while moving.
+  The chooser above it sets what the numbers are measured **from**: the zero
+  set by `set-zero` (the default, and what every command is expressed in),
+  or the distance to M1 or to M2. The last two need the distance from zero
+  to that mirror, which nobody has yet — enter it under *Tools → Distances*
+  (or the button under the gauge) once it is known; until then the gauge says
+  "distance not set" rather than showing a made-up number.
+- Per-actuator position, mode, brake lamp, load, **supply voltage** and jog,
+  with a **key underneath** spelling out what every lamp and colour means.
+  The brake lamps are blue for HOLDING and amber for FREE, deliberately not
+  green/red: a released brake is not "good", it means the camera is hanging
+  on the drives. Supply shows volts once `cli supply` has recorded the scale,
+  and the raw register value until then.
 - A timestamped log of everything the application did.
 
 Behind the menus, so the main window stays about the job:
@@ -99,10 +107,13 @@ Behind the menus, so the main window stays about the job:
 | where | what |
 |---|---|
 | **Motion → Tip and tilt** | the two tilt angles, with nudges and a Level button |
+| **Motion → Go back to the previous position** | return to where the focal plane was before the last move — an ordinary checked move, with confirmation |
+| **View → Position log** | every move, newest first: where the plane was, where it was sent, where it ended up; select a line and go back to it |
 | **View → Focal plane picture** | live drawing of the plate on its three actuators |
 | **View → Load and torque** | how hard each motor is working, big enough to read across a room, with peaks, temperature and supply |
 | **Tools → Connection settings** | edit each motor's IP and port, use now or save |
 | **Tools → Motion limits** | focus, tilt and step limits; set them from the ends of travel that Find hard stop discovered |
+| **Tools → Distances from zero to M1 and M2** | the two numbers the gauge needs to show distance to a mirror instead of distance from zero |
 | **Tools → Find hard stop** | run the actuators out to the end of travel |
 | **Tools → Run safety drills** | prove the guards still fire (simulated, safe any time) |
 
@@ -175,6 +186,27 @@ Faster is not free: every poll is a set of Modbus TCP transactions per motor,
 three motors at a time on the telescope. If the event log starts reporting
 slow transactions, ease it back — a poll that takes longer than the interval
 is not giving you fresher numbers, it is queueing.
+
+### Where the focal plane has been
+
+The motors keep no history at all — there is no event log or fault buffer
+anywhere in the drive — so the software writes one. Every move it commands
+goes into `config/positions.jsonl`, beside the configuration: when, what kind
+of move (move, nudge, jog, find-stop, go-back), where the focal plane was
+before, where it was sent, where it actually ended up, and whether it
+finished. A halted move is recorded too, because its "after" is where the
+plane really is.
+
+*View → Position log* shows it, newest first. Select a line and either return
+to its "before" or go to its "after"; *Motion → Go back to the previous
+position* does the common case in one click. Each of those is an ordinary
+move: it is checked against the limits and the step size, previewed, and
+confirmed, exactly as a typed one is. Going back is never an unchecked path.
+
+```
+python -m psct_motors.cli history              # the same record, in text
+python -m psct_motors.cli go-back              # back to before the last move
+```
 
 ### Finding the end of travel
 

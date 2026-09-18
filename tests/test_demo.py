@@ -89,8 +89,8 @@ class TestFaultInjection(unittest.TestCase):
         self.assertLess(failures, 40)
 
     def test_error_bits_injection(self):
-        self.injector.arm(Fault.ERROR_BITS, error_bits_value=1 << 5)
-        self.assertEqual(self.motor.get_errors(), 1 << 5)
+        self.injector.arm(Fault.ERROR_BITS, error_bits_value=1 << 6)
+        self.assertEqual(self.motor.get_errors(), 1 << 6)
         self.assertIn("Temperature", self.motor.error_text())
         self.injector.clear()
         self.assertEqual(self.motor.get_errors(), 0)

@@ -688,7 +688,7 @@ def drill_fault_error_bits(ctx: DemoContext) -> DrillResult:
     if not ctx.confirm_motion():
         result.note("Motion not permitted, so this runs as a stationary check.")
         with ctx.injector:
-            ctx.injector.arm(Fault.ERROR_BITS, error_bits_value=1 << 5)
+            ctx.injector.arm(Fault.ERROR_BITS, error_bits_value=1 << 6)
             errors = ctx.motor.get_errors()
             result.note(f"ERR_BITS reads 0x{errors:08X} -> {describe_errors(errors)}")
         return result.ok("The error register is read and decoded. Re-run with "

@@ -45,11 +45,13 @@ from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
 from .config import load_config, save_config, default_config_path
-from .focus_gauge import FocusGauge
+from .focus_gauge import REFERENCE_TITLES, REFERENCES, FocusGauge
+from .history import MoveRecord, default_history_path
 from .plane_view import FocalPlaneView
 from .jvl_motor import BrakeState
 from .kinematics import Orientation
 from .platform import FocalPlanePlatform, PlatformError, PlatformState
+from .registers import describe_errors_short
 
 # Indicator colours, shared by the brake lamps and the status pills.
 COLOR_OK = "#1b8a3a"
@@ -192,6 +194,10 @@ class MotorRow:
     MODE_SAMPLES = ("Passive", "Velocity", "Position", "Gear", "no comms", "--")
     BRAKE_SAMPLES = ("HOLDING?", "FREE?", "unknown")
     NAME_FONT = ("TkDefaultFont", 11, "bold")
+    #: How many grid columns a row occupies. Anything spanning the table --
+    #: the legend, the footer -- spans this many, so adding a column here
+    #: cannot leave them one short.
+    NCOLS = 15
 
     def __init__(self, parent, name: str, row: int, app: "MotorApp"):
         self.name = name
@@ -202,11 +208,11 @@ class MotorRow:
         self.name_label.grid(row=row, column=0, padx=(6, 2), sticky="w")
 
         self.position_var = tk.StringVar(value="--")
-        ttk.Label(parent, textvariable=self.position_var, width=14, anchor="e",
+        ttk.Label(parent, textvariable=self.position_var, width=12, anchor="e",
                   font=("TkFixedFont", 10)).grid(row=row, column=1, padx=2)
 
         self.counts_var = tk.StringVar(value="--")
-        ttk.Label(parent, textvariable=self.counts_var, width=13, anchor="e",
+        ttk.Label(parent, textvariable=self.counts_var, width=12, anchor="e",
                   font=("TkFixedFont", 9), foreground="#555").grid(row=row, column=2, padx=2)
 
         self.mode_lamp = Lamp(parent)
@@ -231,23 +237,34 @@ class MotorRow:
                   font=("TkFixedFont", 10, "bold"), foreground="#333").grid(
             row=row, column=8, padx=(2, 6), sticky="w")
 
+        # The drive's supply. Volts once `cli supply` has recorded the scale,
+        # the raw register value until then -- and labelled as raw, because
+        # the drive's units are not documented and are not guessed at here.
+        self.supply_var = tk.StringVar(value="--")
+        ttk.Label(parent, textvariable=self.supply_var, width=9, anchor="e",
+                  font=("TkFixedFont", 10), foreground="#333").grid(
+            row=row, column=9, padx=(2, 6))
+
         self.release_btn = ttk.Button(
             parent, text="Release", width=8,
             command=lambda: app.on_brake(name, engage=False))
-        self.release_btn.grid(row=row, column=9, padx=2)
+        self.release_btn.grid(row=row, column=10, padx=2)
         self.engage_btn = ttk.Button(
             parent, text="Engage", width=8,
             command=lambda: app.on_brake(name, engage=True))
-        self.engage_btn.grid(row=row, column=10, padx=2)
+        self.engage_btn.grid(row=row, column=11, padx=2)
 
         ttk.Button(parent, text="▼", width=3,
-                   command=lambda: app.on_jog(name, -1)).grid(row=row, column=11, padx=(10, 1))
+                   command=lambda: app.on_jog(name, -1)).grid(row=row, column=12, padx=(10, 1))
         ttk.Button(parent, text="▲", width=3,
-                   command=lambda: app.on_jog(name, +1)).grid(row=row, column=12, padx=1)
+                   command=lambda: app.on_jog(name, +1)).grid(row=row, column=13, padx=1)
 
+        # Short form in the row -- the hex and the first name -- because the
+        # full decode with its caveats is a sentence long and stretched the
+        # whole table. The full text is in the log whenever the bits change.
         self.error_var = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.error_var, foreground=COLOR_BAD,
-                  anchor="w").grid(row=row, column=13, padx=(10, 6), sticky="w")
+                  anchor="w").grid(row=row, column=14, padx=(10, 6), sticky="w")
 
     def update(self, status) -> None:
         if status.comms_error:
@@ -256,6 +273,7 @@ class MotorRow:
             self.mode_var.set("no comms")
             self.load_bar.set(None, "--")
             self.load_var.set("")
+            self.supply_var.set("--")
             self.mode_lamp.set(COLOR_BAD)
             self.brake_var.set("unknown")
             self.brake_lamp.set(COLOR_IDLE)
@@ -292,7 +310,15 @@ class MotorRow:
         else:
             self.load_var.set(f"{status.torque_percent:>3.0f}% load")
 
-        self.error_var.set(status.error_text if status.error_bits else "")
+        if status.bus_voltage is None:
+            self.supply_var.set("--")
+        elif status.supply_volts is not None:
+            self.supply_var.set(f"{status.supply_volts:.1f} V")
+        else:
+            self.supply_var.set(f"{status.bus_voltage} raw")
+
+        self.error_var.set(describe_errors_short(status.error_bits)
+                           if status.error_bits else "")
 
     def set_brake_controls_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
@@ -322,18 +348,22 @@ class MotorApp:
             # a slow poll would silently make the stationary case quicker.
             self.cfg.idle_poll_interval_s = max(poll_interval_s,
                                                 self.cfg.idle_poll_interval_s)
-        self.platform = FocalPlanePlatform(
-            cfg=self.cfg, simulate=simulate, logger=self.log_threadsafe,
-            config_path=config_path,
-        )
-        self.root.title(self._window_title())
-
         self._busy = False
         self._poll_stop = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
         #: Closures posted by worker threads, executed on the UI thread.
+        #: Created before the platform, whose logger posts here.
         self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
         self._ui_job: Optional[str] = None
+        self._history_window = None
+        self._history_tree = None
+        self._history_rows: List[MoveRecord] = []
+        #: How many records the log window last drew, so a poll can notice a
+        #: move that was recorded without the change callback firing.
+        self._history_drawn = -1
+
+        self.platform = self._make_platform()
+        self.root.title(self._window_title())
 
         self._build_ui()
         self._drain_ui()
@@ -364,6 +394,20 @@ class MotorApp:
         self.log("Press Connect to begin.")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.report_callback_exception = self._on_callback_error
+
+    def _make_platform(self) -> FocalPlanePlatform:
+        """The platform, with its position history written beside the config.
+
+        The history file is per machine, like the configuration, so it goes
+        in the same place -- and it is passed explicitly because a platform
+        built for a test or a safety drill must not write one.
+        """
+        return FocalPlanePlatform(
+            cfg=self.cfg, simulate=self.simulate, logger=self.log_threadsafe,
+            config_path=self.config_path,
+            history_path=default_history_path(self.config_path),
+            on_history_change=lambda: self.post(self._refresh_position_log),
+        )
 
     def _on_callback_error(self, exc_type, exc_value, exc_traceback) -> None:
         """Surface a crash in a button or menu command.
@@ -449,12 +493,19 @@ class MotorApp:
         motion = tk.Menu(menubar, tearoff=0)
         motion.add_command(label="Tip and tilt...", command=self.on_open_tilt)
         motion.add_separator()
+        motion.add_command(label="Go back to the previous position",
+                           command=self.on_go_back)
+        motion.add_command(label="Position log...",
+                           command=self.on_open_position_log)
+        motion.add_separator()
         motion.add_command(label="Set zero here", command=self.on_set_zero)
         motion.add_command(label="Copy current orientation into the boxes",
                            command=self.on_copy_current)
         menubar.add_cascade(label="Motion", menu=motion)
 
         view = tk.Menu(menubar, tearoff=0)
+        view.add_command(label="Position log...",
+                         command=self.on_open_position_log)
         view.add_command(label="Focal plane picture...",
                          command=self.on_open_plane_view)
         view.add_command(label="Load and torque...",
@@ -466,6 +517,8 @@ class MotorApp:
                           command=self.on_edit_connection)
         tools.add_command(label="Motion limits...",
                           command=self.on_edit_limits)
+        tools.add_command(label="Distances from zero to M1 and M2...",
+                          command=self.on_edit_reference_distances)
         tools.add_command(label="Find hard stop (calibration)...",
                           command=self.on_find_hard_stop)
         tools.add_command(label="Run safety drills (simulated)...",
@@ -499,7 +552,7 @@ class MotorApp:
             font=("TkDefaultFont", 9, "bold"), height=2,
         ).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
 
-        tk.Label(
+        explanation = tk.Label(
             bar,
             text="STOP decelerates and holds position with the drives still on. "
                  "EMERGENCY does that too, then engages the brakes, and turns the "
@@ -507,7 +560,10 @@ class MotorApp:
                  "they stay on, because they are the only thing holding the camera. "
                  "Neither asks for confirmation.",
             bg=COLOR_STOP_DARK, fg="#ffd7d7", font=("TkDefaultFont", 8),
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2))
+            justify="left", anchor="w",
+        )
+        explanation.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8,
+                         pady=(0, 2))
 
         # What the last STOP or EMERGENCY actually did. These controls act
         # without asking, so the result has to be visible without going to
@@ -516,10 +572,32 @@ class MotorApp:
         self.action_label = tk.Label(
             bar, textvariable=self.action_var, bg=COLOR_STOP_DARK, fg="white",
             font=("TkDefaultFont", 9, "bold"), anchor="w", justify="left",
-            wraplength=900,
         )
         self.action_label.grid(row=2, column=0, columnspan=2, sticky="ew",
                                padx=8, pady=(0, 4))
+
+        # Both labels wrap to the bar's width, whatever that turns out to be.
+        # Without this the explanation ran as one line about 1700 px long, and
+        # since a window is never narrower than its widest child, it pushed
+        # the whole application past the right edge of any ordinary screen --
+        # the gauge, the log's Clear button and the end of the text itself
+        # were simply off-screen.
+        self._wrap_to_width(bar, explanation, self.action_label)
+
+    @staticmethod
+    def _wrap_to_width(container, *labels, margin: int = 24) -> None:
+        """Keep `labels` wrapped to `container`'s current width.
+
+        Tk labels do not wrap on their own: `wraplength` is a fixed number of
+        pixels, and a label with none set is exactly as wide as its text. So
+        the wrap length follows the container as it is resized, and a long
+        sentence can never be the thing that decides how wide the window is.
+        """
+        def resize(event) -> None:
+            width = max(200, event.width - margin)
+            for label in labels:
+                label.configure(wraplength=width)
+        container.bind("<Configure>", resize, add="+")
 
     def _build_connection(self) -> None:
         frame = ttk.LabelFrame(self.root, text="Connection")
@@ -554,7 +632,7 @@ class MotorApp:
         "released" is the state where the camera hangs on the drives.
         """
         legend = ttk.Frame(parent)
-        legend.grid(row=row, column=0, columnspan=14, sticky="w",
+        legend.grid(row=row, column=0, columnspan=MotorRow.NCOLS, sticky="w",
                     padx=8, pady=(8, 0))
 
         ttk.Label(legend, text="key:", foreground="#555",
@@ -576,8 +654,8 @@ class MotorApp:
             column += 2
 
         brake_key = ttk.Frame(parent)
-        brake_key.grid(row=row + 1, column=0, columnspan=14, sticky="w",
-                       padx=8, pady=(2, 0))
+        brake_key.grid(row=row + 1, column=0, columnspan=MotorRow.NCOLS,
+                       sticky="w", padx=8, pady=(2, 0))
         ttk.Label(brake_key, text="brake:", foreground="#555",
                   font=("TkDefaultFont", 8, "bold")).grid(row=0, column=0,
                                                            padx=(0, 6))
@@ -599,8 +677,8 @@ class MotorApp:
                   font=("TkDefaultFont", 8)).grid(row=0, column=column)
 
         load_key = ttk.Frame(parent)
-        load_key.grid(row=row + 2, column=0, columnspan=14, sticky="w",
-                      padx=8, pady=(2, 0))
+        load_key.grid(row=row + 2, column=0, columnspan=MotorRow.NCOLS,
+                      sticky="w", padx=8, pady=(2, 0))
         ttk.Label(load_key, text="load:", foreground="#555",
                   font=("TkDefaultFont", 8, "bold")).grid(row=0, column=0,
                                                            padx=(0, 6))
@@ -608,7 +686,9 @@ class MotorApp:
             load_key,
             text=("torque as % of the drive's current limit (these motors "
                   "report no amps). Dashed lines mark the warning and stall "
-                  "levels; the dark tick is the peak since the window opened."),
+                  "levels; the dark tick is the peak since the window opened. "
+                  "supply: the drive's bus voltage, in volts once `cli supply` "
+                  "has recorded the scale, raw until then."),
             foreground="#555", font=("TkDefaultFont", 8), wraplength=760,
             justify="left",
         ).grid(row=0, column=1, sticky="w")
@@ -696,7 +776,7 @@ class MotorApp:
         frame.grid(row=1, column=0, sticky="nsew", pady=3)
 
         headers = ["", "position", "counts", "", "mode", "", "brake",
-                   "load", "", "", "", "jog", "", ""]
+                   "load", "", "supply", "", "", "jog", "", ""]
         for col, text in enumerate(headers):
             if text:
                 ttk.Label(frame, text=text, foreground="#555",
@@ -716,11 +796,16 @@ class MotorApp:
         frame.columnconfigure(6, minsize=pixels_for(
             "TkDefaultFont", *MotorRow.BRAKE_SAMPLES))
 
-        self._build_legend(frame, row=len(self.cfg.actuators) + 1)
+        # The legend takes three rows (lamps, brakes, load). The footer goes
+        # after all three. It used to be placed on the second of them, so the
+        # jog controls were drawn on top of the brake key and the only visible
+        # trace of that line was its tail end peeking out past the buttons.
+        legend_row = len(self.cfg.actuators) + 1
+        self._build_legend(frame, row=legend_row)
 
         footer = ttk.Frame(frame)
-        footer.grid(row=len(self.cfg.actuators) + 2, column=0, columnspan=14,
-                    sticky="w", padx=6, pady=(6, 6))
+        footer.grid(row=legend_row + 3, column=0,
+                    columnspan=MotorRow.NCOLS, sticky="w", padx=6, pady=(6, 6))
         ttk.Label(footer, text="jog step (mm)").grid(row=0, column=0, padx=(0, 4))
         self.jog_step_var = tk.StringVar(value="0.050")
         ttk.Entry(footer, textvariable=self.jog_step_var, width=8).grid(row=0, column=1)
@@ -728,7 +813,7 @@ class MotorApp:
             footer,
             text="  Jogging moves ONE actuator and tilts the plane. Use the focal "
                  "plane controls above for normal operation.",
-            foreground="#777",
+            foreground="#777", wraplength=520, justify="left",
         ).grid(row=0, column=2, padx=6)
 
         ttk.Button(footer, text="Release all brakes",
@@ -736,15 +821,46 @@ class MotorApp:
         ttk.Button(footer, text="Engage all brakes",
                    command=lambda: self.on_brake(None, engage=True)).grid(row=0, column=4, padx=4)
 
+    #: What the gauge's reference chooser shows for each reference.
+    REFERENCE_CHOICES = {
+        "zero": "from zero",
+        "m1": "to M1 (primary)",
+        "m2": "to M2 (secondary)",
+    }
+
     def _build_gauge(self, parent) -> None:
-        frame = ttk.LabelFrame(parent, text="Distance from zero")
+        frame = ttk.LabelFrame(parent, text=REFERENCE_TITLES["zero"])
         frame.grid(row=0, column=1, rowspan=3, sticky="ns", padx=(6, 0))
-        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        self.gauge_frame = frame
+
+        # Which reference the labels use. Commands are always in focus mm
+        # from zero; this only changes what the gauge says.
+        chooser = ttk.Frame(frame)
+        chooser.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 0))
+        ttk.Label(chooser, text="measure", foreground="#555",
+                  font=("TkDefaultFont", 8)).grid(row=0, column=0, padx=(0, 4))
+        self.gauge_reference_var = tk.StringVar(
+            value=self.REFERENCE_CHOICES.get(self.cfg.gauge_reference,
+                                             self.REFERENCE_CHOICES["zero"]))
+        self.gauge_reference_box = ttk.Combobox(
+            chooser, textvariable=self.gauge_reference_var, state="readonly",
+            width=16, values=list(self.REFERENCE_CHOICES.values()))
+        self.gauge_reference_box.grid(row=0, column=1)
+        self.gauge_reference_box.bind("<<ComboboxSelected>>",
+                                      lambda _e: self.on_gauge_reference_changed())
+
         self.gauge = FocusGauge(frame,
                                 min_mm=self.cfg.limits.min_focus_mm,
                                 max_mm=self.cfg.limits.max_focus_mm)
-        self.gauge.grid(row=0, column=0, sticky="ns", padx=8, pady=8)
+        self.gauge.grid(row=1, column=0, sticky="ns", padx=8, pady=(4, 4))
+
+        ttk.Button(frame, text="Distances to M1 / M2...",
+                   command=self.on_edit_reference_distances).grid(
+            row=2, column=0, pady=(0, 8))
+
         self._refresh_gauge_limits()
+        self._apply_gauge_reference(self.cfg.gauge_reference)
 
     def _refresh_gauge_limits(self) -> None:
         """Push the current limits and any found hard stops onto the gauge."""
@@ -752,6 +868,137 @@ class MotorApp:
         self.gauge.set_limits(limits.min_focus_mm, limits.max_focus_mm,
                               hard_stop_low_mm=limits.hard_stop_low_mm,
                               hard_stop_high_mm=limits.hard_stop_high_mm)
+
+    def _apply_gauge_reference(self, reference: str) -> None:
+        """Point the gauge at a reference and retitle the frame to match."""
+        self.gauge.set_reference(reference,
+                                 zero_to_m1_mm=self.cfg.zero_to_m1_mm,
+                                 zero_to_m2_mm=self.cfg.zero_to_m2_mm)
+        title = self.gauge.reference_title
+        if not self.gauge.reference_available:
+            title += "  (distance not set)"
+        self.gauge_frame.configure(text=title)
+        choice = self.REFERENCE_CHOICES[reference]
+        if self.gauge_reference_var.get() != choice:
+            self.gauge_reference_var.set(choice)
+
+    def on_gauge_reference_changed(self) -> None:
+        """The chooser on the gauge. Remembered for the session; the distances
+        dialog is where it gets saved, alongside the numbers it depends on."""
+        chosen = self.gauge_reference_var.get()
+        reference = next((k for k, v in self.REFERENCE_CHOICES.items()
+                          if v == chosen), "zero")
+        self.cfg.gauge_reference = reference
+        self._apply_gauge_reference(reference)
+        if not self.gauge.reference_available:
+            self.log(f"The gauge cannot show the distance to "
+                     f"{reference.upper()} until the distance from zero to "
+                     f"{reference.upper()} has been entered. Use the button "
+                     f"under the gauge, or Tools > Distances.")
+            self.on_edit_reference_distances()
+
+    def on_edit_reference_distances(self) -> None:
+        """Enter how far the zero reference is from each mirror.
+
+        These are the numbers the "to M1" and "to M2" references need, and
+        nobody has them yet. They can change -- re-setting the zero moves
+        both, and a re-survey moves either -- so they are edited here rather
+        than typed into a file.
+        """
+        window = tk.Toplevel(self.root)
+        window.title("Distances from zero to the mirrors")
+        window.transient(self.root)
+
+        tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=500,
+                 text=("Distance along the optical axis from the zero reference "
+                       "(the position set by 'Set zero here') to each mirror, in "
+                       "millimetres. With these entered the gauge can show how "
+                       "far the focal plane is from M1 or from M2 instead of "
+                       "from zero.\n\n"
+                       "Commands are still given in millimetres from zero; only "
+                       "the gauge's labels change. Leave a box empty if the "
+                       "distance is not known -- the gauge will say so rather "
+                       "than show a made-up number. Re-enter them after moving "
+                       "the zero reference.")
+                 ).grid(row=0, column=0, columnspan=3, sticky="w",
+                        padx=12, pady=(12, 8))
+
+        def as_text(value):
+            return "" if value is None else f"{value:g}"
+
+        m1_var = tk.StringVar(value=as_text(self.cfg.zero_to_m1_mm))
+        m2_var = tk.StringVar(value=as_text(self.cfg.zero_to_m2_mm))
+        ttk.Label(window, text="zero to M1 (mm)").grid(row=1, column=0, sticky="e",
+                                                       padx=(12, 4), pady=4)
+        ttk.Entry(window, textvariable=m1_var, width=14).grid(row=1, column=1,
+                                                              sticky="w")
+        ttk.Label(window, text="+ direction, the primary mirror",
+                  foreground="#777", font=("TkDefaultFont", 8)).grid(
+            row=1, column=2, sticky="w", padx=(4, 12))
+        ttk.Label(window, text="zero to M2 (mm)").grid(row=2, column=0, sticky="e",
+                                                       padx=(12, 4), pady=4)
+        ttk.Entry(window, textvariable=m2_var, width=14).grid(row=2, column=1,
+                                                              sticky="w")
+        ttk.Label(window, text="− direction, the secondary mirror",
+                  foreground="#777", font=("TkDefaultFont", 8)).grid(
+            row=2, column=2, sticky="w", padx=(4, 12))
+
+        ttk.Label(window, text="show the gauge as").grid(
+            row=3, column=0, sticky="e", padx=(12, 4), pady=(10, 4))
+        reference_var = tk.StringVar(
+            value=self.REFERENCE_CHOICES[self.cfg.gauge_reference])
+        ttk.Combobox(window, textvariable=reference_var, state="readonly",
+                     width=16, values=list(self.REFERENCE_CHOICES.values())
+                     ).grid(row=3, column=1, sticky="w", pady=(10, 4))
+
+        def parse(var, label):
+            text = var.get().strip()
+            if not text:
+                return None, True
+            try:
+                value = float(text)
+            except ValueError:
+                messagebox.showerror("Check the number",
+                                     f"{label} must be a number, or empty.",
+                                     parent=window)
+                return None, False
+            if value <= 0:
+                messagebox.showerror("Check the number",
+                                     f"{label} must be a positive distance.",
+                                     parent=window)
+                return None, False
+            return value, True
+
+        def apply(persist: bool) -> None:
+            m1, ok1 = parse(m1_var, "zero to M1")
+            if not ok1:
+                return
+            m2, ok2 = parse(m2_var, "zero to M2")
+            if not ok2:
+                return
+            reference = next((k for k, v in self.REFERENCE_CHOICES.items()
+                              if v == reference_var.get()), "zero")
+            self.cfg.zero_to_m1_mm = m1
+            self.cfg.zero_to_m2_mm = m2
+            self.cfg.gauge_reference = reference
+            self._apply_gauge_reference(reference)
+            self.log("Zero-to-mirror distances: "
+                     f"M1 {as_text(m1) or 'not set'} mm, "
+                     f"M2 {as_text(m2) or 'not set'} mm. Gauge shows "
+                     f"{self.gauge.reference_title.lower()}.")
+            if persist:
+                path = save_config(self.cfg, self.config_path)
+                self.log(f"Saved to {path}")
+            window.destroy()
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=4, column=0, columnspan=3, pady=(8, 12))
+        ttk.Button(buttons, text="Use for this session",
+                   command=lambda: apply(False)).grid(row=0, column=0, padx=6)
+        ttk.Button(buttons, text="Use and save",
+                   command=lambda: apply(True)).grid(row=0, column=1, padx=6)
+        ttk.Button(buttons, text="Cancel",
+                   command=window.destroy).grid(row=0, column=2, padx=6)
 
     def _build_log(self) -> None:
         frame = ttk.LabelFrame(self.root, text="Log")
@@ -877,6 +1124,13 @@ class MotorApp:
         `slow_poll_every` polls, so the fast path is two round trips lighter
         per motor.
         """
+        # One poller at a time. A disconnect-then-connect used to start a
+        # second thread while the first was still sleeping out its interval,
+        # and from then on the motors were polled twice as often as configured.
+        previous = self._poll_thread
+        if previous is not None and previous.is_alive():
+            self._poll_stop.set()
+            previous.join(timeout=max(2.0, self.cfg.idle_poll_interval_s * 2))
         self._poll_stop.clear()
 
         def poll():
@@ -941,6 +1195,9 @@ class MotorApp:
                                              or "no reading")
 
         self._update_load_view(state)
+        if (self._history_tree is not None
+                and len(self.platform.history) != self._history_drawn):
+            self._refresh_position_log()
 
         if state.any_error:
             self.conn_lamp.set(COLOR_BAD)
@@ -1131,26 +1388,9 @@ class MotorApp:
         target = self._read_orientation_fields()
         if target is None:
             return
-        try:
-            self.platform.check_orientation(target)
-        except PlatformError as exc:
-            messagebox.showerror("Move refused", str(exc))
-            return
-
-        preview = self.platform.preview(target)
-        detail = "\n".join(f"   {n}: {mm:10.4f} mm" for n, mm in preview.items())
-        if not messagebox.askyesno(
-            "Confirm move",
-            f"Move the focal plane to:\n\n{target.describe()}\n\n"
-            f"Actuator targets:\n{detail}\n\nProceed?",
-        ):
-            return
-
-        def work():
-            self.platform.move_to_orientation(target)
-            self.log_threadsafe("Move complete.")
-
-        self.run_async("Move", work)
+        self._move_with_confirmation(
+            target, kind="move", note="",
+            reason="Move the focal plane to:")
 
     def on_nudge(self, axis: str, sign: int) -> None:
         if not self.platform.connected:
@@ -1252,7 +1492,7 @@ class MotorApp:
                        "it, and the raw register value until then -- the "
                        "drive's units are not documented and are not guessed "
                        "at here.")
-                 ).grid(row=0, column=0, columnspan=5, sticky="w",
+                 ).grid(row=0, column=0, columnspan=6, sticky="w",
                         padx=12, pady=(12, 8))
 
         headers = ("motor", "load now", "", "peak", "temp", "supply")
@@ -1732,10 +1972,8 @@ class MotorApp:
             self.platform.disconnect()
         except Exception:
             pass
-        self.platform = FocalPlanePlatform(
-            cfg=self.cfg, simulate=self.simulate, logger=self.log_threadsafe,
-            config_path=self.config_path,
-        )
+        self.platform = self._make_platform()
+        self._refresh_position_log()
         self.connect_btn.config(text="Connect")
         self.conn_var.set("disconnected")
         self.conn_lamp.set(COLOR_IDLE)
@@ -1932,6 +2170,196 @@ class MotorApp:
                     "situation until it is fixed.")
 
         self.run_async("Safety drills", work)
+
+    # --------------------------------------------------------- position log
+
+    def on_open_position_log(self) -> None:
+        """Where the focal plane has been, one line per move.
+
+        The motors remember nothing, so this is the only record of previous
+        positions there is. Each line says where the plane was before the
+        move, where it was sent, where it ended up and whether the move
+        finished -- and any line's "before" or "after" can be sent to the
+        motors again, through exactly the checks an ordinary move gets.
+        """
+        if self._history_window is not None and self._history_window.winfo_exists():
+            self._history_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Position log")
+        self._history_window = window
+        window.geometry("980x420")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+
+        tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=940,
+                 text=("Every move this software has commanded, newest first: "
+                       "where the focal plane was before, where it was sent, and "
+                       "where it actually ended up. Positions are focus mm from "
+                       "zero, then tip and tilt in degrees. A move that was "
+                       "halted is listed too, because its 'after' is where the "
+                       "plane really is.")
+                 ).grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+
+        columns = ("when", "what", "before", "sent to", "after", "result", "note")
+        tree = ttk.Treeview(window, columns=columns, show="headings",
+                            selectmode="browse", height=12)
+        widths = {"when": 130, "what": 68, "before": 180, "sent to": 180,
+                  "after": 180, "result": 100, "note": 160}
+        for column in columns:
+            tree.heading(column, text=column)
+            tree.column(column, width=widths[column], anchor="w",
+                        stretch=(column == "note"))
+        tree.grid(row=1, column=0, sticky="nsew", padx=(12, 0))
+        scroll = ttk.Scrollbar(window, orient="vertical", command=tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns", padx=(0, 12))
+        tree.configure(yscrollcommand=scroll.set)
+        self._history_tree = tree
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="w", padx=12,
+                     pady=(8, 10))
+        ttk.Button(buttons, text="Go back one move",
+                   command=self.on_go_back).grid(row=0, column=0, padx=(0, 12))
+        ttk.Button(buttons, text="Return to the selected line's 'before'",
+                   command=lambda: self._go_to_selected("before")).grid(
+            row=0, column=1, padx=4)
+        ttk.Button(buttons, text="Go to the selected line's 'after'",
+                   command=lambda: self._go_to_selected("after")).grid(
+            row=0, column=2, padx=4)
+        ttk.Label(buttons, foreground="#777", font=("TkDefaultFont", 8),
+                  text="  Each of these is an ordinary move: limits and step "
+                       "size are checked, and you are asked to confirm.").grid(
+            row=0, column=3, padx=(12, 0))
+
+        self._history_path_var = tk.StringVar()
+        ttk.Label(window, textvariable=self._history_path_var, foreground="#777",
+                  font=("TkDefaultFont", 8)).grid(row=3, column=0, columnspan=2,
+                                                  sticky="w", padx=12,
+                                                  pady=(0, 8))
+
+        def closed() -> None:
+            self._history_window = None
+            self._history_tree = None
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", closed)
+        self._refresh_position_log()
+
+    @staticmethod
+    def _orientation_cell(o: Optional[Orientation]) -> str:
+        if o is None:
+            return "--"
+        if abs(o.tip_deg) < 5e-6 and abs(o.tilt_deg) < 5e-6:
+            return f"{o.focus_mm:+.4f} mm"
+        return f"{o.focus_mm:+.4f} mm  {o.tip_deg:+.4f}/{o.tilt_deg:+.4f}°"
+
+    def _refresh_position_log(self) -> None:
+        """Redraw the log window from the platform's history. UI thread."""
+        tree = self._history_tree
+        if tree is None or not tree.winfo_exists():
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        self._history_rows = self.platform.history.records(newest_first=True)
+        self._history_drawn = len(self._history_rows)
+        for index, record in enumerate(self._history_rows):
+            tree.insert("", "end", iid=str(index), values=(
+                record.when, record.kind,
+                self._orientation_cell(record.before),
+                self._orientation_cell(record.commanded),
+                self._orientation_cell(record.after),
+                "done" if record.completed else record.outcome,
+                record.note,
+            ))
+        path = self.platform.history.path
+        self._history_path_var.set(
+            f"{len(self._history_rows)} move(s) on record"
+            + (f", written to {path}" if path else ", this session only"))
+
+    def _go_to_selected(self, which: str) -> None:
+        tree = self._history_tree
+        if tree is None:
+            return
+        selected = tree.selection()
+        if not selected:
+            messagebox.showinfo("Nothing selected",
+                                "Select a line in the log first.",
+                                parent=self._history_window)
+            return
+        try:
+            record = self._history_rows[int(selected[0])]
+        except (ValueError, IndexError):
+            return
+        target = record.before if which == "before" else record.after
+        if target is None:
+            messagebox.showwarning(
+                "Not recorded",
+                f"That line has no '{which}' position: the motors could not "
+                "be read at the time.", parent=self._history_window)
+            return
+        self._move_with_confirmation(
+            target, kind="go-back",
+            note=f"to the '{which}' of the {record.kind} at {record.when}",
+            reason=f"Return to the '{which}' position of the {record.kind} "
+                   f"at {record.when}:")
+
+    def on_go_back(self) -> None:
+        """Back to where the focal plane was before the most recent move."""
+        if not self.platform.connected:
+            messagebox.showwarning("Not connected", "Connect first.")
+            return
+        record = self.platform.history.last_with_before()
+        if record is None:
+            messagebox.showinfo(
+                "Nothing to go back to",
+                "No move has been recorded yet, so there is no previous "
+                "position on record.")
+            return
+        self._move_with_confirmation(
+            record.before, kind="go-back",
+            note=f"back to before the {record.kind} at {record.when}",
+            reason=f"Go back to where the focal plane was before the "
+                   f"{record.kind} at {record.when}:")
+
+    def _move_with_confirmation(self, target: Orientation, kind: str,
+                                note: str, reason: str) -> None:
+        """The one path every absolute move takes: check, show, confirm, go.
+
+        The check is made against where the plane is *now*, so a move that
+        would be refused for its step size is refused here, in a dialog,
+        rather than after the operator has confirmed it -- where the only
+        trace of the refusal used to be a line in the log.
+        """
+        if not self.platform.connected:
+            messagebox.showwarning("Not connected", "Connect first.")
+            return
+        try:
+            current = self.platform.read_orientation()
+        except Exception as exc:  # noqa: BLE001 -- refuse, do not guess
+            messagebox.showerror("Cannot move",
+                                 f"The current position could not be read: {exc}")
+            return
+        try:
+            self.platform.check_orientation(target, current=current)
+        except PlatformError as exc:
+            messagebox.showerror("Move refused", str(exc))
+            return
+        preview = self.platform.preview(target)
+        detail = "\n".join(f"   {n}: {mm:10.4f} mm" for n, mm in preview.items())
+        if not messagebox.askyesno(
+            "Confirm move",
+            f"{reason}\n\n{target.describe()}\n\n"
+            f"Actuator targets:\n{detail}\n\nProceed?",
+        ):
+            return
+
+        def work():
+            self.platform.move_to_orientation(target, kind=kind, note=note)
+            self.log_threadsafe("Move complete.")
+
+        self.run_async("Move" if kind == "move" else "Go back", work)
 
     # ----------------------------------------------------------------- misc
 

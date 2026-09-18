@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
 from .config import PlatformConfig, load_config, save_config
+from .history import MoveRecord, PositionHistory
 from .jvl_motor import BrakeState, JVLMotor, MotorFault, MotorStatus
 from .kinematics import Orientation, ThreePointPlatform, platform_from_config
 from .transport import ModbusError
@@ -235,7 +236,16 @@ class PlatformState:
 
     @property
     def moving(self) -> bool:
-        return any(not m.in_position for m in self.motors if not m.comms_error)
+        """True while an enabled drive has not reached its target.
+
+        A passive drive is excluded. Its P_SOLL is whatever was last written,
+        which after a power cycle or a passivate need not match where the
+        shaft sits -- and a machine with the drives off is not moving, however
+        far apart those two numbers are. Counting it kept the fast poll rate
+        and the MOVING flag on for ever on a parked, unpowered axis.
+        """
+        return any(not m.in_position for m in self.motors
+                   if not m.comms_error and m.mode != 0)
 
     def as_dict(self) -> dict:
         return {
@@ -255,7 +265,9 @@ class FocalPlanePlatform:
     def __init__(self, cfg: Optional[PlatformConfig] = None,
                  simulate: bool = False,
                  logger: Optional[Callable[[str], None]] = None,
-                 config_path: Optional[str] = None):
+                 config_path: Optional[str] = None,
+                 history_path: Optional[str] = None,
+                 on_history_change: Optional[Callable[[], None]] = None):
         self.cfg = cfg or load_config(config_path)
         self.cfg.validate()
         self.config_path = config_path
@@ -265,6 +277,12 @@ class FocalPlanePlatform:
         self.external_brake = self._build_external_brake()
         self._move_lock = threading.RLock()
         self._abort = threading.Event()
+        #: Every move, with where the plane was before and after it. Kept in
+        #: memory always; written to `history_path` as well when one is given,
+        #: which the GUI and CLI do and the tests and drills do not.
+        self.history = PositionHistory(path=history_path or None,
+                                       on_change=on_history_change,
+                                       logger=self._log)
         #: Said once, not on every move: there is no healthy supply reading to
         #: compare against. Repeating it every time would train people to
         #: ignore it.
@@ -486,7 +504,8 @@ class FocalPlanePlatform:
         `include_slow` is passed to each motor: False skips temperature and bus
         voltage and reuses the last ones, which is what a fast poll loop wants.
         """
-        statuses = [self._with_external_brake(m.read_status(include_slow))
+        brake = self._external_brake_reading()
+        statuses = [self._with_external_brake(m.read_status(include_slow), brake)
                     for m in self.motors]
         valid = all(s.connected and not s.comms_error for s in statuses)
         orientation = None
@@ -505,28 +524,62 @@ class FocalPlanePlatform:
         return PlatformState(motors=statuses, orientation=orientation,
                              orientation_valid=valid, message=message)
 
-    def _with_external_brake(self, status: MotorStatus) -> MotorStatus:
+    def _external_brake_reading(self):
+        """One read of the brake device per poll, shared by all three axes.
+
+        Returns {name: BrakeStatus}, or None when there is no device. The
+        site's brakes are one switch for all three, so asking the device
+        three times per poll -- which at the moving poll rate would be twenty
+        HTTP requests a second to a PLC -- told us nothing the first answer
+        did not.
+        """
+        from .external_brake import BrakeError
+        from .jvl_motor import BrakeStatus
+
+        controller = self.external_brake
+        if not controller.available:
+            return None
+        detail = getattr(controller, "describe", lambda: "external brake")()
+        readings = {}
+        # The simulated controller carries the flag itself; the real one
+        # carries it on its config. Either way, one switch means one read.
+        all_or_nothing = getattr(controller, "all_or_nothing", None)
+        if all_or_nothing is None:
+            all_or_nothing = getattr(getattr(controller, "cfg", None),
+                                     "all_or_nothing", True)
+        names_to_read = ["all"] if all_or_nothing else [m.name for m in self.motors]
+        try:
+            for name in names_to_read:
+                state = controller.read_state(name)
+                measured = controller.state_is_measured(name)
+                readings[name] = BrakeStatus(state, not measured, detail)
+        except BrakeError as exc:
+            failed = BrakeStatus(BrakeState.UNKNOWN, True, str(exc))
+            return {m.name: failed for m in self.motors}
+        if "all" in readings:
+            return {m.name: readings["all"] for m in self.motors}
+        return readings
+
+    def _with_external_brake(self, status: MotorStatus, brake=None) -> MotorStatus:
         """Show the brake that actually holds this axis.
 
         `MotorStatus.brake` describes the motor's own brake output, which on
         the pSCT is unassigned -- the brakes are on a separate device. Where
         that device is reachable, its state is the true one, and displaying the
         motor's instead would be showing an indicator that cannot change.
+
+        `brake` is the reading from `_external_brake_reading`; when None it is
+        taken now, for callers outside the poll.
         """
         from dataclasses import replace
-        from .external_brake import BrakeError
-        from .jvl_motor import BrakeStatus
 
-        controller = self.external_brake
-        if not controller.available or status.comms_error:
+        if not self.external_brake.available or status.comms_error:
             return status
-        try:
-            state = controller.read_state(status.name)
-            measured = controller.state_is_measured(status.name)
-            detail = getattr(controller, "describe", lambda: "external brake")()
-        except BrakeError as exc:
-            state, measured, detail = BrakeState.UNKNOWN, False, str(exc)
-        return replace(status, brake=BrakeStatus(state, not measured, detail))
+        if brake is None:
+            brake = self._external_brake_reading()
+        if not brake or status.name not in brake:
+            return status
+        return replace(status, brake=brake[status.name])
 
     # --------------------------------------------------------------- limits
 
@@ -689,8 +742,14 @@ class FocalPlanePlatform:
     # ----------------------------------------------------------------- moves
 
     def move_to_orientation(self, orientation: Orientation, wait: bool = True,
-                            check_step: bool = True) -> PlatformState:
-        """Drive the focal plane to an absolute orientation."""
+                            check_step: bool = True, kind: str = "move",
+                            note: str = "") -> PlatformState:
+        """Drive the focal plane to an absolute orientation.
+
+        `kind` and `note` are for the position history: what sort of command
+        this was ("move", "nudge", "go-back" ...) and anything worth writing
+        beside it. They change nothing about the motion.
+        """
         with self._move_lock:
             self._require_connected()
             self._abort.clear()
@@ -705,14 +764,36 @@ class FocalPlanePlatform:
                 + ", ".join(f"{m.name} {t:.4f} mm" for m, t in zip(self.motors, targets))
             )
 
-            self._prepare_for_motion()
-            self._apply_synchronised_velocities(targets)
+            # Nothing has moved yet. From here on, whatever happens is
+            # recorded -- a halted move changes the position just as much as
+            # a completed one, and "where was it before" is exactly what gets
+            # asked after a halt.
+            started = time.time()
+            before = current if current is not None else self._orientation_or_none()
+            actuators_before = self._actuator_positions_or_empty()
+            outcome = "done"
+            commanded = False
+            try:
+                self._prepare_for_motion()
+                self._apply_synchronised_velocities(targets)
 
-            for motor, target in zip(self.motors, targets):
-                motor.command_position_mm(target)
+                for motor, target in zip(self.motors, targets):
+                    motor.command_position_mm(target)
+                    commanded = True
 
-            if wait:
-                self._wait_for_all()
+                if wait:
+                    self._wait_for_all()
+            except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised
+                outcome = "failed: " + str(exc).splitlines()[0][:160]
+                raise
+            finally:
+                # A refusal before the first target was written moved nothing
+                # and is not a position; it is in the log, not the history.
+                if commanded:
+                    self._record_move(kind, before, orientation, actuators_before,
+                                      outcome, note if wait else
+                                      (note + " (commanded, not waited for)").strip(),
+                                      started)
             return self.read_state()
 
     def move_relative(self, d_focus_mm: float = 0.0, d_tip_deg: float = 0.0,
@@ -722,7 +803,64 @@ class FocalPlanePlatform:
             self._require_connected()
             current = self.read_orientation()
             target = current.offset_by(d_focus_mm, d_tip_deg, d_tilt_deg)
-            return self.move_to_orientation(target, wait=wait)
+            parts = []
+            if d_focus_mm:
+                parts.append(f"focus {d_focus_mm:+g} mm")
+            if d_tip_deg:
+                parts.append(f"tip {d_tip_deg:+g} deg")
+            if d_tilt_deg:
+                parts.append(f"tilt {d_tilt_deg:+g} deg")
+            return self.move_to_orientation(target, wait=wait, kind="nudge",
+                                            note=", ".join(parts))
+
+    # ------------------------------------------------------------- history
+
+    def _orientation_or_none(self) -> Optional[Orientation]:
+        """The orientation now, or None if it cannot be read. Never raises."""
+        try:
+            return self.read_orientation()
+        except Exception:  # noqa: BLE001 -- a record, not a command
+            return None
+
+    def _actuator_positions_or_empty(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for motor in self.motors:
+            try:
+                out[motor.name] = motor.get_position_mm()
+            except (ModbusError, MotorFault):
+                pass
+        return out
+
+    def _record_move(self, kind: str, before: Optional[Orientation],
+                     commanded: Optional[Orientation],
+                     actuators_before: Dict[str, float], outcome: str,
+                     note: str, started: float) -> MoveRecord:
+        """Write one entry in the position history, reading back where the
+        plane ended up rather than assuming it went where it was sent."""
+        return self.history.record(
+            kind=kind, before=before, commanded=commanded,
+            after=self._orientation_or_none(),
+            actuators_before=actuators_before,
+            actuators_after=self._actuator_positions_or_empty(),
+            outcome=outcome, note=note, timestamp=started,
+        )
+
+    def go_back(self, wait: bool = True) -> PlatformState:
+        """Return to where the focal plane was before the most recent move.
+
+        An ordinary move with an ordinary set of checks: the previous
+        orientation is handed to `move_to_orientation`, which will refuse it
+        if it is outside the limits or too big a step, exactly as it would a
+        typed one. Raises PlatformError when there is nothing to go back to.
+        """
+        record = self.history.last_with_before()
+        if record is None:
+            raise PlatformError(
+                "There is no previous position to go back to: nothing has "
+                "been moved since this record began.")
+        return self.move_to_orientation(
+            record.before, wait=wait, kind="go-back",
+            note=f"back to where it was before the {record.kind} at {record.when}")
 
     def move_to_polar_tilt(self, focus_mm: float, total_tilt_deg: float,
                            azimuth_deg: float, wait: bool = True) -> PlatformState:
@@ -768,15 +906,35 @@ class FocalPlanePlatform:
             self._release_brake_if_controlled(motor)
             self._release_external_brakes()
             motor.set_velocity(motor.cfg.velocity_raw)
-            motor.command_position_mm(target)
-            self._log(f"{motor.name}: single-axis move to {target:.4f} mm.")
-            if wait and not motor.wait_for_in_position():
-                # wait_for_in_position has already halted this axis.
-                raise PlatformError(
-                    f"{motor.name} did not reach {target:.4f} mm within "
-                    f"{motor.cfg.move_timeout_s:.0f} s, and has been halted where "
-                    "it got to."
-                )
+
+            started = time.time()
+            before = self._orientation_or_none()
+            actuators_before = self._actuator_positions_or_empty()
+            outcome = "done"
+            commanded = False
+            try:
+                motor.command_position_mm(target)
+                commanded = True
+                self._log(f"{motor.name}: single-axis move to {target:.4f} mm.")
+                if wait and not motor.wait_for_in_position():
+                    # wait_for_in_position has already halted this axis.
+                    outcome = "failed: timed out"
+                    raise PlatformError(
+                        f"{motor.name} did not reach {target:.4f} mm within "
+                        f"{motor.cfg.move_timeout_s:.0f} s, and has been halted where "
+                        "it got to."
+                    )
+            except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised
+                if outcome == "done":
+                    outcome = "failed: " + str(exc).splitlines()[0][:160]
+                raise
+            finally:
+                if commanded:
+                    self._record_move(
+                        "jog", before, None, actuators_before, outcome,
+                        f"{motor.name} to {target:+.4f} mm"
+                        + (f" ({target_mm:+g} mm relative)" if relative else ""),
+                        started)
             return motor.read_status()
 
     # --------------------------------------------------------- move internals
@@ -1102,6 +1260,10 @@ class FocalPlanePlatform:
         worst_spread = 0.0
         stopped_by: List[str] = []
         reasons: Dict[str, str] = {}
+        started = time.time()
+        before = self._orientation_or_none()
+        outcome = "done"
+        commanded = False
 
         try:
             self._set_synchronised_seek_speed(original_velocity, speed_fraction)
@@ -1111,6 +1273,7 @@ class FocalPlanePlatform:
             for motor in self.motors:
                 target = start_mm[motor.name] + direction * budget_mm
                 motor.command_position_counts(motor.cfg.mm_to_counts(target))
+                commanded = True
 
             last_movement = {m.name: time.monotonic() for m in self.motors}
             last_position = dict(start_mm)
@@ -1231,12 +1394,18 @@ class FocalPlanePlatform:
                     )
 
                 time.sleep(poll_s)
+        except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised
+            outcome = "failed: " + str(exc).splitlines()[0][:160]
+            raise
         finally:
             for motor in self.motors:
                 try:
                     motor.set_velocity(original_velocity[motor.name])
                 except (ModbusError, MotorFault):
                     pass
+            if outcome != "done" and commanded:
+                self._record_move("find-stop", before, None, start_mm, outcome,
+                                  f"direction {direction:+d}", started)
 
         stop_mm = {m.name: m.get_position_mm() for m in self.motors}
         levelled = self._level_after_stop(start_mm, direction) if level_after else False
@@ -1261,6 +1430,11 @@ class FocalPlanePlatform:
             backed_off_mm=backed_off,
         )
         self._log(result.summary())
+        self._record_move(
+            "find-stop", before, None, start_mm, "done",
+            f"direction {direction:+d}, stopped by "
+            f"{', '.join(result.stopped_by) or 'nothing'}, travel ends at "
+            f"{sum(stop_mm.values()) / len(stop_mm):+.4f} mm", started)
         return result
 
     def _back_off_from_stop(self, direction: int, back_off_mm: float) -> float:
@@ -1355,45 +1529,6 @@ class FocalPlanePlatform:
         self._log("Levelling did not complete -- the plate may still be tilted. "
                   "Check the actuator positions before commanding a move.")
         return False
-
-    def _wait_out_hard_stop_step(self, timeout_s: float):
-        """Wait for one step of the coordinated search to finish or stop.
-
-        Returns (names that stopped, why). Deliberately not `_wait_for_all`:
-        there, an axis that does not reach its target is a failure, while here
-        it is the thing being looked for.
-        """
-        stopped: List[str] = []
-        reasons: Dict[str, str] = {}
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if self._abort.is_set():
-                return stopped, reasons
-            pending = False
-            for motor in self.motors:
-                if motor.name in reasons:
-                    continue
-                torque = motor.check_stall()
-                if torque is not None:
-                    stopped.append(motor.name)
-                    reasons[motor.name] = f"torque reached {torque:.0f}%"
-                    continue
-                errors = motor.get_errors()
-                if errors:
-                    stopped.append(motor.name)
-                    reasons[motor.name] = f"drive faulted: {motor.error_text()}"
-                    continue
-                if not motor.is_in_position():
-                    pending = True
-            if stopped:
-                # One axis has finished travelling. Every other axis must stop
-                # now, in this poll, or the plane tilts by however far they get
-                # before the loop next comes round.
-                return stopped, reasons
-            if not pending:
-                return stopped, reasons
-            time.sleep(0.05)
-        return stopped, reasons
 
     def _settle_all_where_they_are(self) -> None:
         """Command every axis to hold its present position.
@@ -1535,6 +1670,15 @@ class FocalPlanePlatform:
         The target is written *before* the mode change, so the motor holds the
         position it is at instead of jumping to whatever stale P_SOLL it was
         left with. Returns the axes it took hold of.
+
+        The target is the ENCODER position, not the projected one. On an
+        enabled drive `stop()` freezes the profile output, because writing the
+        encoder reading there would command a step of the standing following
+        error. On a passive drive the profile output is stale: it says where
+        the generator was when the drive went off, and if the load has sunk
+        since -- which is exactly the situation this exists for -- enabling
+        the drive at that target would haul the camera back up to it. The
+        encoder is where the shaft is now, and that is what to hold.
         """
         from .registers import MotorMode
 
@@ -1543,7 +1687,7 @@ class FocalPlanePlatform:
             try:
                 if motor.get_mode() == int(MotorMode.POSITION):
                     continue
-                motor.command_position_counts(motor.get_projected_position_counts())
+                motor.command_position_counts(motor.get_position_counts())
                 motor.ensure_position_mode()
                 taken.append(motor.name)
             except (ModbusError, MotorFault) as exc:
@@ -1719,4 +1863,4 @@ class FocalPlanePlatform:
         return save_config(self.cfg, self.config_path)
 
 
-__all__ = ["FocalPlanePlatform", "PlatformState", "PlatformError"]
+__all__ = ["FocalPlanePlatform", "PlatformState", "PlatformError", "MoveRecord"]

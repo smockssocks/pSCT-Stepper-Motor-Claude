@@ -63,7 +63,13 @@ class TestRegisterEncoding(unittest.TestCase):
 
     def test_error_decoding(self):
         self.assertEqual(describe_errors(0), "No errors")
-        self.assertIn("Temperature too high", describe_errors(1 << 5))
+        # Bit order follows JVL's LB0053 Err_Bits table: bit 2 is the output
+        # driver (the one the manual corroborates in its I/O chapter), bit 4
+        # low bus voltage, bit 6 temperature.
+        self.assertIn("Output driver", describe_errors(1 << 2))
+        self.assertIn("Low bus voltage", describe_errors(1 << 4))
+        self.assertIn("Temperature too high", describe_errors(1 << 6))
+        self.assertIn("UNVERIFIED", describe_errors(1 << 6))
         self.assertIn("unmapped", describe_errors(1 << 30))
         self.assertEqual(decode_bits(0b101, {0: "a", 2: "c"}), ["a", "c"])
 
@@ -204,7 +210,7 @@ class TestSingleMotor(unittest.TestCase):
         self.assertIn("word order", str(ctx.exception))
 
     def test_errors_reported_and_cleared(self):
-        self.motor._transport.inject_error(1 << 5)
+        self.motor._transport.inject_error(1 << 6)          # temperature, per LB0053
         self.assertNotEqual(self.motor.get_errors(), 0)
         self.assertIn("Temperature", self.motor.error_text())
         self.assertEqual(self.motor.clear_errors(), 0)

@@ -76,8 +76,12 @@ def make_platform(args) -> FocalPlanePlatform:
     if getattr(args, "poll", None):
         cfg.poll_interval_s = args.poll
         cfg.idle_poll_interval_s = max(args.poll, cfg.idle_poll_interval_s)
+    from .history import default_history_path
+    # The same position record the GUI keeps, so a move made from the command
+    # line shows up in the window's log and vice versa.
     platform = FocalPlanePlatform(cfg=cfg, simulate=args.simulate, logger=out,
-                                  config_path=args.config)
+                                  config_path=args.config,
+                                  history_path=default_history_path(args.config))
     if platform.is_mixed:
         out("BENCH MODE: " + ", ".join(platform.simulated_names)
             + " are simulated; only "
@@ -160,15 +164,23 @@ def cmd_status(args) -> int:
 
         rule("Actuators")
         header = (f"{'name':<6}{'mm':>12}{'counts':>14}{'target mm':>12}  "
-                  f"{'mode':<20}{'brake':<12}")
+                  f"{'mode':<20}{'brake':<12}{'load':>6}{'supply':>12}")
         out(header)
         for m in state.motors:
             if m.comms_error:
                 out(f"{m.name:<6}  ** {m.comms_error}")
                 continue
             brake = m.brake.state.value + ("?" if m.brake.inferred else "")
+            load = "--" if m.torque_percent is None else f"{m.torque_percent:.0f}%"
+            if m.bus_voltage is None:
+                supply = "--"
+            elif m.supply_volts is not None:
+                supply = f"{m.supply_volts:.1f} V"
+            else:
+                supply = f"{m.bus_voltage} raw"
             out(f"{m.name:<6}{m.position_mm:>12.4f}{m.position_counts:>14}"
-                f"{m.target_mm:>12.4f}  {m.mode_text:<20}{brake:<12}")
+                f"{m.target_mm:>12.4f}  {m.mode_text:<20}{brake:<12}"
+                f"{load:>6}{supply:>12}")
             if m.error_bits:
                 out(f"        errors: {m.error_text}")
 
@@ -514,6 +526,79 @@ def cmd_move_relative(args) -> int:
         if not confirm("Command this move?", args.yes):
             return 1
         state = platform.move_to_orientation(target, wait=not args.no_wait)
+        if state.orientation:
+            out(f"Done:   {state.orientation.describe()}")
+        return 0
+    except PlatformError as exc:
+        out(f"Move failed: {exc}")
+        return 1
+    finally:
+        platform.disconnect()
+
+
+def cmd_history(args) -> int:
+    """Where the focal plane has been: the position record, newest first."""
+    from .history import PositionHistory, default_history_path
+    path = default_history_path(args.config)
+    history = PositionHistory(path=path, logger=out)
+    records = history.records(newest_first=True)
+    if args.json:
+        out(json.dumps([r.as_dict() for r in records[:args.last]], indent=2))
+        return 0
+    rule("Position log")
+    out(f"  {path}")
+    if not records:
+        out("  No moves on record yet. Every move made from the GUI or the "
+            "command line is written here as it happens.")
+        return 0
+    out("")
+
+    def cell(o):
+        if o is None:
+            return "--"
+        if abs(o.tip_deg) < 5e-6 and abs(o.tilt_deg) < 5e-6:
+            return f"{o.focus_mm:+.4f}"
+        return f"{o.focus_mm:+.4f} ({o.tip_deg:+.4f}/{o.tilt_deg:+.4f} deg)"
+
+    out(f"  {'when':<19} {'what':<10}{'before':>12}{'sent to':>12}{'after':>12}"
+        f"  result")
+    for record in records[:args.last]:
+        result = "done" if record.completed else record.outcome
+        out(f"  {record.when:<19} {record.kind:<10}{cell(record.before):>12}"
+            f"{cell(record.commanded):>12}{cell(record.after):>12}  {result}")
+        if record.note:
+            out(f"  {'':<19} {'':<10}  {record.note}")
+    out("")
+    out(f"  {len(records)} move(s) on record, showing the latest "
+        f"{min(args.last, len(records))}. Focus in mm from zero.")
+    return 0
+
+
+def cmd_go_back(args) -> int:
+    """Return to where the focal plane was before the most recent move."""
+    platform = make_platform(args)
+    try:
+        platform.connect()
+    except PlatformError as exc:
+        out(str(exc))
+        return 1
+    try:
+        record = platform.history.last_with_before()
+        if record is None:
+            out("There is no previous position on record to go back to.")
+            return 1
+        current = platform.read_orientation()
+        out(f"Now:    {current.describe()}")
+        out(f"Back to where it was before the {record.kind} at {record.when}:")
+        out(f"Target: {record.before.describe()}")
+        try:
+            platform.check_orientation(record.before, current=current)
+        except PlatformError as exc:
+            out(str(exc))
+            return 1
+        if not confirm("Command this move?", args.yes):
+            return 1
+        state = platform.go_back(wait=not args.no_wait)
         if state.orientation:
             out(f"Done:   {state.orientation.describe()}")
         return 0
@@ -1176,7 +1261,8 @@ def cmd_motor_report(args) -> int:
     intermittent fault they are often the only evidence left.
     """
     from .demo import build_motor
-    from .registers import REGISTERS, describe_errors, describe_mode, describe_status
+    from .registers import (REGISTERS, describe_errors, describe_mode,
+                            describe_status, describe_warnings)
 
     motor = build_motor(args.config, args.motor, args.simulate)
     try:
@@ -1225,7 +1311,7 @@ def cmd_motor_report(args) -> int:
         errors = value("ERR_BITS", 0)
         warnings = value("WARN_BITS", 0)
         out(f"  errors   (reg 35)  {describe_errors(errors)}")
-        out(f"  warnings (reg 36)  {warnings}")
+        out(f"  warnings (reg 36)  {describe_warnings(warnings)}")
         out(f"  status   (reg 25)  {describe_status(value('STATUSBITS', 0))}")
         out(f"  temperature        {value('TEMPERATURE_LOW_RES')} C "
             f"(raw {value('TEMPERATURE')})")
@@ -1415,6 +1501,8 @@ commissioning order
                        supply can be told from a normal reading
   set-zero             define the reference orientation
   status / move        normal operation
+  history / go-back    where the focal plane has been, and back to the
+                       position before the last move
 
 one motor on a bench
 --------------------
@@ -1501,6 +1589,18 @@ one motor on a bench
     p.add_argument("--dtilt", type=float, default=0.0, help="degrees about +y")
     p.add_argument("--no-wait", action="store_true")
     p.set_defaults(func=cmd_move_relative)
+
+    p = command("go-back", help="return to where the focal plane was before "
+                                "the most recent move")
+    p.add_argument("--no-wait", action="store_true")
+    p.set_defaults(func=cmd_go_back)
+
+    p = command("history", help="list where the focal plane has been, "
+                                "newest first")
+    p.add_argument("--last", type=int, default=30,
+                   help="how many moves to show (default 30)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_history)
 
     p = command("jog", help="move a single actuator (commissioning)")
     p.add_argument("--motor", required=True)

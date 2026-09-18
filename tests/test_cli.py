@@ -14,6 +14,25 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class TestCli(unittest.TestCase):
+    def setUp(self):
+        # Point the default configuration at a scratch directory. The CLI
+        # writes the machine's position record beside its configuration, and
+        # a test run must not leave a line in the real one.
+        import tempfile
+        self._previous_env = os.environ.get("PSCT_MOTORS_CONFIG")
+        self._scratch = tempfile.mkdtemp()
+        os.environ["PSCT_MOTORS_CONFIG"] = os.path.join(self._scratch,
+                                                        "psct_motors.json")
+
+    def tearDown(self):
+        if self._previous_env is None:
+            os.environ.pop("PSCT_MOTORS_CONFIG", None)
+        else:
+            os.environ["PSCT_MOTORS_CONFIG"] = self._previous_env
+        for name in os.listdir(self._scratch):
+            os.remove(os.path.join(self._scratch, name))
+        os.rmdir(self._scratch)
+
     def test_help_builds(self):
         from psct_motors.cli import build_parser
         parser = build_parser()
@@ -34,6 +53,56 @@ class TestCli(unittest.TestCase):
     def test_preview_needs_no_hardware(self):
         from psct_motors.cli import main
         self.assertEqual(main(["preview", "--focus", "2.0", "--tip", "0.1"]), 0)
+
+    def test_history_and_go_back_share_the_record(self):
+        """A move from the command line is written to the position log, the
+        log lists it, and go-back returns to where it was -- all against a
+        temporary config so the machine's own record is untouched."""
+        import json
+        import tempfile
+        from psct_motors.cli import main
+        from psct_motors.config import default_config, save_config
+        directory = tempfile.mkdtemp()
+        cfg_path = os.path.join(directory, "psct_motors.json")
+        log_path = os.path.join(directory, "positions.jsonl")
+        try:
+            cfg = default_config()
+            cfg.simulated_speed_mm_per_s = 30.0
+            save_config(cfg, cfg_path)
+            self.assertEqual(main(["--config", cfg_path, "history"]), 0)
+            self.assertEqual(main(["--config", cfg_path, "--simulate", "-y",
+                                   "move", "--focus", "1.0"]), 0)
+            self.assertTrue(os.path.exists(log_path))
+            with open(log_path, encoding="utf-8") as fh:
+                lines = [json.loads(l) for l in fh if l.strip()]
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0]["kind"], "move")
+            self.assertEqual(main(["--config", cfg_path, "history"]), 0)
+            # A fresh process: the record on disk is what go-back reads.
+            self.assertEqual(main(["--config", cfg_path, "--simulate", "-y",
+                                   "go-back"]), 0)
+            with open(log_path, encoding="utf-8") as fh:
+                lines = [json.loads(l) for l in fh if l.strip()]
+            self.assertEqual([l["kind"] for l in lines], ["move", "go-back"])
+        finally:
+            for name in os.listdir(directory):
+                os.remove(os.path.join(directory, name))
+            os.rmdir(directory)
+
+    def test_go_back_with_no_record_is_refused(self):
+        import tempfile
+        from psct_motors.cli import main
+        from psct_motors.config import default_config, save_config
+        directory = tempfile.mkdtemp()
+        cfg_path = os.path.join(directory, "psct_motors.json")
+        try:
+            save_config(default_config(), cfg_path)
+            self.assertEqual(main(["--config", cfg_path, "--simulate", "-y",
+                                   "go-back"]), 1)
+        finally:
+            for name in os.listdir(directory):
+                os.remove(os.path.join(directory, name))
+            os.rmdir(directory)
 
     def test_register_table_prints_offline(self):
         from psct_motors.cli import main

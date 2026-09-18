@@ -233,6 +233,28 @@ It does **not** prove the motor sets the bit you think it sets; only the
 hardware can tell you that, which is why every decoded error prints raw hex
 first with an explicit `[bit names UNVERIFIED]` marker.
 
+The names come from JVL's MIS23x/SMC75 user manual (LB0053, the "Err_Bits"
+description of register 35, and "Warn_Bits" for register 36):
+
+| bit | Err_Bits (35) | Warn_Bits (36) |
+|---|---|---|
+| 0 | General error | General warning |
+| 1 | Follow error | Positive limit switch active |
+| 2 | Output driver error (an output short-circuited) | Negative limit switch active |
+| 3 | Position limit error | Positive limit has been active |
+| 4 | Low bus voltage error | Negative limit has been active |
+| 5 | Over voltage error | Low bus voltage |
+| 6 | Temperature too high | Temperature above 80 C |
+| 7 | Internal error | Driver overload |
+| 8–10 | Encoder: lost position, reed error, communication error | — |
+
+Bit 2 is the one independently corroborated: the manual's I/O chapter says a
+short-circuited output "will show as Error Output Driver and Bit2 will be set
+in Err_Bits". To confirm the rest, provoke one fault with MacTalk connected
+and note which bit lights — or check the table against the register
+description in your copy of LB0053. `cli status` and `motor-report` decode
+both registers.
+
 Injection only ever tampers with values read back and with whether a
 transaction succeeds. It never invents a write, never changes a target, and
 never enables a drive.

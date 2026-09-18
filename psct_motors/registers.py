@@ -418,22 +418,52 @@ def describe_mode(value: int) -> str:
 # Bit-field decoding
 # --------------------------------------------------------------------------
 
-#: Bit meanings for ERR_BITS. VERIFY-level: the register itself is confirmed
-#: (0 = healthy), but this bit-to-text mapping has not been checked against a
-#: real fault on the pSCT motors. Decoded text is always shown next to the raw
-#: hex value in the UI so an unmapped or mis-mapped bit is still visible.
+#: Bit meanings for ERR_BITS (register 35, 'Err_Bits').
+#:
+#: Where this comes from, and how far to trust it
+#: ----------------------------------------------
+#: The register itself is CONFIRMED: it is in MacTalk's list for this motor and
+#: reads 0 on the healthy bench motor. The bit names below follow the order in
+#: JVL's MIS23x/SMC75 user manual (LB0053, section "Err_Bits", register 35).
+#: One of them is independently corroborated: the manual's I/O chapter says
+#: that a short-circuited output shows as the "Output Driver" error and "Bit2
+#: will be set in Err_Bits". An earlier version of this table had bit 2 as a
+#: position-limit error and no output-driver error at all, so it was wrong
+#: from bit 2 onwards.
+#:
+#: None of these has been checked against a real fault on the pSCT motors,
+#: and the manual could not be re-read while this was written, so the UI
+#: still shows the raw hex first and marks the names as unverified. To settle
+#: it: open LB0053 at the Err_Bits description (register 35, in the "MIS23x
+#: & SMC75 registers detailed" chapter), or provoke one fault in MacTalk and
+#: note which bit lights.
 ERROR_BITS: Dict[int, str] = {
     0: "General error",
-    1: "Follow error / position error too large",
-    2: "Position limit exceeded",
-    3: "Low bus voltage",
-    4: "Over voltage",
-    5: "Temperature too high",
-    6: "Internal/self-test error",
-    7: "Encoder error",
-    8: "Driver over-current",
-    9: "Driver disabled",
-    10: "Communication error",
+    1: "Follow error (encoder fell too far behind the profile)",
+    2: "Output driver error (an output is short-circuited)",
+    3: "Position limit error (a software position limit was passed)",
+    4: "Low bus voltage error (the motor will not move without its supply)",
+    5: "Over voltage error",
+    6: "Temperature too high",
+    7: "Internal error",
+    8: "Encoder lost position",
+    9: "Encoder reed error",
+    10: "Encoder communication error",
+}
+
+#: Bit meanings for WARN_BITS (register 36, 'Warn_Bits'), from the same
+#: section of LB0053 and with the same caveat: the layout is the manual's,
+#: unchecked on this motor. A warning is not an error -- the drive keeps
+#: running -- which is why nothing in this package refuses a move on one.
+WARNING_BITS: Dict[int, str] = {
+    0: "General warning",
+    1: "Positive limit switch active",
+    2: "Negative limit switch active",
+    3: "Positive limit switch has been active",
+    4: "Negative limit switch has been active",
+    5: "Low bus voltage",
+    6: "Temperature above 80 C",
+    7: "Driver overload",
 }
 
 #: Bit meanings for STATUSBITS -- deliberately empty.
@@ -479,6 +509,30 @@ def describe_errors(value: int) -> str:
             + " [bit names UNVERIFIED -- check against MacTalk]")
 
 
+def describe_errors_short(value: int, max_len: int = 48) -> str:
+    """The same decode, cut down to fit a table cell.
+
+    The hex always survives the cut, because it is the part that is certain.
+    """
+    if value == 0:
+        return ""
+    names = decode_bits(value, ERROR_BITS)
+    text = f"0x{int(value) & 0xFFFFFFFF:08X} " + "; ".join(
+        n.split(" (")[0] for n in names)
+    if len(text) > max_len:
+        text = text[:max_len - 1] + "…"
+    return text
+
+
+def describe_warnings(value: int) -> str:
+    """Decode WARN_BITS, with the same honesty as `describe_errors`."""
+    if value == 0:
+        return "No warnings"
+    names = decode_bits(value, WARNING_BITS)
+    return (f"0x{int(value) & 0xFFFFFFFF:08X}: " + ", ".join(names)
+            + " [bit names UNVERIFIED -- check against MacTalk]")
+
+
 def describe_status(value: int) -> str:
     raw = f"0x{int(value) & 0xFFFFFFFF:08X}"
     if not STATUS_BITS:
@@ -492,6 +546,8 @@ __all__ = [
     "RegisterDef", "REGISTERS", "REGISTERS_BY_NAME", "REGISTERS_BY_NUMBER",
     "register", "registers_needing_verification",
     "MotorMode", "describe_mode",
-    "ERROR_BITS", "STATUS_BITS", "decode_bits", "describe_errors", "describe_status",
+    "ERROR_BITS", "WARNING_BITS", "STATUS_BITS", "decode_bits",
+    "describe_errors", "describe_errors_short", "describe_warnings",
+    "describe_status",
     "CONFIRMED", "DOCUMENTED", "VERIFY",
 ]

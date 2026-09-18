@@ -14,3 +14,7 @@ config/*.tmp
 
 # Event log recordings from `cli watch` and the bench GUI.
 logs/
+
+# Where the focal plane has been: written by the application, one line per
+# move, beside the configuration. Belongs to the machine, not the repository.
+config/positions.jsonl

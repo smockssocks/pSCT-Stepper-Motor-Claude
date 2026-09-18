@@ -170,9 +170,19 @@ Say this first, not last. It is the part that makes the rest credible.
   test that settles it takes two minutes: engage the brakes by hand, command a
   0.1 mm move, and see whether the motors move anyway.
 * **The error bit meanings.** `ERR_BITS` is confirmed as the register, and 0 is
-  confirmed as healthy. Which bit means what comes from JVL's conventions and
-  has never been checked against a real fault. That is why every decoded error
-  prints the raw hex first and says `[bit names UNVERIFIED]`.
+  confirmed as healthy. The bit names follow the order in JVL's MIS23x manual
+  (LB0053, "Err_Bits", register 35): bit 0 general, 1 follow error, 2 output
+  driver, 3 position limit, 4 low bus voltage, 5 over voltage, 6 temperature,
+  7 internal. One of those is corroborated — the manual's I/O chapter says a
+  short-circuited output sets bit 2 — and an earlier version of this table
+  had bit 2 as something else, so it was wrong from there on. None of them
+  has been checked against a real fault on these motors, which is why every
+  decoded error prints the raw hex first and says `[bit names UNVERIFIED]`.
+  Settling it takes one provoked fault in MacTalk, noting which bit lights.
+* **Where the focal plane has been.** The drive keeps no history, so the
+  software keeps one — `config/positions.jsonl`, one line per move — and
+  "go back" reads from it. The record is only as old as the software: moves
+  made from MacTalk are not in it.
 * **Two of the three motors.** Only the bench motor has ever answered this
   software. The site drives the others over serial from MacTalk.
 * **The scale.** 169492 counts/mm comes from one measurement — 10,000 counts
