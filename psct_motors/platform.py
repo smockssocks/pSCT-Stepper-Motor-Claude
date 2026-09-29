@@ -452,11 +452,28 @@ class FocalPlanePlatform:
         The precondition for releasing a brake. Checked against the motors
         rather than assumed, because the brake controller cannot see them.
         """
+        return self.holding(None)
+
+    def holding(self, name: Optional[str]) -> bool:
+        """Whether the drive(s) a brake holds are enabled and holding.
+
+        `name` None or "all" means every drive. With separate brakes, one
+        brake only needs its own drive: the other two are still clamped.
+        """
         from .registers import MotorMode
+        motors = (self.motors if name in (None, "all")
+                  else [self.motor(name)])
         try:
-            return all(m.get_mode() == int(MotorMode.POSITION) for m in self.motors)
+            return all(m.get_mode() == int(MotorMode.POSITION) for m in motors)
         except (ModbusError, MotorFault):
             return False
+
+    def _brake_target(self, name: Optional[str]) -> str:
+        """What a request for one brake actually switches: that brake when
+        they are separate, all of them when one switch holds every brake."""
+        if name in (None, "all"):
+            return "all"
+        return "all" if getattr(self.external_brake, "all_or_nothing", True) else name
 
     # ------------------------------------------------------------ accessors
 
@@ -936,15 +953,34 @@ class FocalPlanePlatform:
                     "Raise limits.max_step_mm if this is genuinely intended."
                 )
 
-            # Every drive is enabled, not just the one that moves. The brakes
-            # are one switch for all three actuators, so taking them off with
-            # two drives passive would leave most of the plate held by nothing
-            # -- and the release interlock would refuse anyway.
+            # The same checks a coordinated move makes before any brake comes
+            # off. A jog used to skip them: it enabled the drives and released
+            # the brakes without looking at the drive's error bits or its
+            # supply -- and a JVL with no main supply still answers Modbus and
+            # can report Position mode while holding nothing at all.
+            for other in self.motors:
+                if not other.connected:
+                    continue
+                errors = other.get_errors()
+                if errors:
+                    raise PlatformError(
+                        f"Not jogging: {other.name} has an active error "
+                        f"({other.error_text()}). Clear it first; the brakes "
+                        "have not been touched.")
+            self._check_drive_power()
+
+            # Every drive is enabled, not just the one that moves: a jog tilts
+            # the plate about the other two, and they should be holding while
+            # it does. Each is read back as being in Position mode.
             for other in self.motors:
                 if other.connected:
                     other.ensure_position_mode()
+            self._log(f"{motor.name}: drive on and holding (read back); "
+                      "brakes may now be released.")
             self._release_brake_if_controlled(motor)
-            self._release_external_brakes()
+            # Only this actuator's brake when the brakes are separate; all of
+            # them when one switch holds all three.
+            self._release_external_brakes(motor.name)
             motor.set_velocity(motor.cfg.velocity_raw)
 
             started = time.time()
@@ -1056,8 +1092,14 @@ class FocalPlanePlatform:
                 "silently ignores its targets will look like a software fault."
             )
 
-    def _release_external_brakes(self) -> None:
-        """Take the site's brakes off, or say why the move cannot go ahead."""
+    def _release_external_brakes(self, name: Optional[str] = None) -> None:
+        """Take the site's brakes off, or say why the move cannot go ahead.
+
+        `name` is for a single-axis move: with separate brakes only that
+        actuator's comes off, and only its own drive has to be holding.
+        """
+        target = self._brake_target(name)
+        who = "the brakes" if target == "all" else f"the {target} brake"
         controller = self.external_brake
         if not controller.available:
             # Nothing to command and nothing to read. Say so once per move
@@ -1073,7 +1115,7 @@ class FocalPlanePlatform:
         try:
             # Fresh, not the poll's cached reading: this answer decides
             # whether the motors are about to push against a clamped brake.
-            state = controller.read_state(fresh=True)
+            state = controller.read_state(target, fresh=True)
         except BrakeError as exc:
             raise PlatformError(
                 f"Not moving: the brake controller could not be read ({exc}). "
@@ -1084,28 +1126,28 @@ class FocalPlanePlatform:
         if state is BrakeState.RELEASED:
             return
 
-        if not self.drives_holding:
+        if not self.holding(target):
             raise PlatformError(
-                "Not moving: the brakes are engaged and the drives are not "
-                "holding position, so releasing them now would leave the focal "
+                f"Not moving: {who} are engaged and the drive(s) they hold are "
+                "not holding position, so releasing now would leave the focal "
                 "plane held by nothing. Enable the drives first."
             )
         try:
-            controller.release("all", drives_holding=True)
+            controller.release(target, drives_holding=True)
         except BrakeError as exc:
             raise PlatformError(
-                f"Not moving: the brakes did not release ({exc}). Driving the "
+                f"Not moving: {who} did not release ({exc}). Driving the "
                 "motors against an engaged brake is how a lead screw or a "
                 "coupling gets damaged."
             ) from exc
 
         try:
-            after = controller.read_state(fresh=True)
+            after = controller.read_state(target, fresh=True)
         except BrakeError:
             return          # commanded, but unreadable; already logged
         if after is not BrakeState.RELEASED:
             raise PlatformError(
-                "Not moving: the brakes were commanded to release but still "
+                f"Not moving: {who} were commanded to release but still "
                 f"read back as {after.value}. Check the brake supply -- these "
                 "brakes are spring-applied, so with no power to them they clamp."
             )
@@ -1874,16 +1916,17 @@ class FocalPlanePlatform:
         from .external_brake import BrakeError
         controller = self.external_brake
         if controller.available:
-            together = getattr(controller, "all_or_nothing", True)
-            target = "all" if together else name
+            target = self._brake_target(name)
             try:
                 if engaged:
                     controller.engage(target)
                 else:
-                    controller.release(target, drives_holding=self.drives_holding)
+                    # With separate brakes only this actuator's drive has to
+                    # be holding: the other two are still clamped.
+                    controller.release(target, drives_holding=self.holding(target))
             except BrakeError as exc:
                 return {target: str(exc)}
-            return {target: "ok" if not together else
+            return {target: "ok" if target != "all" else
                     "ok (one switch holds all three brakes, so all three changed)"}
 
         motor = self.motor(name)

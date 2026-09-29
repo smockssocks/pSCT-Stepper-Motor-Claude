@@ -804,6 +804,63 @@ class TestGui(unittest.TestCase):
         self.assertIsInstance(self.app.platform.external_brake, BrakeController)
         self.assertEqual(self.app.platform.external_brake.cfg.relays, {"all": 1})
 
+    def test_choosing_a_relay_per_actuator_makes_the_brakes_separate(self):
+        plc = self._use_fake_plc()
+        self._answer(False, self.app.on_edit_brake_controller)
+        self.pump(0.2)
+        window = self.app._brake_window
+        # Pick "a relay for each actuator" and fill in 1, 2, 3.
+        radios = []
+        entries = []
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, ttk.Radiobutton):
+                    radios.append(child)
+                if isinstance(child, ttk.Entry):
+                    entries.append(child)
+                walk(child)
+        walk(window)
+        next(r for r in radios if "separate" in r.cget("text")).invoke()
+        # The three per-actuator relay boxes follow the single-relay box.
+        relay_boxes = [e for e in entries if int(e.cget("width")) == 5][1:4]
+        for box, number in zip(relay_boxes, ("1", "2", "3")):
+            box.delete(0, "end")
+            box.insert(0, number)
+        self._answer(False, lambda: self._press(window, "Use for this session"))
+        self.pump(0.2)
+        settings = self.app.cfg.external_brake
+        self.assertEqual(settings.relays, {"Top": 1, "East": 2, "West": 3})
+        self.assertFalse(settings.all_or_nothing)
+        self.assertFalse(self.app.platform.external_brake.all_or_nothing)
+
+    def test_the_position_log_has_one_go_to_button_and_double_click(self):
+        self.app._start_polling()
+        self.app.on_open_position_log()
+        self.pump(0.2)
+        labels = []
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, ttk.Button):
+                    labels.append(child.cget("text"))
+                walk(child)
+        walk(self.app._history_window)
+        self.assertIn("Go to selected position", labels)
+        self.assertFalse(any("'before'" in t or "'after'" in t for t in labels))
+
+        start = self.app.platform.read_orientation().focus_mm
+        self.app.platform.move_to_orientation(Orientation(start + 2.0, 0.0, 0.0))
+        self.app.platform.move_to_orientation(Orientation(start + 4.0, 0.0, 0.0))
+        self.pump(0.3)
+        tree = self.app._history_tree
+        older = tree.get_children()[1]                  # the move to +2
+        tree.selection_set(older)
+        self._answer(True, self.app._go_to_selected)
+        self._wait_idle(8.0)
+        self.assertAlmostEqual(self.app.platform.read_orientation().focus_mm,
+                               start + 2.0, places=2)
+
     def _press(self, window, text):
         def walk(widget):
             for child in widget.winfo_children():

@@ -197,11 +197,12 @@ before, where it was sent, where it actually ended up, and whether it
 finished. A halted move is recorded too, because its "after" is where the
 plane really is.
 
-*View → Position log* shows it, newest first. Select a line and either return
-to its "before" or go to its "after"; *Motion → Go back to the previous
-position* does the common case in one click. Each of those is an ordinary
-move: it is checked against the limits and the step size, previewed, and
-confirmed, exactly as a typed one is. Going back is never an unchecked path.
+*View → Position log* shows it, newest first. Select a line and press **Go to
+selected position** (or double-click it) to return to where that move ended
+up; *Motion → Go back to the previous position* undoes the last move in one
+click. Each of those is an ordinary move: it is checked against the limits and
+the step size, previewed, and confirmed, exactly as a typed one is. Going back
+is never an unchecked path.
 
 ```
 python -m psct_motors.cli history              # the same record, in text
@@ -391,14 +392,18 @@ says which parts are real.
    "Local I/O Number" set on the PLC and has to be given one there first.
 2. In the GUI, *Tools → Brake controller (PLC)* (or **Brakes…** in the
    Connection box): enter the IP, and which relay drives the brakes: one relay
-   for all three, or one per actuator. Add the user and password if the PLC
-   asks for one.
+   for all three, or one per actuator. With a relay per actuator the brakes
+   are **separate**: each row's Release/Engage switches only that brake, and a
+   jog releases only the brake of the actuator it moves (a focus move still
+   releases all three). Add the user and password if the PLC asks for one.
 3. Press **Read the PLC** and tick **keep reading**. Every relay and input is
    shown live. Switch relays from the PLC's own web page and watch which light
    changes, and which brake clicks. This window only reads, and never switches
    anything itself.
-4. Set **relay ON releases the brakes** to match what you saw. Spring-applied
-   brakes that are powered to release are the usual case, but check it.
+4. Leave **relay ON releases the brakes** ticked if the brakes are fail-safe
+   (a dead-man's arrangement: they clamp when they lose power, so powering
+   them is what releases them). The site describes them that way. Check it
+   once by hand: release from the GUI, and the brake should be free.
 5. **Use and save.**
 
 Then run the sequence you would use on the telescope, and watch the **Brakes:**
@@ -410,6 +415,11 @@ line in the Connection box:
   Releasing is refused while any drive is off, because then nothing would be
   holding the camera.
 - Move or nudge focus. The brakes are released first if they are on.
+- **Jog** one actuator (▲/▼). Before any brake comes off it checks, in order:
+  no drive reports an error, the supply has not failed (once `cli supply` has
+  recorded a healthy reading), every drive is on and reads back as holding.
+  Only then is the brake released (just that actuator's, if they are
+  separate). If any check fails, nothing is released and the log says which.
 - **Engage all brakes**, then try **EMERGENCY**. It engages the brakes but
   **keeps the drives on**, and the log says why (see below).
 - `python -m psct_motors.cli plc` prints every relay and input from the command

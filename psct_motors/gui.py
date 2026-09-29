@@ -2134,9 +2134,9 @@ class MotorApp:
                                                   padx=8, pady=3)
         ttk.Entry(wiring, textvariable=one_relay, width=5).grid(row=0, column=1,
                                                                 sticky="w")
-        ttk.Radiobutton(wiring, text="a relay for each actuator:", value="each",
-                        variable=relay_mode).grid(row=1, column=0, sticky="w",
-                                                  padx=8, pady=3)
+        ttk.Radiobutton(wiring, text="a relay for each actuator (separate):",
+                        value="each", variable=relay_mode).grid(
+            row=1, column=0, sticky="w", padx=8, pady=3)
         relay_vars = {}
         for index, name in enumerate(names):
             ttk.Label(wiring, text=name).grid(row=2 + index, column=0, sticky="e",
@@ -2146,11 +2146,26 @@ class MotorApp:
             ttk.Entry(wiring, textvariable=var, width=5).grid(
                 row=2 + index, column=1, sticky="w", pady=1)
             relay_vars[name] = var
+        tk.Label(wiring, justify="left", anchor="w", fg="#555", wraplength=330,
+                 font=("TkDefaultFont", 8),
+                 text=("Separate: each row's Release/Engage switches only that "
+                       "brake, and a jog releases only the brake of the "
+                       "actuator it moves. A focus move still releases all "
+                       "three.")).grid(row=5, column=0, columnspan=3, sticky="w",
+                                       padx=8, pady=(2, 0))
         energized_var = tk.BooleanVar(value=settings.energized_releases)
         ttk.Checkbutton(
             wiring, variable=energized_var,
-            text="relay ON releases the brakes (spring brakes powered to release)"
-        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 6))
+            text="relay ON releases the brakes"
+        ).grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 0))
+        tk.Label(wiring, justify="left", anchor="w", fg="#555", wraplength=330,
+                 font=("TkDefaultFont", 8),
+                 text=("Leave ticked for fail-safe brakes (a dead-man's "
+                       "arrangement): with no power they clamp, so powering "
+                       "them through the relay is what releases them. Check it "
+                       "once by hand: release from here, and the brake should "
+                       "be free.")).grid(row=7, column=0, columnspan=3,
+                                         sticky="w", padx=8, pady=(0, 6))
 
         # --- feedback --------------------------------------------------------
         feedback = ttk.LabelFrame(window, text="Brake feedback inputs (optional)")
@@ -2263,6 +2278,9 @@ class MotorApp:
                           http_port=port, username=user_var.get().strip(),
                           password=pass_var.get(), use_https=bool(https_var.get()),
                           relays=relays, feedback_inputs=feedbacks,
+                          # A relay per actuator means separate brakes: each
+                          # can be switched on its own. One relay means one.
+                          all_or_nothing=(relay_mode.get() == "one"),
                           energized_releases=bool(energized_var.get()),
                           feedback_on_means_released=bool(fb_released_var.get()))
             try:
@@ -2597,18 +2615,18 @@ class MotorApp:
 
         tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=940,
                  text=("Every move this software has commanded, newest first: "
-                       "where the focal plane was before, where it was sent, and "
-                       "where it actually ended up. Positions are focus mm from "
-                       "zero, then tip and tilt in degrees. A move that was "
-                       "halted is listed too, because its 'after' is where the "
-                       "plane really is.")
+                       "where the focal plane came from, where it was sent, and "
+                       "the position it actually ended up at. Positions are "
+                       "focus mm from zero, then tip and tilt in degrees. A "
+                       "move that was halted is listed too, because its "
+                       "position is where the plane really is.")
                  ).grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
 
-        columns = ("when", "what", "before", "sent to", "after", "result", "note")
+        columns = ("when", "what", "from", "sent to", "position", "result", "note")
         tree = ttk.Treeview(window, columns=columns, show="headings",
                             selectmode="browse", height=12)
-        widths = {"when": 130, "what": 68, "before": 180, "sent to": 180,
-                  "after": 180, "result": 100, "note": 160}
+        widths = {"when": 130, "what": 68, "from": 180, "sent to": 180,
+                  "position": 180, "result": 100, "note": 160}
         for column in columns:
             tree.heading(column, text=column)
             tree.column(column, width=widths[column], anchor="w",
@@ -2622,18 +2640,19 @@ class MotorApp:
         buttons = ttk.Frame(window)
         buttons.grid(row=2, column=0, columnspan=2, sticky="w", padx=12,
                      pady=(8, 10))
+        # One button: go to the position on the selected line, which is where
+        # that move actually ended up. Double-clicking a line does the same.
+        ttk.Button(buttons, text="Go to selected position",
+                   command=self._go_to_selected).grid(row=0, column=0,
+                                                      padx=(0, 8))
         ttk.Button(buttons, text="Go back one move",
-                   command=self.on_go_back).grid(row=0, column=0, padx=(0, 12))
-        ttk.Button(buttons, text="Return to the selected line's 'before'",
-                   command=lambda: self._go_to_selected("before")).grid(
-            row=0, column=1, padx=4)
-        ttk.Button(buttons, text="Go to the selected line's 'after'",
-                   command=lambda: self._go_to_selected("after")).grid(
-            row=0, column=2, padx=4)
+                   command=self.on_go_back).grid(row=0, column=1, padx=4)
         ttk.Label(buttons, foreground="#777", font=("TkDefaultFont", 8),
-                  text="  Each of these is an ordinary move: limits and step "
-                       "size are checked, and you are asked to confirm.").grid(
-            row=0, column=3, padx=(12, 0))
+                  text="  Double-click a line to go there. Every one of these "
+                       "is an ordinary move: limits and step size are checked, "
+                       "and you are asked to confirm.").grid(
+            row=0, column=2, padx=(12, 0))
+        tree.bind("<Double-1>", lambda _event: self._go_to_selected())
 
         self._history_path_var = tk.StringVar()
         ttk.Label(window, textvariable=self._history_path_var, foreground="#777",
@@ -2680,7 +2699,12 @@ class MotorApp:
             f"{len(self._history_rows)} move(s) on record"
             + (f", written to {path}" if path else ", this session only"))
 
-    def _go_to_selected(self, which: str) -> None:
+    def _go_to_selected(self) -> None:
+        """Go to the selected line's position: where that move ended up.
+
+        For the position before a move, pick the line above it (the move
+        before), or use Go back one move.
+        """
         tree = self._history_tree
         if tree is None:
             return
@@ -2694,17 +2718,16 @@ class MotorApp:
             record = self._history_rows[int(selected[0])]
         except (ValueError, IndexError):
             return
-        target = record.before if which == "before" else record.after
-        if target is None:
+        if record.after is None:
             messagebox.showwarning(
                 "Not recorded",
-                f"That line has no '{which}' position: the motors could not "
-                "be read at the time.", parent=self._history_window)
+                "That line has no recorded position: the motors could not be "
+                "read at the time.", parent=self._history_window)
             return
         self._move_with_confirmation(
-            target, kind="go-back",
-            note=f"to the '{which}' of the {record.kind} at {record.when}",
-            reason=f"Return to the '{which}' position of the {record.kind} "
+            record.after, kind="go-back",
+            note=f"to where the {record.kind} at {record.when} ended",
+            reason=f"Go to the position recorded after the {record.kind} "
                    f"at {record.when}:")
 
     def on_go_back(self) -> None:

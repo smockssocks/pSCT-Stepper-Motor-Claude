@@ -350,6 +350,72 @@ class TestPlatformWithThePlc(unittest.TestCase):
         time.sleep(0.4)
         self.assertGreater(motor.get_position_mm(), start + 0.1)
 
+    # ---- separate brakes ------------------------------------------------------
+
+    def _separate(self):
+        return self._platform(relays={"Top": 1, "East": 2, "West": 3},
+                              all_or_nothing=False)
+
+    def test_separate_brakes_switch_one_at_a_time_from_their_rows(self):
+        platform = self._separate()
+        platform.enable_drives()
+        result = platform.set_brake("East", engaged=False)
+        self.assertEqual(result, {"East": "ok"})
+        self.assertEqual([self.plc.relays[n] for n in (1, 2, 3)], [0, 1, 0])
+        state = platform.read_state()
+        brakes = {m.name: m.brake.state for m in state.motors}
+        self.assertEqual(brakes, {"Top": BrakeState.ENGAGED,
+                                  "East": BrakeState.RELEASED,
+                                  "West": BrakeState.ENGAGED})
+
+    def test_one_separate_brake_needs_only_its_own_drive_holding(self):
+        platform = self._separate()
+        platform.motor("West").ensure_position_mode()      # only West is on
+        refused = platform.set_brake("East", engaged=False)
+        self.assertIn("Refusing", refused["East"])
+        self.assertEqual(self.plc.relays[2], 0)
+        self.assertEqual(platform.set_brake("West", engaged=False), {"West": "ok"})
+        self.assertEqual(self.plc.relays[3], 1)
+
+    def test_a_jog_releases_only_its_own_brake_when_they_are_separate(self):
+        platform = self._separate()
+        platform.move_actuator_mm("Top", 0.5, relative=True)
+        self.assertEqual([self.plc.relays[n] for n in (1, 2, 3)], [1, 0, 0])
+
+    def test_a_focus_move_releases_all_three_separate_brakes(self):
+        platform = self._separate()
+        platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+        self.assertEqual([self.plc.relays[n] for n in (1, 2, 3)], [1, 1, 1])
+
+    def test_a_jog_releases_every_brake_when_one_relay_holds_them_all(self):
+        platform = self._platform()
+        platform.move_actuator_mm("Top", 0.5, relative=True)
+        self.assertEqual(self.plc.relays[1], 1)
+
+    # ---- the checks before a jog releases anything ------------------------------
+
+    def test_a_jog_is_refused_over_a_drive_error_and_touches_no_brake(self):
+        platform = self._platform()
+        platform.motors[1]._transport.inject_error(1 << 6)
+        with self.assertRaises(PlatformError) as ctx:
+            platform.move_actuator_mm("Top", 0.5, relative=True)
+        self.assertIn("East has an active error", str(ctx.exception))
+        self.assertEqual(self.plc.relays[1], 0)
+        self.assertTrue(all("relay" not in r for r in self.plc.requests))
+
+    def test_a_jog_is_refused_with_a_failed_supply_and_touches_no_brake(self):
+        """A drive with no main supply answers Modbus and can read back as
+        enabled while holding nothing. Releasing a brake over it drops that
+        corner of the plate."""
+        platform = self._platform()
+        for actuator in platform.cfg.actuators:
+            actuator.supply_nominal_v, actuator.supply_raw_at_nominal = 48.0, 4485
+        platform.motor("Top")._transport.set_powered(False)
+        with self.assertRaises(PlatformError) as ctx:
+            platform.move_actuator_mm("Top", 0.5, relative=True)
+        self.assertIn("supply has failed", str(ctx.exception))
+        self.assertEqual(self.plc.relays[1], 0)
+
     def test_release_from_a_row_is_refused_with_the_drives_off(self):
         platform = self._platform()
         result = platform.set_brake("Top", engaged=False)
