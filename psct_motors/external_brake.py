@@ -20,25 +20,46 @@ is where that goes. `jvl_motor.BrakeStatus` still covers motor-driven brakes
 for anyone who wires one that way; this covers the arrangement the pSCT
 actually uses.
 
-What is still needed before this can drive the real brakes
-----------------------------------------------------------
-The procedure gives the address of the page but not its protocol, and the two
-pages it names are not consistent with each other (172.17.2.14 is called the
-PLC on one slide and the 24 V supply on another; 172.17.2.16 is called the
-high-voltage GUI on one and the brake page on another). None of that can be
-guessed from here. What is needed is one of:
+The device: a ControlByWeb X-432
+--------------------------------
+The brakes are switched by a ControlByWeb X-432, a web-enabled PLC with 16
+relays and 18 digital inputs. `mode = "controlbyweb"` drives it over HTTP,
+which is what its own web page uses:
 
-  * the make and model of the device behind that page, or
-  * whether it answers Modbus TCP, and on which coil or register, or
-  * the URL the page's own buttons POST to, which a browser's network tab
-    will show in about a minute.
+    GET /state.json                   every relay and input, as JSON
+    GET /state.json?relay3=1          switch relay 3 on (0 = off)
 
-Until one of those is known, `mode` stays "none": the GUI reports the brakes
-as not under software control and says why, rather than showing a state it
-cannot actually read. Guessing a URL and firing writes at an unknown device
-that controls a brake on a suspended camera is not a reasonable default.
+The tag names are the device's "Local I/O Numbers" -- relay1..relay16,
+digitalInput1..digitalInput18 -- and only I/O that has been given one appears
+at all. HTTP was chosen over the device's Modbus TCP because the state page
+can be opened in a browser, so what this software sees can be checked by eye
+in a second, and the relay numbers are the ones printed on the unit rather
+than a coil address table that has to be looked up.
 
-Once known, fill in ExternalBrakeConfig and nothing above this file changes.
+How the relays are wired to the brakes is NOT known from here. So nothing
+about it is assumed:
+
+  * which relay drives which brake is configured (`relays`), either one relay
+    for all three ({"all": 1}) or one per actuator;
+  * which way round it is -- whether energising the relay releases the brake,
+    which it does for a spring-applied brake powered to release -- is
+    configured (`energized_releases`);
+  * whether anything reports what the brake is *actually* doing is
+    configured (`feedback_inputs`), and when nothing does, the state shown is
+    labelled as the relay's state rather than the brake's.
+
+That last point is not a formality. A relay reading "off" says the PLC was
+told to turn it off. It does not say the brake clamped: a wiring mistake, a
+blown fuse or a reversed polarity would all read the same. EMERGENCY turns
+the drives off only when the brakes are *confirmed* holding, and without a
+feedback input they cannot be, so the drives stay on. That is deliberate.
+
+Other devices
+-------------
+"modbus" (a coil per brake) and "http" (fixed URLs to POST to) are kept for a
+device that works that way. "none" -- the brakes not under software control
+-- is still the default: firing writes at a device nobody has configured is
+not a reasonable default for a brake on a suspended camera.
 
 Safety
 ------
@@ -50,14 +71,22 @@ interlock on the motor-driven path.
 
 from __future__ import annotations
 
+import base64
 import json
+import re
 import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence
 
 from .jvl_motor import BrakeState
+
+#: Brake-controller modes, and what each is called on screen.
+MODES = ("none", "controlbyweb", "modbus", "http")
 
 
 class BrakeError(RuntimeError):
@@ -69,16 +98,19 @@ class ExternalBrakeConfig:
     """How to reach the device that switches the brakes.
 
     mode
-        "none"    -- not under software control (the honest default today).
-        "modbus"  -- the device answers Modbus TCP; brakes are coils or a
-                     register bit at `host`.
-        "http"    -- the device has an HTTP endpoint; `release_url` and
-                     `engage_url` are fetched to switch it.
+        "none"          -- not under software control (the default).
+        "controlbyweb"  -- a ControlByWeb X-400-series PLC such as the X-432,
+                           over HTTP: relays switch the brakes, and optional
+                           digital inputs report what they actually did.
+        "modbus"        -- the device answers Modbus TCP; brakes are coils.
+        "http"          -- fixed URLs are POSTed to switch the brakes.
 
     all_or_nothing
         True when one switch controls all three brakes together, which is what
         the procedure's wording implies ("switch on brakes for all motors").
-        Set False if each has its own control.
+        Set False if each has its own control. Even with separate relays,
+        leaving this True switches all three together, which is the safe way
+        to run a three-point mount.
     """
 
     mode: str = "none"
@@ -91,9 +123,10 @@ class ExternalBrakeConfig:
     # --- modbus mode -------------------------------------------------------
     #: Coil address per actuator name, or a single entry keyed "all".
     coils: Dict[str, int] = field(default_factory=dict)
-    #: True when writing 1 releases the brake. A fail-safe brake is
-    #: spring-applied and electrically released, so energising normally
-    #: releases -- but confirm it rather than assuming.
+    #: True when turning the output ON (relay energised, coil 1) releases the
+    #: brake. A fail-safe brake is spring-applied and electrically released,
+    #: so energising normally releases -- but that depends on how the relay is
+    #: wired, which is why it is a setting. Applies to "controlbyweb" too.
     energized_releases: bool = True
 
     # --- http mode ---------------------------------------------------------
@@ -103,12 +136,50 @@ class ExternalBrakeConfig:
     #: JSON field in the status response holding the state, if there is one.
     status_field: str = "brakes"
 
+    # --- controlbyweb mode -------------------------------------------------
+    #: Which relay switches which brake: {"all": 1} for one relay switching
+    #: every brake, or {"Top": 1, "East": 2, "West": 3}. The numbers are the
+    #: relays' Local I/O Numbers, as printed in the device's state.json.
+    relays: Dict[str, int] = field(default_factory=dict)
+    #: Optional digital inputs that report what each brake actually did -- a
+    #: limit switch on the brake, or a sense line on the brake supply. With
+    #: one configured for every brake, the brake state is a measurement.
+    #: Without, it is only the relay's state, and is labelled that way.
+    feedback_inputs: Dict[str, int] = field(default_factory=dict)
+    #: True when a feedback input reading ON means the brake is released.
+    feedback_on_means_released: bool = True
+    http_port: int = 80
+    use_https: bool = False
+    #: The device's login, if it has a password set for its state page.
+    username: str = "admin"
+    password: str = ""
+
     def validate(self) -> None:
-        if self.mode not in ("none", "modbus", "http"):
+        if self.mode not in MODES:
             raise ValueError(
-                f"external_brake.mode must be 'none', 'modbus' or 'http', "
+                f"external_brake.mode must be one of {', '.join(MODES)}; "
                 f"got {self.mode!r}"
             )
+        if self.mode == "controlbyweb":
+            if not self.host:
+                raise ValueError(
+                    "external_brake.mode is 'controlbyweb' but no host is set. "
+                    "Put the PLC's IP address in external_brake.host.")
+            if not self.relays:
+                raise ValueError(
+                    "external_brake.mode is 'controlbyweb' but no relays are "
+                    "mapped. Set relays to {'all': <relay number>} or one "
+                    "entry per actuator.")
+            for kind, mapping in (("relay", self.relays),
+                                  ("feedback input", self.feedback_inputs)):
+                for name, number in mapping.items():
+                    if not isinstance(number, int) or isinstance(number, bool) \
+                            or number < 1:
+                        raise ValueError(
+                            f"external_brake: {kind} for {name!r} must be a "
+                            f"whole number from 1, got {number!r}")
+            if not (0 < int(self.http_port) < 65536):
+                raise ValueError("external_brake.http_port must be 1..65535")
         if self.mode == "modbus":
             if not self.host:
                 raise ValueError("external_brake.mode is 'modbus' but no host is set")
@@ -128,6 +199,84 @@ class ExternalBrakeConfig:
     def configured(self) -> bool:
         return self.mode != "none"
 
+    @classmethod
+    def from_settings(cls, settings) -> "ExternalBrakeConfig":
+        """Build from config.ExternalBrakeSettings (same field names)."""
+        from dataclasses import fields
+        names = {f.name for f in fields(cls)}
+        values = {name: getattr(settings, name) for name in names
+                  if hasattr(settings, name)}
+        for key in ("coils", "relays", "feedback_inputs"):
+            if key in values:
+                values[key] = dict(values[key])
+        return cls(**values)
+
+
+# --------------------------------------------------------------------------
+# Reading a ControlByWeb state page
+# --------------------------------------------------------------------------
+
+_RELAY_KEY = re.compile(r"^relay(\d+)(?:state)?$", re.IGNORECASE)
+_INPUT_KEY = re.compile(r"^(?:digitalinput|input)(\d+)(?:state)?$", re.IGNORECASE)
+
+
+def _on_off(value) -> Optional[bool]:
+    """A ControlByWeb I/O value as on (True) / off (False), or None."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "on", "true", "closed", "energized", "energised"):
+            return True
+        if text in ("0", "off", "false", "open", "de-energized", "de-energised"):
+            return False
+        try:
+            return float(text) != 0
+        except ValueError:
+            return None
+    return None
+
+
+def parse_state(payload: Dict[str, object]) -> Dict[str, Dict[int, bool]]:
+    """Pick the relays and digital inputs out of a state.json / state.xml.
+
+    Tolerant on purpose: the X-400 series names them relay1 and
+    digitalInput1, older ControlByWeb units relay1state and input1state, and
+    values arrive as numbers or strings depending on firmware. Anything that
+    is not a relay or a digital input (analog inputs, temperatures, the
+    serial number) is ignored here and kept in `raw` by the caller.
+    """
+    relays: Dict[int, bool] = {}
+    inputs: Dict[int, bool] = {}
+    for key, value in payload.items():
+        state = _on_off(value)
+        if state is None:
+            continue
+        match = _RELAY_KEY.match(str(key))
+        if match:
+            relays[int(match.group(1))] = state
+            continue
+        match = _INPUT_KEY.match(str(key))
+        if match:
+            inputs[int(match.group(1))] = state
+    return {"relays": relays, "inputs": inputs}
+
+
+def _flatten(payload) -> Dict[str, object]:
+    """state.json is flat on the X-400, but tolerate one level of nesting."""
+    if not isinstance(payload, dict):
+        return {}
+    flat: Dict[str, object] = {}
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            for inner_key, inner in value.items():
+                flat[str(inner_key)] = inner
+        else:
+            flat[str(key)] = value
+    return flat
+
 
 #: Printed wherever the brakes are asked about and cannot be controlled. Says
 #: what is missing and how to find it, rather than only that it is missing.
@@ -135,54 +284,131 @@ NOT_CONFIGURED_MESSAGE = (
     "The focal-plane brakes are not under software control.\n\n"
     "On this telescope they are switched by a separate device with its own web "
     "page, not by the motors -- which is why the motor's Brake Output register "
-    "(179) reads 0. To drive them from here, one of the following is needed:\n"
-    "  * the make and model of that device, or\n"
-    "  * whether it answers Modbus TCP, and on which coil, or\n"
-    "  * the URL its own buttons POST to (a browser's network tab shows this).\n\n"
-    "Then fill in external_brake in the configuration. Until then, release and "
-    "engage the brakes from that web page as the written procedure describes, "
-    "and do it BEFORE moving: the brakes are on when their power is off, and "
-    "the motors cannot move the focal plane against them."
+    "(179) reads 0. That device is a ControlByWeb X-432 PLC. To drive it from "
+    "here, open Tools > Brake controller (PLC) and enter its IP address and "
+    "which relay switches the brakes (or set external_brake.mode to "
+    "'controlbyweb' in the configuration). Other devices can be driven over "
+    "Modbus TCP coils or fixed HTTP URLs.\n\n"
+    "Until then, release and engage the brakes from that web page as the "
+    "written procedure describes, and do it BEFORE moving: the brakes are on "
+    "when their power is off, and the motors cannot move the focal plane "
+    "against them."
 )
 
 
 class BrakeController:
     """Reads and switches brakes that live outside the motors."""
 
-    def __init__(self, cfg: ExternalBrakeConfig,
-                 logger=None):
+    #: How long a ControlByWeb status read is reused. The GUI polls several
+    #: times a second while a move runs; the brakes do not change that fast,
+    #: and a small PLC should not be asked that often.
+    STATUS_CACHE_S = 0.4
+    #: After a failed read, how long to report the same failure without
+    #: trying again. An unreachable PLC would otherwise cost every status poll
+    #: a full timeout, and the motor readouts would freeze behind it.
+    FAILURE_BACKOFF_S = 2.0
+
+    def __init__(self, cfg: ExternalBrakeConfig, logger=None,
+                 names: Optional[Sequence[str]] = None):
         self.cfg = cfg
         self.cfg.validate()
         self._log = logger or (lambda msg: None)
         self._lock = threading.RLock()
         self._client = None
+        #: The actuators' names, so "every brake has feedback" can be judged.
+        self.names: List[str] = list(names or [])
         #: Last commanded state, used only to report something in HTTP mode
         #: when the device offers no way to read back. Reported as inferred.
         self._assumed: Optional[BrakeState] = None
+        # ControlByWeb status cache.
+        self._io: Optional[dict] = None
+        self._io_time = 0.0
+        self._io_error: Optional[str] = None
+        self._io_error_time = 0.0
+        #: Which state page the device answered on, once known.
+        self._endpoint = "state.json"
 
     @property
     def available(self) -> bool:
         return self.cfg.configured
 
+    @property
+    def all_or_nothing(self) -> bool:
+        """True when one command switches every brake."""
+        return (self.cfg.all_or_nothing or "all" in self.cfg.relays
+                or "all" in self.cfg.coils)
+
     def explain_unavailable(self) -> str:
         return NOT_CONFIGURED_MESSAGE
 
+    def describe(self) -> str:
+        if self.cfg.mode == "controlbyweb":
+            return f"ControlByWeb PLC at {self._base_url()}"
+        if self.cfg.mode == "modbus":
+            return f"Modbus brake controller at {self.cfg.host}:{self.cfg.port}"
+        if self.cfg.mode == "http":
+            return "HTTP brake controller"
+        return "no brake controller"
+
     # ---------------------------------------------------------------- state
 
-    def read_state(self, name: str = "all") -> BrakeState:
+    def read_state(self, name: str = "all", fresh: bool = False) -> BrakeState:
+        """The brake state. `fresh` bypasses the status cache, which an
+        interlock that is about to act on the answer must do."""
         if not self.cfg.configured:
             return BrakeState.UNKNOWN
+        if self.cfg.mode == "controlbyweb":
+            return self._cbw_state(name, self._cbw_io(fresh))
         if self.cfg.mode == "modbus":
             return self._modbus_read(name)
         return self._http_read()
 
     def state_is_measured(self, name: str = "all") -> bool:
-        """Whether read_state reflects the device or only what we last sent."""
+        """Whether read_state reports the brake itself.
+
+        False means it reports only what the device was told to do -- the
+        relay's state, or the last command sent. The difference decides
+        whether EMERGENCY may turn the drives off: it may only when the brakes
+        are confirmed holding, and a relay turned off is not a clamped brake.
+        """
+        if self.cfg.mode == "controlbyweb":
+            return bool(self._cbw_feedback_for(name))
         if self.cfg.mode == "modbus":
             return True
         if self.cfg.mode == "http":
             return bool(self.cfg.status_url)
         return False
+
+    def is_holding(self, name: str) -> bool:
+        """Whether this brake is clamping, from the last reading only.
+
+        Asked by a *simulated* motor on every physics step, which is how a
+        bench rig with one real motor and a real PLC behaves as if the brakes
+        were fitted: a stood-in axis will not turn while the PLC says its
+        brake is on. It never touches the network. With no reading yet, or an
+        unreadable one, the brake is taken to be holding -- these brakes are
+        spring-applied, so "not known to be released" is the honest default.
+        """
+        if self.cfg.mode != "controlbyweb":
+            return False
+        with self._lock:
+            io = self._io
+        if io is None:
+            return True
+        try:
+            return self._cbw_state(name, io) is not BrakeState.RELEASED
+        except BrakeError:
+            return True
+
+    def read_io(self, fresh: bool = True) -> dict:
+        """Every relay and digital input the PLC reports, plus the raw page.
+
+        For the GUI's PLC view and `cli plc`: seeing every I/O point at once
+        is how the wiring gets worked out.
+        """
+        if self.cfg.mode != "controlbyweb":
+            raise BrakeError("Only a ControlByWeb brake controller can list its I/O.")
+        return self._cbw_io(fresh)
 
     # -------------------------------------------------------------- control
 
@@ -216,11 +442,177 @@ class BrakeController:
             raise BrakeError(NOT_CONFIGURED_MESSAGE)
 
     def _switch(self, name: str, release: bool) -> None:
-        if self.cfg.mode == "modbus":
+        if self.cfg.mode == "controlbyweb":
+            self._cbw_write(name, release)
+        elif self.cfg.mode == "modbus":
             self._modbus_write(name, release)
         else:
             self._http_write(release)
         self._assumed = BrakeState.RELEASED if release else BrakeState.ENGAGED
+
+    # --------------------------------------------------------- controlbyweb
+
+    def _base_url(self) -> str:
+        scheme = "https" if self.cfg.use_https else "http"
+        default = 443 if self.cfg.use_https else 80
+        port = "" if int(self.cfg.http_port) == default else f":{self.cfg.http_port}"
+        return f"{scheme}://{self.cfg.host}{port}"
+
+    def _cbw_relays_for(self, name: str) -> List[int]:
+        relays = self.cfg.relays
+        if "all" in relays:
+            return [relays["all"]]
+        if name == "all" or self.cfg.all_or_nothing:
+            return sorted(set(relays.values()))
+        if name not in relays:
+            raise BrakeError(
+                f"No relay is mapped for the {name!r} brake. Mapped: "
+                f"{', '.join(sorted(relays))}.")
+        return [relays[name]]
+
+    def _cbw_feedback_for(self, name: str) -> List[int]:
+        """Inputs that report the brake(s) `name` refers to -- all of them,
+        or none. Partial feedback confirms nothing about the brakes it
+        misses, so it counts as none."""
+        inputs = self.cfg.feedback_inputs
+        if not inputs:
+            return []
+        if "all" in inputs:
+            return [inputs["all"]]
+        if name == "all" or self.all_or_nothing:
+            wanted = self.names or [n for n in self.cfg.relays if n != "all"]
+            if not wanted or any(n not in inputs for n in wanted):
+                return []
+            return sorted({inputs[n] for n in wanted})
+        return [inputs[name]] if name in inputs else []
+
+    def _cbw_state(self, name: str, io: dict) -> BrakeState:
+        feedback = self._cbw_feedback_for(name)
+        if feedback:
+            released = []
+            for number in feedback:
+                level = io["inputs"].get(number)
+                if level is None:
+                    raise BrakeError(
+                        f"The PLC does not report digital input {number}, which "
+                        f"is configured as brake feedback. Give it Local I/O "
+                        f"Number {number} on the PLC, or fix feedback_inputs.")
+                released.append(level if self.cfg.feedback_on_means_released
+                                else not level)
+        else:
+            released = []
+            for number in self._cbw_relays_for(name):
+                on = io["relays"].get(number)
+                if on is None:
+                    raise BrakeError(
+                        f"The PLC does not report relay {number}. Give that "
+                        f"relay Local I/O Number {number} on the PLC, or fix "
+                        f"the relay mapping.")
+                released.append(on if self.cfg.energized_releases else not on)
+        if all(released):
+            return BrakeState.RELEASED
+        if not any(released):
+            return BrakeState.ENGAGED
+        return BrakeState.UNKNOWN
+
+    def _cbw_io(self, fresh: bool) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            if not fresh:
+                if (self._io_error is not None
+                        and now - self._io_error_time < self.FAILURE_BACKOFF_S):
+                    raise BrakeError(self._io_error)
+                if self._io is not None and now - self._io_time < self.STATUS_CACHE_S:
+                    return self._io
+            try:
+                io = self._cbw_request(None, timeout=min(self.cfg.timeout_s, 1.5))
+            except BrakeError as exc:
+                self._io_error, self._io_error_time = str(exc), now
+                raise
+            self._io_error = None
+            self._io, self._io_time = io, now
+            return io
+
+    def _cbw_write(self, name: str, release: bool) -> None:
+        energize = release if self.cfg.energized_releases else not release
+        numbers = self._cbw_relays_for(name)
+        query = {f"relay{n}": 1 if energize else 0 for n in numbers}
+        with self._lock:
+            io = self._cbw_request(query, timeout=self.cfg.timeout_s)
+            wrong = [n for n in numbers if io["relays"].get(n) is not energize]
+            if wrong:
+                # The reply may predate the change on some firmware: look once
+                # more before calling it a failure.
+                time.sleep(0.2)
+                io = self._cbw_request(None, timeout=self.cfg.timeout_s)
+                wrong = [n for n in numbers if io["relays"].get(n) is not energize]
+            self._io, self._io_time, self._io_error = io, time.monotonic(), None
+        if wrong:
+            raise BrakeError(
+                f"The PLC was told to turn relay(s) "
+                f"{', '.join(str(n) for n in wrong)} "
+                f"{'on' if energize else 'off'} but reports "
+                + ", ".join(f"relay {n} "
+                            f"{'missing' if io['relays'].get(n) is None else ('on' if io['relays'][n] else 'off')}"
+                            for n in wrong)
+                + ". Check the relay numbers, and that the PLC's own logic "
+                "is not overriding them.")
+
+    def _cbw_request(self, query: Optional[Dict[str, int]], timeout: float) -> dict:
+        """One GET of the state page, optionally setting relays, parsed."""
+        headers = {}
+        if self.cfg.password:
+            token = base64.b64encode(
+                f"{self.cfg.username}:{self.cfg.password}".encode()).decode()
+            headers["Authorization"] = f"Basic {token}"
+        suffix = ("?" + urllib.parse.urlencode(query)) if query else ""
+        endpoints = [self._endpoint] + [e for e in ("state.json", "state.xml")
+                                        if e != self._endpoint]
+        last_error = ""
+        for endpoint in endpoints:
+            url = f"{self._base_url()}/{endpoint}{suffix}"
+            try:
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    body = response.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401:
+                    raise BrakeError(
+                        f"The PLC at {self._base_url()} asked for a login. Set "
+                        "its user name and password in the brake controller "
+                        "settings.") from exc
+                if exc.code == 404:
+                    last_error = f"{endpoint} not found"
+                    continue
+                raise BrakeError(
+                    f"The PLC at {self._base_url()} answered {exc.code} to "
+                    f"{endpoint}.") from exc
+            except (urllib.error.URLError, OSError) as exc:
+                reason = getattr(exc, "reason", exc)
+                raise BrakeError(
+                    f"Could not reach the PLC at {self._base_url()}: {reason}"
+                ) from exc
+            payload = self._parse_body(endpoint, body)
+            self._endpoint = endpoint
+            io = parse_state(payload)
+            io["raw"] = payload
+            return io
+        raise BrakeError(
+            f"The PLC at {self._base_url()} has no state page ({last_error}). "
+            "Is this a ControlByWeb X-400-series device?")
+
+    @staticmethod
+    def _parse_body(endpoint: str, body: str) -> Dict[str, object]:
+        try:
+            if endpoint.endswith(".json"):
+                return _flatten(json.loads(body))
+            root = ElementTree.fromstring(body)
+            return {child.tag: (child.text or "").strip() for child in root}
+        except (ValueError, ElementTree.ParseError) as exc:
+            raise BrakeError(
+                f"The PLC's {endpoint} could not be read as "
+                f"{'JSON' if endpoint.endswith('.json') else 'XML'}: {exc}"
+            ) from exc
 
     # --------------------------------------------------------------- modbus
 
@@ -392,7 +784,7 @@ class SimulatedBrakeController:
     def state_is_measured(self, name: str = "all") -> bool:
         return True
 
-    def read_state(self, name: str = "all") -> BrakeState:
+    def read_state(self, name: str = "all", fresh: bool = False) -> BrakeState:
         if name == "all" or self.all_or_nothing:
             if all(self._engaged.values()):
                 return BrakeState.ENGAGED
@@ -460,4 +852,5 @@ class SimulatedBrakeController:
 
 
 __all__ = ["ExternalBrakeConfig", "BrakeController", "BrakeError",
-           "SimulatedBrakeController", "NOT_CONFIGURED_MESSAGE"]
+           "SimulatedBrakeController", "NOT_CONFIGURED_MESSAGE", "MODES",
+           "parse_state"]

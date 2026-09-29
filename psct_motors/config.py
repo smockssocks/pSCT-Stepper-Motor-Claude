@@ -379,7 +379,7 @@ class ExternalBrakeSettings:
     separate from the class that does the work so config.py stays free of I/O.
     """
 
-    mode: str = "none"                    # "none" | "modbus" | "http"
+    mode: str = "none"          # "none" | "controlbyweb" | "modbus" | "http"
     host: str = ""
     port: int = 502
     unit_id: int = 1
@@ -391,12 +391,22 @@ class ExternalBrakeSettings:
     engage_url: str = ""
     status_url: str = ""
     status_field: str = "brakes"
+    # --- ControlByWeb X-400 series (the site's X-432) -----------------------
+    relays: Dict[str, int] = field(default_factory=dict)
+    feedback_inputs: Dict[str, int] = field(default_factory=dict)
+    feedback_on_means_released: bool = True
+    http_port: int = 80
+    use_https: bool = False
+    username: str = "admin"
+    #: Stored in the configuration file, which is kept out of git for exactly
+    #: this kind of machine-specific detail.
+    password: str = ""
 
     def validate(self) -> None:
-        if self.mode not in ("none", "modbus", "http"):
-            raise ValueError(
-                f"external_brake.mode must be 'none', 'modbus' or 'http', "
-                f"got {self.mode!r}")
+        # The full check lives with the class that does the work, so the two
+        # cannot disagree about what a complete configuration is.
+        from .external_brake import ExternalBrakeConfig
+        ExternalBrakeConfig.from_settings(self).validate()
 
 
 @dataclass
@@ -575,6 +585,15 @@ class PlatformConfig:
             a.validate()
         self.limits.validate()
         self.external_brake.validate()
+        # A brake mapped under a name no actuator has would never be switched,
+        # and the move would then be driven against it.
+        allowed = set(names) | {"all"}
+        for kind in ("relays", "feedback_inputs", "coils"):
+            unknown = sorted(set(getattr(self.external_brake, kind)) - allowed)
+            if unknown:
+                raise ValueError(
+                    f"external_brake.{kind} names {unknown}, which are not "
+                    f"actuators. Use 'all' or one of {names}.")
         if self.min_velocity_raw < 1:
             raise ValueError("min_velocity_raw must be >= 1")
         if self.simulated_speed_mm_per_s <= 0:

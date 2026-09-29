@@ -149,21 +149,35 @@ Output register (179) reads 0 — no motor output drives a brake. That is why th
 per-actuator brake mode defaults to `none`: showing an inferred brake state
 with nothing behind it would be worse than showing none.
 
-`external_brake` in the configuration is where that device goes, and
-`psct_motors/external_brake.py` supports Modbus TCP or an HTTP endpoint. It is
-unconfigured today because the procedure gives the page's address but not its
-protocol, and names two different addresses on different slides. To finish it,
-one of these is needed:
+That device is a **ControlByWeb X-432** web PLC. `external_brake.mode =
+"controlbyweb"` drives it over HTTP (`state.json`, `?relayN=0|1`); set it up
+from *Tools → Brake controller (PLC)*. Modbus-coil and fixed-URL devices are
+also supported. Until it is configured, the GUI says the brakes are not under
+software control rather than showing a state it cannot read.
 
-- the make and model of the device behind that page, or
-- whether it answers Modbus TCP, and on which coil, or
-- the URL its own buttons POST to — a browser's network tab shows this in a
-  minute.
+What the software will and will not believe about the PLC:
 
-Until then the GUI says the brakes are not under software control and why,
-rather than guessing a URL and firing writes at an unknown device that holds a
-suspended camera. Releasing is interlocked either way: it refuses unless the
-drives are confirmed enabled and holding.
+- **Which relay, which way round** are settings (`relays`,
+  `energized_releases`), because the wiring is not known from here.
+- **A relay's state is not a brake's state.** Relay off means the PLC was told
+  to clamp. Reversed polarity, a blown fuse or a loose wire all read the same.
+  Unless a digital input reports the brake itself (`feedback_inputs`), the
+  state is shown as inferred (`?`), and **EMERGENCY will not turn the drives
+  off**: it only does that when the brakes are confirmed holding. The same rule
+  now applies to an HTTP device that only echoes the last command. Before this
+  it would have counted that as confirmation.
+- **Releasing is interlocked**: it is refused unless every drive is enabled
+  and holding. **Enable drives** turns them on holding exactly where they are.
+  The target is set to the encoder position first, so a stale target cannot
+  make the axis jump the instant it is enabled.
+- **A relay that does not end up where it was sent is an error**, which
+  catches the PLC's own logic overriding it.
+- **`--simulate` never switches the real PLC.** Configuring the PLC used to
+  make simulations drive it. Now a stand-in is used unless `--real-brakes` is
+  given, and the title bar says when the PLC is real.
+- **An unreachable PLC does not freeze the window.** A failed read is reported
+  for two seconds before the next attempt, rather than costing every status
+  poll a full timeout.
 
 **In simulation a stand-in device fills that gap**, so the interlocks can be
 rehearsed and tested even though the real protocol is unknown. It holds the

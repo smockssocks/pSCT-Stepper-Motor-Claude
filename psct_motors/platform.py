@@ -225,6 +225,10 @@ class PlatformState:
     #: derived from two live positions and one stale one is worse than none.
     orientation_valid: bool = False
     message: str = ""
+    #: One line about the brake controller: which device, what it reports,
+    #: and whether that is the brake itself or only its relay. Empty when no
+    #: brake controller is configured.
+    brake_summary: str = ""
 
     @property
     def all_connected(self) -> bool:
@@ -256,6 +260,7 @@ class PlatformState:
             "any_error": self.any_error,
             "moving": self.moving,
             "message": self.message,
+            "brake_summary": self.brake_summary,
         }
 
 
@@ -267,13 +272,20 @@ class FocalPlanePlatform:
                  logger: Optional[Callable[[str], None]] = None,
                  config_path: Optional[str] = None,
                  history_path: Optional[str] = None,
-                 on_history_change: Optional[Callable[[], None]] = None):
+                 on_history_change: Optional[Callable[[], None]] = None,
+                 use_real_brakes: bool = False):
         self.cfg = cfg or load_config(config_path)
         self.cfg.validate()
         self.config_path = config_path
         self.simulate = simulate
+        #: Drive the configured brake controller even in full simulation. Off
+        #: by default: `--simulate` promises that no hardware is touched, and a
+        #: PLC that switches brakes is hardware. On, it lets the PLC be bench
+        #: tested with no motors connected at all.
+        self.use_real_brakes = use_real_brakes
         self._log = logger or (lambda msg: None)
         self.geometry: ThreePointPlatform = platform_from_config(self.cfg)
+        self.brake_summary = ""
         self.external_brake = self._build_external_brake()
         self._move_lock = threading.RLock()
         self._abort = threading.Event()
@@ -386,34 +398,52 @@ class FocalPlanePlatform:
         still answers "not available, and here is why", which is more use than
         an attribute that does not exist.
 
-        In simulation, and only when no real device is configured, a fake one
-        stands in. Otherwise the brake interlocks -- the checks that stop a
-        released brake dropping the camera -- could not be rehearsed at all,
-        since the real device's protocol is still unknown.
+        In full simulation a fake one stands in, so the brake interlocks -- the
+        checks that stop a released brake dropping the camera -- can be
+        rehearsed. That is true even when a real device IS configured: it used
+        to be that configuring the PLC made `--simulate` switch its relays,
+        which broke the one promise `--simulate` makes. The real device is used
+        in simulation only when asked for (`use_real_brakes`, `--real-brakes`).
+
+        In bench mode (`--bench`) the platform is not simulated -- one motor is
+        real -- so the configured device is used, and the stood-in motors obey
+        it: a simulated axis will not turn while the PLC says its brake is on.
         """
         from .external_brake import BrakeController, ExternalBrakeConfig
         settings = self.cfg.external_brake
-        if self.simulate and settings.mode == "none":
+        if self.simulate and not (self.use_real_brakes and settings.mode != "none"):
             from .external_brake import SimulatedBrakeController
+            if settings.mode != "none":
+                self._log(
+                    f"Simulation: the configured brake controller "
+                    f"({settings.mode} at {settings.host or 'no host'}) is NOT "
+                    f"being used; a simulated one stands in. Pass --real-brakes "
+                    f"to switch the real one from a simulation.")
             return SimulatedBrakeController(
                 [a.name for a in self.cfg.actuators],
                 all_or_nothing=settings.all_or_nothing,
                 logger=self._log,
             )
         return BrakeController(
-            ExternalBrakeConfig(
-                mode=settings.mode, host=settings.host, port=settings.port,
-                unit_id=settings.unit_id, timeout_s=settings.timeout_s,
-                all_or_nothing=settings.all_or_nothing,
-                coils=dict(settings.coils),
-                energized_releases=settings.energized_releases,
-                release_url=settings.release_url,
-                engage_url=settings.engage_url,
-                status_url=settings.status_url,
-                status_field=settings.status_field,
-            ),
+            ExternalBrakeConfig.from_settings(settings),
             logger=self._log,
+            names=[a.name for a in self.cfg.actuators],
         )
+
+    def reload_external_brake(self) -> None:
+        """Rebuild the brake controller from the current configuration.
+
+        For the GUI's brake settings: the motors stay connected, and the
+        stood-in axes pick up the new controller on their next physics step,
+        because they ask for `self.external_brake` by name each time.
+        """
+        old = self.external_brake
+        self.external_brake = self._build_external_brake()
+        self.brake_summary = ""
+        try:
+            old.close()
+        except Exception:  # noqa: BLE001 -- closing the old one is best effort
+            pass
 
     @property
     def drives_holding(self) -> bool:
@@ -522,7 +552,8 @@ class FocalPlanePlatform:
             offline = [s.name for s in statuses if s.comms_error or not s.connected]
             message = f"Orientation unavailable: no reading from {', '.join(offline)}"
         return PlatformState(motors=statuses, orientation=orientation,
-                             orientation_valid=valid, message=message)
+                             orientation_valid=valid, message=message,
+                             brake_summary=self.brake_summary)
 
     def _external_brake_reading(self):
         """One read of the brake device per poll, shared by all three axes.
@@ -538,6 +569,7 @@ class FocalPlanePlatform:
 
         controller = self.external_brake
         if not controller.available:
+            self.brake_summary = ""
             return None
         detail = getattr(controller, "describe", lambda: "external brake")()
         readings = {}
@@ -554,8 +586,16 @@ class FocalPlanePlatform:
                 measured = controller.state_is_measured(name)
                 readings[name] = BrakeStatus(state, not measured, detail)
         except BrakeError as exc:
+            self.brake_summary = f"{detail}: NOT READABLE -- {exc}"
             failed = BrakeStatus(BrakeState.UNKNOWN, True, str(exc))
             return {m.name: failed for m in self.motors}
+
+        words = sorted({r.state.value for r in readings.values()})
+        measured_all = all(not r.inferred for r in readings.values())
+        self.brake_summary = (
+            f"{detail}: brakes {'/'.join(words)}"
+            + ("" if measured_all else
+               " (relay state; nothing measures the brake itself)"))
         if "all" in readings:
             return {m.name: readings["all"] for m in self.motors}
         return readings
@@ -1031,7 +1071,9 @@ class FocalPlanePlatform:
 
         from .external_brake import BrakeError
         try:
-            state = controller.read_state()
+            # Fresh, not the poll's cached reading: this answer decides
+            # whether the motors are about to push against a clamped brake.
+            state = controller.read_state(fresh=True)
         except BrakeError as exc:
             raise PlatformError(
                 f"Not moving: the brake controller could not be read ({exc}). "
@@ -1058,7 +1100,7 @@ class FocalPlanePlatform:
             ) from exc
 
         try:
-            after = controller.read_state()
+            after = controller.read_state(fresh=True)
         except BrakeError:
             return          # commanded, but unreadable; already logged
         if after is not BrakeState.RELEASED:
@@ -1720,12 +1762,22 @@ class FocalPlanePlatform:
             except BrakeError as exc:
                 return False, f"The brakes could not be engaged ({exc})."
             try:
-                state = self.external_brake.read_state()
+                state = self.external_brake.read_state(fresh=True)
             except BrakeError as exc:
                 return False, f"The brakes were commanded on but cannot be read back ({exc})."
-            if state is BrakeState.ENGAGED:
-                return True, "The brakes are engaged and read back engaged."
-            return False, f"The brakes were commanded on but read back {state.value}."
+            if state is not BrakeState.ENGAGED:
+                return False, f"The brakes were commanded on but read back {state.value}."
+            # Engaged -- but engaged according to what? A relay reading off,
+            # or an HTTP device that only echoes the last command, says the
+            # brake was TOLD to clamp. Turning the drives off on that basis
+            # would bet the camera on the wiring being right. Only a reading
+            # of the brake itself counts as confirmation.
+            if not self.external_brake.state_is_measured("all"):
+                return False, (
+                    "The brakes were commanded on and the controller reports "
+                    "its output off, but nothing measures the brakes "
+                    "themselves, so they are not confirmed holding.")
+            return True, "The brakes are engaged and read back engaged."
 
         controllable = [m for m in self.motors if m.brake_is_software_controlled]
         if not controllable:
@@ -1811,11 +1863,65 @@ class FocalPlanePlatform:
                 results[motor.name] = str(exc)
         return results
 
+    def set_brake(self, name: str, engaged: bool) -> Dict[str, str]:
+        """One actuator's brake, from its row in the GUI.
+
+        When one switch holds every brake -- one relay, or `all_or_nothing` --
+        there is no such thing as one brake: the request becomes all three,
+        and the result says so rather than pretending only one changed.
+        Otherwise the per-actuator relay or output is switched.
+        """
+        from .external_brake import BrakeError
+        controller = self.external_brake
+        if controller.available:
+            together = getattr(controller, "all_or_nothing", True)
+            target = "all" if together else name
+            try:
+                if engaged:
+                    controller.engage(target)
+                else:
+                    controller.release(target, drives_holding=self.drives_holding)
+            except BrakeError as exc:
+                return {target: str(exc)}
+            return {target: "ok" if not together else
+                    "ok (one switch holds all three brakes, so all three changed)"}
+
+        motor = self.motor(name)
+        try:
+            if engaged:
+                motor.engage_brake()
+            else:
+                motor.release_brake()
+            return {motor.name: "ok"}
+        except (ModbusError, MotorFault) as exc:
+            return {motor.name: str(exc)}
+
+    def enable_drives(self) -> List[str]:
+        """Enable every passive drive, holding exactly where its shaft is.
+
+        The step before releasing a brake: the interlock refuses to take the
+        brakes off unless the drives are holding. Returns the axes it enabled.
+        `JVLMotor.ensure_position_mode` writes the encoder position as the
+        target before enabling, so this cannot move anything.
+        """
+        from .registers import MotorMode
+        enabled = []
+        for motor in self.motors:
+            if not motor.connected:
+                continue
+            if motor.get_mode() == int(MotorMode.POSITION):
+                continue
+            motor.ensure_position_mode()
+            enabled.append(motor.name)
+        if enabled:
+            self._log("Drives enabled and holding position: " + ", ".join(enabled))
+        return enabled
+
     def brake_states(self) -> Dict[str, BrakeState]:
         from .external_brake import BrakeError
         if self.external_brake.available:
             try:
-                state = self.external_brake.read_state()
+                state = self.external_brake.read_state(fresh=True)
             except BrakeError:
                 state = BrakeState.UNKNOWN
             return {m.name: state for m in self.motors}

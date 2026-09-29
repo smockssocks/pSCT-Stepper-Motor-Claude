@@ -89,6 +89,58 @@ class TestCli(unittest.TestCase):
                 os.remove(os.path.join(directory, name))
             os.rmdir(directory)
 
+    def _fake_plc_config(self, **brake):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from fake_plc import FakeX432
+        from psct_motors.config import default_config, save_config
+        plc = FakeX432().start()
+        self.addCleanup(plc.stop)
+        cfg = default_config()
+        cfg.simulated_speed_mm_per_s = 30.0
+        b = cfg.external_brake
+        b.mode, b.host, b.http_port, b.relays = "controlbyweb", "127.0.0.1", plc.port, {"all": 1}
+        for key, value in brake.items():
+            setattr(b, key, value)
+        save_config(cfg, os.environ["PSCT_MOTORS_CONFIG"])
+        return plc
+
+    def test_plc_lists_the_io_and_reads_only(self):
+        import contextlib
+        import io
+        from psct_motors.cli import main
+        plc = self._fake_plc_config()
+        plc.relays[5] = 1
+        before = dict(plc.relays)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(main(["plc"]), 0)
+        text = buffer.getvalue()
+        self.assertIn("<- brakes", text)
+        self.assertIn("brakes: ENGAGED", text)
+        self.assertEqual(plc.relays, before)
+        self.assertTrue(all("relay" not in r for r in plc.requests))
+
+    def test_simulate_leaves_the_plc_alone_unless_asked(self):
+        from psct_motors.cli import main
+        plc = self._fake_plc_config()
+        self.assertEqual(main(["--simulate", "-y", "move", "--focus", "1.0"]), 0)
+        self.assertEqual(plc.requests, [])
+        self.assertEqual(main(["--simulate", "--real-brakes", "-y", "move",
+                               "--focus", "2.0"]), 0)
+        self.assertEqual(plc.relays[1], 1)
+
+    def test_brake_status_reads_the_plc(self):
+        import contextlib
+        import io
+        from psct_motors.cli import main
+        self._fake_plc_config()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(main(["--simulate", "--real-brakes", "brake",
+                                   "status"]), 0)
+        self.assertIn("ControlByWeb", buffer.getvalue())
+        self.assertIn("relay state", buffer.getvalue())
+
     def test_go_back_with_no_record_is_refused(self):
         import tempfile
         from psct_motors.cli import main

@@ -52,6 +52,8 @@ from .jvl_motor import BrakeState
 from .kinematics import Orientation
 from .platform import FocalPlanePlatform, PlatformError, PlatformState
 from .registers import describe_errors_short
+from .external_brake import (BrakeController, BrakeError, ExternalBrakeConfig,
+                             SimulatedBrakeController)
 
 # Indicator colours, shared by the brake lamps and the status pills.
 COLOR_OK = "#1b8a3a"
@@ -330,10 +332,12 @@ class MotorApp:
     def __init__(self, root: tk.Tk, config_path: Optional[str] = None,
                  simulate: bool = False, bench: Optional[str] = None,
                  sim_speed: Optional[float] = None,
-                 poll_interval_s: Optional[float] = None):
+                 poll_interval_s: Optional[float] = None,
+                 use_real_brakes: bool = False):
         self.root = root
         self.simulate = simulate
         self.bench = bench
+        self.use_real_brakes = use_real_brakes
         self.config_path = config_path
 
         self.cfg = load_config(config_path)
@@ -368,7 +372,11 @@ class MotorApp:
         self._build_ui()
         self._drain_ui()
         self.log(f"Configuration: {config_path or default_config_path()}")
-        if simulate:
+        if simulate and "PLC IS REAL" in self._window_title():
+            self.log("SIMULATED MOTORS with the REAL brake PLC "
+                     f"({self.platform.external_brake.describe()}). Its relays "
+                     "WILL switch.")
+        elif simulate:
             self.log("SIMULATION MODE -- no hardware is being touched.")
             self.log(f"Simulated actuators run at "
                      f"{self.cfg.simulated_speed_mm_per_s:g} mm/s at full "
@@ -407,6 +415,7 @@ class MotorApp:
             config_path=self.config_path,
             history_path=default_history_path(self.config_path),
             on_history_change=lambda: self.post(self._refresh_position_log),
+            use_real_brakes=self.use_real_brakes,
         )
 
     def _on_callback_error(self, exc_type, exc_value, exc_traceback) -> None:
@@ -450,6 +459,11 @@ class MotorApp:
         whether it is driving a telescope. A screenshot of a simulated run and
         a screenshot of a real one are otherwise identical.
         """
+        real_brakes = self.platform.external_brake.available and not isinstance(
+            self.platform.external_brake, SimulatedBrakeController)
+        if self.simulate and real_brakes:
+            return ("pSCT Focal Plane Control  [SIMULATED MOTORS -- the brake "
+                    "PLC IS REAL]")
         if self.simulate:
             return "pSCT Focal Plane Control  [SIMULATION -- no hardware]"
         if self.platform.is_mixed:
@@ -523,6 +537,11 @@ class MotorApp:
                           command=self.on_find_hard_stop)
         tools.add_command(label="Run safety drills (simulated)...",
                           command=self.on_safety_drills)
+        tools.add_separator()
+        tools.add_command(label="Brake controller (PLC)...",
+                          command=self.on_edit_brake_controller)
+        tools.add_command(label="Enable drives (hold position)",
+                          command=self.on_enable_drives)
         tools.add_separator()
         tools.add_command(label="Clear errors", command=self.on_clear_errors)
         tools.add_command(label="Release all brakes",
@@ -622,6 +641,28 @@ class MotorApp:
         ttk.Button(frame, text="Edit...",
                    command=self.on_edit_connection).grid(row=0, column=6, padx=4)
         self._refresh_addresses()
+
+        # The brake controller, on its own line: which device, what it says,
+        # and whether that is the brake or only its relay. Bench testing the
+        # PLC is mostly a matter of watching this line change.
+        self.brake_lamp = Lamp(frame)
+        self.brake_lamp.grid(row=1, column=1, padx=(6, 2), pady=(0, 6))
+        self.brake_ctrl_var = tk.StringVar(value=self._brake_controller_text())
+        self.brake_ctrl_label = ttk.Label(frame, textvariable=self.brake_ctrl_var,
+                                          anchor="w", justify="left")
+        self.brake_ctrl_label.grid(row=1, column=2, columnspan=4, sticky="w",
+                                   pady=(0, 6))
+        ttk.Button(frame, text="Brakes...",
+                   command=self.on_edit_brake_controller).grid(
+            row=1, column=6, padx=4, pady=(0, 6))
+        self._wrap_to_width(frame, self.brake_ctrl_label, margin=260)
+
+    def _brake_controller_text(self) -> str:
+        """What the brake line says before anything has been read."""
+        controller = self.platform.external_brake
+        if not controller.available:
+            return "Brakes: not under software control (Brakes... to set up the PLC)"
+        return f"Brakes: {controller.describe()} -- not read yet"
 
     def _build_legend(self, parent, row: int) -> None:
         """A key to every lamp and colour in the table.
@@ -767,6 +808,8 @@ class MotorApp:
         self._hard_stop_window = None
         self._limits_window = None
         self._load_window = None
+        self._brake_window = None
+        self._brake_window_read = None
         self._load_rows = {}
         self.plane_view = None
 
@@ -813,13 +856,16 @@ class MotorApp:
             footer,
             text="  Jogging moves ONE actuator and tilts the plane. Use the focal "
                  "plane controls above for normal operation.",
-            foreground="#777", wraplength=520, justify="left",
+            foreground="#777", wraplength=380, justify="left",
         ).grid(row=0, column=2, padx=6)
 
+        # In the order they are used: drives on and holding, then brakes off.
+        ttk.Button(footer, text="Enable drives",
+                   command=self.on_enable_drives).grid(row=0, column=3, padx=(16, 4))
         ttk.Button(footer, text="Release all brakes",
-                   command=lambda: self.on_brake(None, engage=False)).grid(row=0, column=3, padx=(20, 4))
+                   command=lambda: self.on_brake(None, engage=False)).grid(row=0, column=4, padx=4)
         ttk.Button(footer, text="Engage all brakes",
-                   command=lambda: self.on_brake(None, engage=True)).grid(row=0, column=4, padx=4)
+                   command=lambda: self.on_brake(None, engage=True)).grid(row=0, column=5, padx=4)
 
     #: What the gauge's reference chooser shows for each reference.
     REFERENCE_CHOICES = {
@@ -1203,6 +1249,23 @@ class MotorApp:
             self.conn_lamp.set(COLOR_BAD)
         elif state.all_connected:
             self.conn_lamp.set(COLOR_WARN if state.moving else COLOR_OK)
+        self._apply_brake_summary(state)
+
+    def _apply_brake_summary(self, state: PlatformState) -> None:
+        if not self.platform.external_brake.available:
+            self.brake_ctrl_var.set(self._brake_controller_text())
+            self.brake_lamp.set(COLOR_IDLE)
+            return
+        self.brake_ctrl_var.set("Brakes: " + (state.brake_summary or "not read yet"))
+        states = {m.brake.state for m in state.motors if not m.comms_error}
+        if "NOT READABLE" in state.brake_summary:
+            self.brake_lamp.set(COLOR_BAD)
+        elif states == {BrakeState.ENGAGED}:
+            self.brake_lamp.set(COLOR_BRAKE_ON)
+        elif states == {BrakeState.RELEASED}:
+            self.brake_lamp.set(COLOR_BRAKE_OFF)
+        else:
+            self.brake_lamp.set(COLOR_IDLE)
 
     # ----------------------------------------------------------------- stop
 
@@ -1443,24 +1506,39 @@ class MotorApp:
             return
 
         def work():
+            # Through the platform either way, so a row's button reaches the
+            # PLC when that is where the brakes are. It used to go straight
+            # to the motor's own brake output, which on this telescope is not
+            # connected to anything, and every press failed.
             if name is None:
                 results = self.platform.set_all_brakes(engaged=engage)
-                for motor_name, result in results.items():
-                    self.log_threadsafe(
-                        f"{motor_name}: brake "
-                        f"{'engage' if engage else 'release'} -> {result}"
-                    )
             else:
-                motor = self.platform.motor(name)
-                if engage:
-                    motor.engage_brake()
-                else:
-                    motor.release_brake()
+                results = self.platform.set_brake(name, engaged=engage)
+            for target, result in results.items():
+                label = "all brakes" if target == "all" else f"{target} brake"
                 self.log_threadsafe(
-                    f"{name}: brake {'engaged' if engage else 'released'}."
-                )
+                    f"{label}: {'engage' if engage else 'release'} -> {result}")
 
         self.run_async(f"Brake {who}", work)
+
+    def on_enable_drives(self) -> None:
+        """Turn every passive drive on, holding exactly where it is.
+
+        The step before releasing the brakes, which the interlock refuses to
+        do while any drive is passive. Nothing moves: each drive's target is
+        set to where its shaft already is before it is enabled.
+        """
+        if not self.platform.connected:
+            messagebox.showwarning("Not connected", "Connect first.")
+            return
+
+        def work():
+            # The platform logs the drives it enabled; only the no-op needs
+            # saying here, or a press would appear to do nothing.
+            if not self.platform.enable_drives():
+                self.log_threadsafe("All drives were already enabled and holding.")
+
+        self.run_async("Enable drives", work)
 
     # ---------------------------------------------------- focal plane picture
 
@@ -1980,6 +2058,330 @@ class MotorApp:
         if was_connected:
             self.log("Disconnected because the addresses changed.")
 
+    # ------------------------------------------------------ brake controller
+
+    #: What the brake settings call each mode.
+    BRAKE_MODE_LABELS = {
+        "none": "not under software control",
+        "controlbyweb": "ControlByWeb X-432 (web PLC)",
+    }
+
+    def on_edit_brake_controller(self) -> None:
+        """Set up the PLC that switches the brakes, and watch its I/O live.
+
+        Nothing here switches a relay. Working out which relay is which is
+        done from the PLC's own web page, where somebody is looking at it on
+        purpose; this window only reads, so it can be left open while the
+        wiring is traced and every relay and input can be seen change.
+        """
+        settings = self.cfg.external_brake
+        names = [a.name for a in self.cfg.actuators]
+        window = tk.Toplevel(self.root)
+        window.title("Brake controller (PLC)")
+        window.transient(self.root)
+        self._brake_window = window
+
+        tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=640,
+                 text=("The focal-plane brakes are switched by a ControlByWeb "
+                       "X-432, not by the motors. Enter its address and which "
+                       "relay drives the brakes. 'Read the PLC' shows every "
+                       "relay and input live, which is how to check the wiring: "
+                       "switch a relay from the PLC's own web page and watch "
+                       "which light changes here. This window never switches "
+                       "anything itself.")
+                 ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12,
+                        pady=(12, 8))
+
+        # --- device --------------------------------------------------------
+        device = ttk.LabelFrame(window, text="Device")
+        device.grid(row=1, column=0, sticky="nsew", padx=(12, 6), pady=4)
+        labels = dict(self.BRAKE_MODE_LABELS)
+        if settings.mode not in labels:
+            labels[settings.mode] = f"{settings.mode} (set in the configuration file)"
+        mode_var = tk.StringVar(value=labels[settings.mode])
+        ttk.Label(device, text="brakes are").grid(row=0, column=0, sticky="e",
+                                                  padx=(8, 4), pady=3)
+        ttk.Combobox(device, textvariable=mode_var, state="readonly", width=30,
+                     values=list(labels.values())).grid(row=0, column=1,
+                                                        columnspan=3, sticky="w")
+        host_var = tk.StringVar(value=settings.host)
+        port_var = tk.StringVar(value=str(settings.http_port))
+        user_var = tk.StringVar(value=settings.username)
+        pass_var = tk.StringVar(value=settings.password)
+        https_var = tk.BooleanVar(value=settings.use_https)
+        rows = [("IP address", host_var, 18, ""), ("port", port_var, 6, ""),
+                ("user", user_var, 12, ""), ("password", pass_var, 12, "*")]
+        for index, (label, var, width, show) in enumerate(rows, start=1):
+            ttk.Label(device, text=label).grid(row=index, column=0, sticky="e",
+                                               padx=(8, 4), pady=3)
+            ttk.Entry(device, textvariable=var, width=width, show=show).grid(
+                row=index, column=1, sticky="w")
+        ttk.Checkbutton(device, text="HTTPS", variable=https_var).grid(
+            row=2, column=2, sticky="w", padx=8)
+        ttk.Label(device, text="(leave the password empty if the PLC has none)",
+                  foreground="#777", font=("TkDefaultFont", 8)).grid(
+            row=5, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
+
+        # --- relays ----------------------------------------------------------
+        wiring = ttk.LabelFrame(window, text="Which relay switches the brakes")
+        wiring.grid(row=2, column=0, sticky="nsew", padx=(12, 6), pady=4)
+        per_axis = bool(settings.relays) and "all" not in settings.relays
+        relay_mode = tk.StringVar(value="each" if per_axis else "one")
+        one_relay = tk.StringVar(value=str(settings.relays.get("all", 1))
+                                 if not per_axis else "1")
+        ttk.Radiobutton(wiring, text="one relay for all three:", value="one",
+                        variable=relay_mode).grid(row=0, column=0, sticky="w",
+                                                  padx=8, pady=3)
+        ttk.Entry(wiring, textvariable=one_relay, width=5).grid(row=0, column=1,
+                                                                sticky="w")
+        ttk.Radiobutton(wiring, text="a relay for each actuator:", value="each",
+                        variable=relay_mode).grid(row=1, column=0, sticky="w",
+                                                  padx=8, pady=3)
+        relay_vars = {}
+        for index, name in enumerate(names):
+            ttk.Label(wiring, text=name).grid(row=2 + index, column=0, sticky="e",
+                                              padx=(8, 4))
+            var = tk.StringVar(value=str(settings.relays.get(name, ""))
+                               if per_axis else "")
+            ttk.Entry(wiring, textvariable=var, width=5).grid(
+                row=2 + index, column=1, sticky="w", pady=1)
+            relay_vars[name] = var
+        energized_var = tk.BooleanVar(value=settings.energized_releases)
+        ttk.Checkbutton(
+            wiring, variable=energized_var,
+            text="relay ON releases the brakes (spring brakes powered to release)"
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 6))
+
+        # --- feedback --------------------------------------------------------
+        feedback = ttk.LabelFrame(window, text="Brake feedback inputs (optional)")
+        feedback.grid(row=3, column=0, sticky="nsew", padx=(12, 6), pady=4)
+        tk.Label(feedback, justify="left", anchor="w", fg="#555", wraplength=300,
+                 text=("A digital input that reports what the brake actually "
+                       "did: a switch on the brake, or a sense on its supply. "
+                       "Without one, the state shown is the relay's, not the "
+                       "brake's, and EMERGENCY keeps the drives on because it "
+                       "cannot confirm the brakes are holding.")
+                 ).grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=4)
+        fb = settings.feedback_inputs
+        fb_mode = tk.StringVar(value=("none" if not fb else
+                                      "one" if "all" in fb else "each"))
+        fb_one = tk.StringVar(value=str(fb.get("all", "")))
+        ttk.Radiobutton(feedback, text="none", value="none",
+                        variable=fb_mode).grid(row=1, column=0, sticky="w", padx=8)
+        ttk.Radiobutton(feedback, text="one input for all three:", value="one",
+                        variable=fb_mode).grid(row=2, column=0, sticky="w", padx=8)
+        ttk.Entry(feedback, textvariable=fb_one, width=5).grid(row=2, column=1,
+                                                               sticky="w")
+        ttk.Radiobutton(feedback, text="an input for each actuator:", value="each",
+                        variable=fb_mode).grid(row=3, column=0, sticky="w", padx=8)
+        fb_vars = {}
+        for index, name in enumerate(names):
+            ttk.Label(feedback, text=name).grid(row=4 + index, column=0,
+                                                sticky="e", padx=(8, 4))
+            var = tk.StringVar(value=str(fb.get(name, "")) if "all" not in fb else "")
+            ttk.Entry(feedback, textvariable=var, width=5).grid(
+                row=4 + index, column=1, sticky="w", pady=1)
+            fb_vars[name] = var
+        fb_released_var = tk.BooleanVar(value=settings.feedback_on_means_released)
+        ttk.Checkbutton(feedback, variable=fb_released_var,
+                        text="input ON means the brake is released").grid(
+            row=7, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 6))
+
+        # --- live view -------------------------------------------------------
+        live = ttk.LabelFrame(window, text="The PLC right now")
+        live.grid(row=1, column=1, rowspan=3, sticky="nsew", padx=(6, 12), pady=4)
+        lamps = {"relays": {}, "inputs": {}}
+        for kind, count, column in (("relays", 16, 0), ("inputs", 18, 2)):
+            ttk.Label(live, text="relay" if kind == "relays" else "input",
+                      font=("TkDefaultFont", 8, "bold"), foreground="#555").grid(
+                row=0, column=column, columnspan=2, pady=(6, 2))
+            for n in range(1, count + 1):
+                lamp = Lamp(live, diameter=11)
+                lamp.grid(row=n, column=column, padx=(10, 2))
+                text = tk.StringVar(value=str(n))
+                ttk.Label(live, textvariable=text, font=("TkDefaultFont", 8),
+                          width=12, anchor="w").grid(row=n, column=column + 1,
+                                                     sticky="w")
+                lamps[kind][n] = (lamp, text)
+        live_var = tk.StringVar(value="Not read yet.")
+        tk.Label(live, textvariable=live_var, justify="left", anchor="w",
+                 wraplength=260, fg="#333").grid(row=20, column=0, columnspan=4,
+                                                 sticky="w", padx=8, pady=(6, 4))
+        keep_reading = tk.BooleanVar(value=False)
+        buttons_live = ttk.Frame(live)
+        buttons_live.grid(row=21, column=0, columnspan=4, sticky="w", padx=6,
+                          pady=(0, 8))
+        in_flight = [False]
+
+        def candidate():
+            """A settings object built from the fields, or an error string."""
+            from dataclasses import replace
+            chosen = next((k for k, v in labels.items() if v == mode_var.get()),
+                          "none")
+
+            def number(text, what):
+                text = str(text).strip()
+                if not text:
+                    return None
+                try:
+                    value = int(text)
+                except ValueError:
+                    raise ValueError(f"{what} must be a whole number.")
+                if value < 1:
+                    raise ValueError(f"{what} must be 1 or more.")
+                return value
+
+            try:
+                port = number(port_var.get(), "The port") or 80
+                if relay_mode.get() == "one":
+                    relays = {"all": number(one_relay.get(), "The relay")}
+                    if relays["all"] is None:
+                        relays = {}
+                else:
+                    relays = {}
+                    for name, var in relay_vars.items():
+                        value = number(var.get(), f"{name}'s relay")
+                        if value is not None:
+                            relays[name] = value
+                    if relays and len(relays) != len(names):
+                        raise ValueError("Give every actuator a relay, or use "
+                                         "one relay for all three.")
+                if fb_mode.get() == "none":
+                    feedbacks = {}
+                elif fb_mode.get() == "one":
+                    value = number(fb_one.get(), "The feedback input")
+                    feedbacks = {"all": value} if value else {}
+                else:
+                    feedbacks = {}
+                    for name, var in fb_vars.items():
+                        value = number(var.get(), f"{name}'s feedback input")
+                        if value is not None:
+                            feedbacks[name] = value
+            except ValueError as exc:
+                return None, str(exc)
+            new = replace(settings, mode=chosen, host=host_var.get().strip(),
+                          http_port=port, username=user_var.get().strip(),
+                          password=pass_var.get(), use_https=bool(https_var.get()),
+                          relays=relays, feedback_inputs=feedbacks,
+                          energized_releases=bool(energized_var.get()),
+                          feedback_on_means_released=bool(fb_released_var.get()))
+            try:
+                new.validate()
+            except ValueError as exc:
+                return None, str(exc)
+            return new, ""
+
+        def show(io, error):
+            if not window.winfo_exists():
+                return
+            in_flight[0] = False
+            new, _ = candidate()
+            relays = new.relays if new else {}
+            feedbacks = new.feedback_inputs if new else {}
+            relay_names = {v: k for k, v in relays.items()}
+            input_names = {v: k for k, v in feedbacks.items()}
+            for kind, mapping in (("relays", relay_names), ("inputs", input_names)):
+                for n, (lamp, text) in lamps[kind].items():
+                    label = f"{n}"
+                    if n in mapping:
+                        who = mapping[n]
+                        label += f"  {'brakes' if who == 'all' else who}"
+                    text.set(label)
+                    if io is None:
+                        lamp.set(COLOR_IDLE)
+                        continue
+                    value = io[kind].get(n)
+                    lamp.set(COLOR_IDLE if value is None else
+                             COLOR_OK if value else "#ffffff")
+            if error:
+                live_var.set(f"Could not read the PLC: {error}")
+            else:
+                on_relays = [n for n, v in io["relays"].items() if v]
+                on_inputs = [n for n, v in io["inputs"].items() if v]
+                live_var.set(
+                    f"Read at {time.strftime('%H:%M:%S')}. Relays on: "
+                    f"{', '.join(map(str, on_relays)) or 'none'}. Inputs on: "
+                    f"{', '.join(map(str, on_inputs)) or 'none'}. Green is on.")
+            if keep_reading.get():
+                window.after(1000, read_now)
+
+        def read_now():
+            if in_flight[0] or not window.winfo_exists():
+                return
+            new, problem = candidate()
+            if new is None:
+                live_var.set(problem)
+                return
+            if new.mode != "controlbyweb":
+                live_var.set("Choose ControlByWeb X-432 above to read the PLC.")
+                return
+            in_flight[0] = True
+            live_var.set(f"Reading {new.host}...")
+            names_now = list(names)
+
+            def work():
+                try:
+                    controller = BrakeController(
+                        ExternalBrakeConfig.from_settings(new), names=names_now)
+                    io, error = controller.read_io(fresh=True), ""
+                except (BrakeError, ValueError) as exc:
+                    io, error = None, str(exc)
+                self.post(lambda: show(io, error))
+
+            threading.Thread(target=work, name="plc-read", daemon=True).start()
+
+        ttk.Button(buttons_live, text="Read the PLC",
+                   command=read_now).grid(row=0, column=0, padx=(0, 8))
+        ttk.Checkbutton(buttons_live, text="keep reading (every second)",
+                        variable=keep_reading,
+                        command=lambda: keep_reading.get() and read_now()).grid(
+            row=0, column=1)
+
+        # --- apply -----------------------------------------------------------
+        def apply(persist: bool) -> None:
+            new, problem = candidate()
+            if new is None:
+                messagebox.showerror("Check the brake settings", problem,
+                                     parent=window)
+                return
+            from dataclasses import fields
+            for f in fields(new):
+                setattr(settings, f.name, getattr(new, f.name))
+            try:
+                self.cfg.validate()
+            except ValueError as exc:
+                messagebox.showerror("Check the brake settings", str(exc),
+                                     parent=window)
+                return
+            self.platform.reload_external_brake()
+            self.root.title(self._window_title())
+            self.brake_ctrl_var.set(self._brake_controller_text())
+            controller = self.platform.external_brake
+            self.log(f"Brake controller: {controller.describe()}.")
+            if (new.mode != "none"
+                    and isinstance(controller, SimulatedBrakeController)):
+                self.log("  This is a simulation, so the PLC is NOT being used. "
+                         "Start with --real-brakes to switch it from a "
+                         "simulation, or --bench to test it with one real motor.")
+            if new.mode == "controlbyweb" and not new.feedback_inputs:
+                self.log("  No feedback inputs: the brake state shown is the "
+                         "relay's, and EMERGENCY will keep the drives on.")
+            if persist:
+                self.log(f"Saved to {save_config(self.cfg, self.config_path)}")
+            keep_reading.set(False)
+            window.destroy()
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=4, column=0, columnspan=2, pady=(8, 12))
+        ttk.Button(buttons, text="Use for this session",
+                   command=lambda: apply(False)).grid(row=0, column=0, padx=6)
+        ttk.Button(buttons, text="Use and save",
+                   command=lambda: apply(True)).grid(row=0, column=1, padx=6)
+        ttk.Button(buttons, text="Cancel",
+                   command=lambda: (keep_reading.set(False), window.destroy())
+                   ).grid(row=0, column=2, padx=6)
+        self._brake_window_read = read_now
+
     # ------------------------------------------------------ hard-stop search
 
     def on_find_hard_stop(self) -> None:
@@ -2444,10 +2846,12 @@ class MotorApp:
 
 def main(config_path: Optional[str] = None, simulate: bool = False,
          bench: Optional[str] = None, sim_speed: Optional[float] = None,
-         poll_interval_s: Optional[float] = None) -> int:
+         poll_interval_s: Optional[float] = None,
+         use_real_brakes: bool = False) -> int:
     root = tk.Tk()
     MotorApp(root, config_path=config_path, simulate=simulate, bench=bench,
-             sim_speed=sim_speed, poll_interval_s=poll_interval_s)
+             sim_speed=sim_speed, poll_interval_s=poll_interval_s,
+             use_real_brakes=use_real_brakes)
     root.mainloop()
     return 0
 

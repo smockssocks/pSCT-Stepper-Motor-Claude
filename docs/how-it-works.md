@@ -164,11 +164,15 @@ the stop less a margin.
 
 Say this first, not last. It is the part that makes the rest credible.
 
-* **The brakes.** The brake device's protocol is unknown, so
-  `external_brake.mode` is `none`: the software cannot read or command them.
-  Every brake interlock has been tested against a *simulated* brake only. The
-  test that settles it takes two minutes: engage the brakes by hand, command a
-  0.1 mm move, and see whether the motors move anyway.
+* **The brakes.** They are switched by a ControlByWeb X-432 PLC, and the
+  software can now drive it over HTTP. But it has only been tested against a
+  stand-in that speaks the same protocol, not the real unit. Which relay drives
+  the brakes, which way round, and whether anything reports the brake's real
+  state all have to be found on the hardware. Until an input reports the brake
+  itself, the software treats "relay off" as "told to clamp", not "clamped",
+  so EMERGENCY keeps the drives on. The test that settles the rest: release
+  from the GUI, check by hand that the brake is free, engage, check it is
+  holding.
 * **The error bit meanings.** `ERR_BITS` is confirmed as the register, and 0 is
   confirmed as healthy. The bit names follow the order in JVL's MIS23x manual
   (LB0053, "Err_Bits", register 35): bit 0 general, 1 follow error, 2 output

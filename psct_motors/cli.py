@@ -81,7 +81,8 @@ def make_platform(args) -> FocalPlanePlatform:
     # line shows up in the window's log and vice versa.
     platform = FocalPlanePlatform(cfg=cfg, simulate=args.simulate, logger=out,
                                   config_path=args.config,
-                                  history_path=default_history_path(args.config))
+                                  history_path=default_history_path(args.config),
+                                  use_real_brakes=getattr(args, "real_brakes", False))
     if platform.is_mixed:
         out("BENCH MODE: " + ", ".join(platform.simulated_names)
             + " are simulated; only "
@@ -715,6 +716,17 @@ def cmd_brake(args) -> int:
         return 1
     try:
         if args.action == "status":
+            controller = platform.external_brake
+            if controller.available:
+                # The brakes are on the PLC, not the motors. The motor's own
+                # brake output is unassigned on this telescope and would
+                # always read the same.
+                state = platform.read_state()
+                out(f"  {state.brake_summary}")
+                for m in state.motors:
+                    tag = " (relay state, not measured)" if m.brake.inferred else ""
+                    out(f"  {m.name:<4} {m.brake.state.label}{tag}")
+                return 0
             for motor in platform.motors:
                 status = motor.get_brake_status()
                 tag = " (inferred)" if status.inferred else ""
@@ -734,6 +746,82 @@ def cmd_brake(args) -> int:
         return 1 if failed else 0
     finally:
         platform.disconnect()
+
+
+def cmd_enable_drives(args) -> int:
+    """Enable every passive drive, holding where it is: the step before a
+    brake release, which is refused while any drive is passive."""
+    platform = make_platform(args)
+    try:
+        platform.connect()
+    except PlatformError as exc:
+        out(str(exc))
+        return 1
+    try:
+        enabled = platform.enable_drives()
+        out("  enabled and holding: " + (", ".join(enabled) if enabled
+                                          else "none needed, all were already on"))
+        return 0
+    finally:
+        # Disconnecting leaves the drives as they are: enabled and holding.
+        platform.disconnect()
+
+
+def cmd_plc(args) -> int:
+    """Read the brake PLC and print every relay and input.
+
+    Only reads. Tracing the wiring means switching relays, and that is done
+    from the PLC's own web page, where someone is looking at it on purpose.
+    Run this before and after to see what changed.
+    """
+    from .external_brake import BrakeController, BrakeError, ExternalBrakeConfig
+    cfg = load_config(args.config)
+    settings = cfg.external_brake
+    if settings.mode != "controlbyweb":
+        out("The brake controller is not set to a ControlByWeb PLC "
+            f"(external_brake.mode is {settings.mode!r}).")
+        out("Set it up in the GUI under Tools > Brake controller (PLC), or in")
+        out("the configuration file:")
+        out('  "external_brake": {"mode": "controlbyweb", "host": "<PLC IP>",')
+        out('                     "relays": {"all": <relay number>}}')
+        return 1
+    controller = BrakeController(ExternalBrakeConfig.from_settings(settings),
+                                 names=[a.name for a in cfg.actuators])
+    rule(controller.describe())
+    try:
+        io = controller.read_io(fresh=True)
+    except BrakeError as exc:
+        out(f"  {exc}")
+        return 1
+    if args.raw:
+        out(json.dumps(io["raw"], indent=2, sort_keys=True))
+        return 0
+
+    relay_names = {v: k for k, v in settings.relays.items()}
+    input_names = {v: k for k, v in settings.feedback_inputs.items()}
+
+    def label(mapping, n):
+        who = mapping.get(n)
+        return "" if who is None else f"  <- {'brakes' if who == 'all' else who}"
+
+    out(f"  {'relay':>5}  state   {'input':>5}  state")
+    for n in range(1, max(len(io["relays"]), len(io["inputs"]), 1) + 1):
+        left = (f"  {n:>5}  {'ON ' if io['relays'][n] else 'off'}"
+                f"{label(relay_names, n):<12}" if n in io["relays"]
+                else " " * 24)
+        right = (f"{n:>5}  {'ON ' if io['inputs'][n] else 'off'}"
+                 f"{label(input_names, n)}" if n in io["inputs"] else "")
+        out(f"{left}  {right}".rstrip())
+    out("")
+    try:
+        state = controller.read_state("all")
+        measured = controller.state_is_measured("all")
+        out(f"  brakes: {state.label}"
+            + ("" if measured else "   (from the relay; nothing measures the "
+                                   "brake itself)"))
+    except BrakeError as exc:
+        out(f"  brakes: cannot be worked out -- {exc}")
+    return 0
 
 
 def cmd_clear_errors(args) -> int:
@@ -1447,7 +1535,8 @@ def cmd_gui(args) -> int:
     from .gui import main as gui_main
     return gui_main(config_path=args.config, simulate=args.simulate,
                     bench=args.bench, sim_speed=args.sim_speed,
-                    poll_interval_s=args.poll)
+                    poll_interval_s=args.poll,
+                    use_real_brakes=args.real_brakes)
 
 
 # --------------------------------------------------------------------------
@@ -1480,6 +1569,11 @@ def _add_global_args(p: argparse.ArgumentParser,
                    help="seconds between status polls while moving (default "
                         "0.15). Lower is more responsive and more Modbus "
                         "traffic.")
+    p.add_argument("--real-brakes", action="store_true", **extra,
+                   help="with --simulate, drive the configured brake PLC "
+                        "anyway, to bench test it with no motors connected. "
+                        "Without this, --simulate never touches the PLC. "
+                        "(--bench and real runs always use it.)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1496,6 +1590,7 @@ commissioning order
   check-direction      confirm which way each actuator pushes  (per motor)
   calibrate            measure counts per millimetre           (per motor)
   probe-brake          confirm brake control and polarity      (per motor)
+  plc                  read the brake PLC (X-432): every relay and input
   supply               record what the bus-voltage register reads with the
                        supply healthy, so volts can be shown and a failed
                        supply can be told from a normal reading
@@ -1632,6 +1727,17 @@ one motor on a bench
     p = command("brake", help="engage, release or report the brakes")
     p.add_argument("action", choices=["status", "engage", "release"])
     p.set_defaults(func=cmd_brake)
+
+    p = command("enable-drives",
+                help="turn every passive drive on, holding where it is (the "
+                     "step before releasing the brakes)")
+    p.set_defaults(func=cmd_enable_drives)
+
+    p = command("plc", help="read the brake PLC and list every relay and "
+                            "input (reads only)")
+    p.add_argument("--raw", action="store_true",
+                   help="print the PLC's state page exactly as it sent it")
+    p.set_defaults(func=cmd_plc)
 
     p = command("clear-errors", help="best-effort error clear on all motors")
     p.set_defaults(func=cmd_clear_errors)

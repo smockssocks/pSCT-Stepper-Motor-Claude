@@ -363,6 +363,72 @@ you find out what "working normally" reads before trusting that threshold on
 the telescope.
 See **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 
+### The brake PLC (ControlByWeb X-432)
+
+The brakes are switched by a ControlByWeb X-432, a web PLC with 16 relays and
+18 digital inputs. The software talks to it over HTTP, the same way its own web
+page does: it reads `http://<PLC>/state.json` and sets a relay with
+`state.json?relay1=1`. How the relays are wired to the brakes is not assumed.
+You tell it which relay, and which way round.
+
+**Three ways to bench test it**, from least to most hardware:
+
+```
+python -m psct_motors.cli --simulate --real-brakes gui   # no motors, real PLC
+python -m psct_motors.cli --bench Top gui                # one real motor, real PLC
+python -m psct_motors.cli gui                            # all three, real PLC
+```
+
+`--simulate` on its own never touches the PLC; `--real-brakes` is what lets it.
+With stood-in motors, the stand-ins obey the PLC: while it says the brakes are
+on, a simulated axis will not turn, just as a real one would not. The title bar
+says which parts are real.
+
+**Setting it up:**
+
+1. Open `http://<PLC IP>/state.json` in a browser. You should see `relay1` to
+   `relay16` and `digitalInput1` to `digitalInput18`. Anything missing has no
+   "Local I/O Number" set on the PLC and has to be given one there first.
+2. In the GUI, *Tools → Brake controller (PLC)* (or **Brakes…** in the
+   Connection box): enter the IP, and which relay drives the brakes: one relay
+   for all three, or one per actuator. Add the user and password if the PLC
+   asks for one.
+3. Press **Read the PLC** and tick **keep reading**. Every relay and input is
+   shown live. Switch relays from the PLC's own web page and watch which light
+   changes, and which brake clicks. This window only reads, and never switches
+   anything itself.
+4. Set **relay ON releases the brakes** to match what you saw. Spring-applied
+   brakes that are powered to release are the usual case, but check it.
+5. **Use and save.**
+
+Then run the sequence you would use on the telescope, and watch the **Brakes:**
+line in the Connection box:
+
+- **Connect**, then **Enable drives**. The drives come on holding exactly where
+  they are.
+- **Release all brakes**. The relay switches and the line says *released*.
+  Releasing is refused while any drive is off, because then nothing would be
+  holding the camera.
+- Move or nudge focus. The brakes are released first if they are on.
+- **Engage all brakes**, then try **EMERGENCY**. It engages the brakes but
+  **keeps the drives on**, and the log says why (see below).
+- `python -m psct_motors.cli plc` prints every relay and input from the command
+  line. It only reads.
+
+**Relay state vs brake state.** A relay reading "off" means the PLC was told to
+turn it off. It does not prove the brake clamped: reversed polarity, a blown
+fuse or a loose wire all read the same. So unless a digital input reports what
+the brake actually did (a switch on the brake, or a sense on its supply), the
+GUI marks the brake state with **?** and says *relay state*, and EMERGENCY will
+not turn the drives off, because it cannot confirm anything else is holding the
+camera. If the X-432 has a spare input wired to such a signal, set it under
+*Brake feedback inputs* and both of those change.
+
+If the PLC's own logic (a task or script on the X-432) switches the brake
+relay, the software notices: a relay that does not end up where it was sent is
+an error, not a success. Check the PLC's logic before assuming the wiring is
+wrong.
+
 ---
 
 ## More detail
@@ -380,13 +446,11 @@ See **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 
 ## Still needed from the site
 
-- **The brake device.** The brakes are switched by a separate box with its own
-  web page, not by the motors — which is why the motor's Brake Output register
-  reads 0. To drive them from here, one of: its make and model, whether it
-  answers Modbus TCP and on which coil, or the URL its own buttons POST to (a
-  browser's network tab shows this in a minute). Until then the GUI says the
-  brakes are not under software control rather than showing a state it cannot
-  read, and the release/engage buttons explain what is missing.
+- **The brake wiring.** The brakes are on a ControlByWeb X-432 (see
+  [The brake PLC](#the-brake-plc-controlbyweb-x-432)). The driver is written
+  and tested against a stand-in, but which relay drives which brake, which way
+  round, and whether any input reports the brake's real state all have to be
+  found on the actual unit.
 - **The other two motors.** This talks Modbus TCP over Ethernet. The site
   currently drives the motors over serial COM4/5/6 from MacTalk, so the other
   two need Ethernet modules, or this needs Modbus RTU support adding.

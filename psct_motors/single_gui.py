@@ -679,8 +679,11 @@ class SingleMotorApp:
             return
 
         def work():
-            self.motor.set_mode(MotorMode.POSITION)
-            self.log.info("command", "Position mode enabled and verified")
+            # Holds where the shaft is: a bare set_mode would send the motor
+            # to whatever stale target it last had.
+            self.motor.ensure_position_mode()
+            self.log.info("command", "Position mode enabled and verified, "
+                                     "holding position")
 
         self.run_async("Enable position mode", work)
 

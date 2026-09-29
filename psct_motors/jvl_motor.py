@@ -432,11 +432,20 @@ class JVLMotor:
             )
 
     def ensure_position_mode(self) -> None:
-        """Make sure the motor is in Position mode, setting it only if needed."""
+        """Make sure the motor is in Position mode, setting it only if needed.
+
+        Before enabling, the target is set to where the shaft is now. A drive
+        in Position mode goes to P_SOLL, and on a drive that has been passive
+        P_SOLL is whatever was last written -- possibly long ago, possibly
+        before the load sank. Enabling without this is a move nobody asked
+        for, made the instant the drive comes on, and with the brakes still
+        engaged it is a move against the brakes.
+        """
         if self.get_mode() == int(MotorMode.POSITION):
             return
+        self.command_position_counts(self.get_position_counts())
         self.set_mode(MotorMode.POSITION)
-        self._log(f"{self.name}: switched to Position mode.")
+        self._log(f"{self.name}: switched to Position mode, holding where it is.")
 
     # ------------------------------------------------------------- position
 

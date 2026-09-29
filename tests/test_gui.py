@@ -724,6 +724,97 @@ class TestGui(unittest.TestCase):
         pollers = [t for t in threading.enumerate() if t.name == "poll" and t.is_alive()]
         self.assertEqual(len(pollers), 1)
 
+    # ---- brake PLC ------------------------------------------------------------
+
+    def _use_fake_plc(self, **brake):
+        """Point the app at a fake X-432, as `--simulate --real-brakes` would."""
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from fake_plc import FakeX432
+        plc = FakeX432().start()
+        self.addCleanup(plc.stop)
+        settings = self.app.cfg.external_brake
+        settings.mode, settings.host = "controlbyweb", "127.0.0.1"
+        settings.http_port, settings.relays = plc.port, {"all": 1}
+        for key, value in brake.items():
+            setattr(settings, key, value)
+        self.app.use_real_brakes = True
+        self.app.platform.use_real_brakes = True
+        self.app.platform.reload_external_brake()
+        return plc
+
+    def test_the_row_brake_buttons_reach_the_plc(self):
+        """They used to call the motor's own brake output, which on this
+        telescope is not wired to anything, so every press failed."""
+        plc = self._use_fake_plc()
+        self.app._start_polling()
+        self._answer(True, self.app.on_enable_drives)
+        self._wait_idle()
+        self._answer(True, lambda: self.app.on_brake("East", engage=False))
+        self._wait_idle()
+        self.assertEqual(plc.relays[1], 1)
+        self._answer(True, lambda: self.app.on_brake("West", engage=True))
+        self._wait_idle()
+        self.assertEqual(plc.relays[1], 0)
+        self.assertIn("all three", self.app.log_text.get("1.0", "end"))
+
+    def _wait_idle(self, timeout: float = 5.0) -> None:
+        """Pump until the app's one-at-a-time worker has finished."""
+        self.pump(0.1)
+        deadline = time.monotonic() + timeout
+        while self.app._busy and time.monotonic() < deadline:
+            self.pump(0.05)
+        self.pump(0.1)
+
+    def test_the_brake_line_says_what_the_plc_reports(self):
+        self._use_fake_plc()
+        self.app._start_polling()
+        self.pump(1.0)
+        line = self.app.brake_ctrl_var.get()
+        self.assertIn("ControlByWeb", line)
+        self.assertIn("engaged", line)
+        self.assertIn("relay state", line)
+
+    def test_the_brake_line_shows_a_dead_plc(self):
+        plc = self._use_fake_plc()
+        self.app._start_polling()
+        self.pump(0.6)
+        plc.stop()
+        self.pump(1.5)
+        self.assertIn("NOT READABLE", self.app.brake_ctrl_var.get())
+
+    def test_the_brake_settings_read_the_plc_and_apply(self):
+        plc = self._use_fake_plc()
+        plc.relays[7] = 1
+        self._answer(False, self.app.on_edit_brake_controller)
+        self.pump(0.2)
+        self.app._brake_window_read()
+        self.pump(1.0)
+        texts = []
+        for child in self.app._brake_window.winfo_children():
+            for inner in child.winfo_children():
+                if isinstance(inner, tk.Label):
+                    texts.append(inner.cget("text"))
+        self.assertTrue(any("Relays on: 7" in t for t in texts), texts)
+
+        # Apply: the controller is rebuilt from what the window says.
+        from psct_motors.external_brake import BrakeController
+        self._answer(False, lambda: self._press(self.app._brake_window,
+                                                 "Use for this session"))
+        self.pump(0.2)
+        self.assertIsInstance(self.app.platform.external_brake, BrakeController)
+        self.assertEqual(self.app.platform.external_brake.cfg.relays, {"all": 1})
+
+    def _press(self, window, text):
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, (ttk.Button, tk.Button)) and child.cget("text") == text:
+                    child.invoke()
+                    return True
+                if walk(child):
+                    return True
+            return False
+        self.assertTrue(walk(window), f"no button {text!r}")
+
     def _answer(self, answer, fn):
         """Call `fn` with every dialog answered `answer`."""
         from psct_motors import gui
