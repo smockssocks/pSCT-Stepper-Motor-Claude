@@ -260,7 +260,8 @@ class FocusGauge(tk.Canvas):
         # Ticks are chosen as round numbers in the units being shown, then
         # placed at the focus position they correspond to. Otherwise "from
         # M1" would label the track 1231.0, 1221.0, 1211.0 ... which nobody
-        # can read at a glance.
+        # can read at a glance. A tick label too close to the bold zero label
+        # is left off rather than printed on top of it.
         zero_y = self._y_for(0.0, top, bottom)
         for value, mm in self._ticks():
             y = self._y_for(mm, top, bottom)
@@ -269,6 +270,8 @@ class FocusGauge(tk.Canvas):
                              cx - track_half, y,
                              fill=COLOR_ZERO if major else "#9a9a9a",
                              width=2 if major else 1)
+            if not major and abs(y - zero_y) < self.LABEL_GAP:
+                continue
             self.create_text(cx - track_half - 10, y, anchor="e",
                              text=self._tick_label(value),
                              fill=COLOR_ZERO if major else COLOR_MUTED,
@@ -276,13 +279,16 @@ class FocusGauge(tk.Canvas):
 
         # --- zero line ------------------------------------------------------
         # Always drawn: in the M1/M2 references it is still the point every
-        # command is measured from, so it is labelled with what it reads there.
+        # command is measured from. Its value is the bold label on the left;
+        # the word "zero" goes on the right, if there is room for it.
         self.create_line(cx - track_half - 8, zero_y, cx + track_half + 8, zero_y,
                          fill=COLOR_ZERO, width=2)
-        if self.reference != "zero" and self.reference_available:
-            self.create_text(right + 12, zero_y, anchor="w",
-                             text=f"zero = {self.display_value(0.0):.1f}",
-                             fill=COLOR_ZERO, font=("TkDefaultFont", 7))
+
+        # Everything to the right of the track goes through one placer, so
+        # no two labels there can land on top of each other: END OF TRAVEL
+        # stays where it is, "target" moves out of the way, and the "zero"
+        # note is dropped if there is no room left for it.
+        placed: List[float] = []
 
         # --- limits ---------------------------------------------------------
         for limit in (self.min_mm, self.max_mm):
@@ -300,7 +306,8 @@ class FocusGauge(tk.Canvas):
             y = self._y_for(stop, top, bottom)
             self.create_line(cx - track_half - 10, y, cx + track_half + 10, y,
                              fill=COLOR_HARD_STOP, width=3)
-            self.create_text(right + 12, y + (8 if stop < 0 else -8), anchor="w",
+            label_y = self._place(y + (8 if stop < 0 else -8), placed, required=True)
+            self.create_text(right + 12, label_y, anchor="w",
                              text="END OF TRAVEL", fill=COLOR_HARD_STOP,
                              font=("TkDefaultFont", 7, "bold"))
 
@@ -310,8 +317,16 @@ class FocusGauge(tk.Canvas):
                 and abs(self._target_mm - self._position_mm) > 1e-4):
             target_y = self._y_for(self._target_mm, top, bottom)
             self._marker(cx, target_y, track_half, COLOR_TARGET, filled=False)
-            self.create_text(right + 14, target_y, anchor="w", text="target",
+            label_y = self._place(target_y, placed, required=True,
+                                  low=top - 6, high=bottom + 6)
+            self.create_text(right + 14, label_y, anchor="w", text="target",
                              fill=COLOR_TARGET, font=("TkDefaultFont", 8))
+
+        if self.reference != "zero" and self.reference_available:
+            label_y = self._place(zero_y, placed, required=False)
+            if label_y is not None:
+                self.create_text(right + 12, label_y, anchor="w", text="zero",
+                                 fill=COLOR_ZERO, font=("TkDefaultFont", 7))
 
         # --- where we are ----------------------------------------------------
         if self._valid and self._position_mm is not None:
@@ -336,6 +351,39 @@ class FocusGauge(tk.Canvas):
                          font=("TkDefaultFont", 11, "bold"))
         self.create_text(width / 2, height - 12, text=caption, fill=colour,
                          font=("TkDefaultFont", 8))
+
+    #: Minimum vertical distance between two labels, in pixels. The fonts in
+    #: use are 7-8 pt, about 10-11 px tall.
+    LABEL_GAP = 12.0
+
+    def _place(self, y: float, placed: List[float], required: bool,
+               low: Optional[float] = None,
+               high: Optional[float] = None) -> Optional[float]:
+        """Find a y for a label near `y` that clears every placed label.
+
+        Tries `y`, then steps away from it alternately up and down. A label
+        that is `required` always gets a place; one that is not is dropped
+        (returns None) when it would have to move more than one step.
+        """
+        gap = self.LABEL_GAP
+        offsets = [0.0]
+        for step in range(1, 6):
+            offsets += [-step * gap, step * gap]
+        if not required:
+            offsets = offsets[:3]
+        for offset in offsets:
+            candidate = y + offset
+            if low is not None and candidate < low:
+                continue
+            if high is not None and candidate > high:
+                continue
+            if all(abs(candidate - other) >= gap for other in placed):
+                placed.append(candidate)
+                return candidate
+        if required:
+            placed.append(y)
+            return y
+        return None
 
     def _marker(self, cx: float, y: float, track_half: float,
                 colour: str, filled: bool) -> None:
