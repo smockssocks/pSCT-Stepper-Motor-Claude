@@ -162,7 +162,7 @@ What the software will and will not believe about the PLC:
 - **A relay's state is not a brake's state.** Relay off means the PLC was told
   to clamp. Reversed polarity, a blown fuse or a loose wire all read the same.
   Unless a digital input reports the brake itself (`feedback_inputs`), the
-  state is shown as inferred (`?`), and **EMERGENCY will not turn the drives
+  Brakes line says "relay state; nothing measures the brake itself", and **EMERGENCY will not turn the drives
   off**: it only does that when the brakes are confirmed holding. The same rule
   now applies to an HTTP device that only echoes the last command. Before this
   it would have counted that as confirmation.

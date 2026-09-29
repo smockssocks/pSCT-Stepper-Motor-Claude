@@ -34,10 +34,10 @@ class TestPositionHistory(unittest.TestCase):
     def test_records_are_kept_newest_first_and_written_to_disk(self):
         history = PositionHistory(path=self.path)
         history.record("move", Orientation(0.0), Orientation(1.0), Orientation(1.0))
-        history.record("nudge", Orientation(1.0), Orientation(1.5), Orientation(1.5))
-        self.assertEqual([r.kind for r in history.records()], ["nudge", "move"])
+        history.record("fine adjust", Orientation(1.0), Orientation(1.5), Orientation(1.5))
+        self.assertEqual([r.kind for r in history.records()], ["fine adjust", "move"])
         self.assertEqual([r.kind for r in history.records(newest_first=False)],
-                         ["move", "nudge"])
+                         ["move", "fine adjust"])
         with open(self.path, encoding="utf-8") as fh:
             lines = [json.loads(line) for line in fh if line.strip()]
         self.assertEqual(len(lines), 2)
@@ -106,10 +106,10 @@ class TestPlatformRecordsMoves(unittest.TestCase):
         self.assertTrue(record.completed)
         self.assertEqual(set(record.actuators_after), {"Top", "East", "West"})
 
-    def test_a_nudge_and_a_jog_are_recorded_with_their_kind(self):
+    def test_a_fine_adjust_and_a_jog_are_recorded_with_their_kind(self):
         platform = self._platform()
         platform.move_relative(d_focus_mm=0.5)
-        self.assertEqual(platform.history.last().kind, "nudge")
+        self.assertEqual(platform.history.last().kind, "fine adjust")
         self.assertIn("focus +0.5 mm", platform.history.last().note)
         platform.move_actuator_mm("Top", 0.2, relative=True)
         record = platform.history.last()

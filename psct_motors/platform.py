@@ -607,7 +607,11 @@ class FocalPlanePlatform:
             failed = BrakeStatus(BrakeState.UNKNOWN, True, str(exc))
             return {m.name: failed for m in self.motors}
 
-        words = sorted({r.state.value for r in readings.values()})
+        # The same words the GUI's actuator table uses.
+        spoken = {BrakeState.ENGAGED: "engaged",
+                  BrakeState.RELEASED: "disengaged",
+                  BrakeState.UNKNOWN: "unknown"}
+        words = sorted({spoken[r.state] for r in readings.values()})
         measured_all = all(not r.inferred for r in readings.values())
         self.brake_summary = (
             f"{detail}: brakes {'/'.join(words)}"
@@ -804,7 +808,7 @@ class FocalPlanePlatform:
         """Drive the focal plane to an absolute orientation.
 
         `kind` and `note` are for the position history: what sort of command
-        this was ("move", "nudge", "go-back" ...) and anything worth writing
+        this was ("move", "fine adjust", "go-back" ...) and anything worth writing
         beside it. They change nothing about the motion.
         """
         with self._move_lock:
@@ -855,7 +859,7 @@ class FocalPlanePlatform:
 
     def move_relative(self, d_focus_mm: float = 0.0, d_tip_deg: float = 0.0,
                       d_tilt_deg: float = 0.0, wait: bool = True) -> PlatformState:
-        """Nudge the focal plane relative to where it is now."""
+        """Fine adjust the focal plane relative to where it is now."""
         with self._move_lock:
             self._require_connected()
             current = self.read_orientation()
@@ -867,7 +871,7 @@ class FocalPlanePlatform:
                 parts.append(f"tip {d_tip_deg:+g} deg")
             if d_tilt_deg:
                 parts.append(f"tilt {d_tilt_deg:+g} deg")
-            return self.move_to_orientation(target, wait=wait, kind="nudge",
+            return self.move_to_orientation(target, wait=wait, kind="fine adjust",
                                             note=", ".join(parts))
 
     # ------------------------------------------------------------- history

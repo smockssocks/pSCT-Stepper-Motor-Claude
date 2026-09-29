@@ -187,7 +187,7 @@ class TestGui(unittest.TestCase):
 
     def test_focal_plane_picture_shows_each_actuator(self):
         self.app._start_polling()
-        self.app.on_open_plane_view()
+        self.app.on_open_tilt()
         self.pump(0.3)
         self.app.platform.move_to_orientation(Orientation(1.0, 0.1, -0.05))
         self.pump(0.6)
@@ -196,19 +196,60 @@ class TestGui(unittest.TestCase):
         # A tip means the actuators are not all at the same height.
         self.assertGreater(max(self.app.plane_view._z) - min(self.app.plane_view._z),
                            0.1)
-        self.app._plane_window.destroy()
+        self.app._tilt_window.destroy()
         self.pump(0.2)
         self.assertIsNone(self.app.plane_view)
+        self.assertIsNone(self.app._tilt_window)
 
     def test_picture_refuses_to_draw_a_stale_plane(self):
         self.app._start_polling()
-        self.app.on_open_plane_view()
+        self.app.on_open_tilt()
         self.pump(0.4)
         self.app.platform.motors[1]._transport.set_offline(True)
         self.pump(0.6)
         self.assertIsNone(self.app.plane_view._z)
         self.assertIn("East", self.app.plane_view._message)
-        self.app._plane_window.destroy()
+        self.app._tilt_window.destroy()
+
+    def test_the_focal_plane_window_has_the_picture_tilt_and_jog(self):
+        """One window for everything that changes the plane's orientation,
+        and none of it left on the main window."""
+        def texts(widget):
+            found = []
+            for child in widget.winfo_children():
+                try:
+                    found.append(str(child.cget("text")))
+                except Exception:
+                    pass
+                found.extend(texts(child))
+            return found
+
+        main = texts(self.root)
+        self.assertNotIn("▲", main)
+        self.assertFalse(any("jog step" in t for t in main))
+        self.assertFalse(any("key:" in t for t in main))
+
+        self.app.on_open_tilt()
+        self.pump(0.3)
+        window = self.app._tilt_window
+        inside = texts(window)
+        self.assertIsNotNone(self.app.plane_view)
+        self.assertEqual(inside.count("▲"), len(self.app.cfg.actuators))
+        self.assertIn("Level (tip = tilt = 0)", inside)
+        self.assertIn("Fine adjust by (deg):", inside)
+        window.destroy()
+
+    def test_a_jog_from_the_focal_plane_window_moves_one_actuator(self):
+        self.app._start_polling()
+        self.pump(0.3)
+        before = self.app.platform.read_actuator_positions_mm()
+        self.app.jog_step_var.set("0.200")
+        self.app.on_jog("Top", +1)
+        self.pump(2.0)
+        after = self.app.platform.read_actuator_positions_mm()
+        self.assertAlmostEqual(after[0] - before[0], 0.2, places=2)
+        self.assertAlmostEqual(after[1], before[1], places=3)
+        self.assertAlmostEqual(after[2], before[2], places=3)
 
     def test_connection_settings_apply_and_rebuild(self):
         """Editing an address has to rebuild the motors, or only the label
@@ -425,10 +466,10 @@ class TestGui(unittest.TestCase):
         self.app._start_polling()
         self.app.platform.set_all_brakes(engaged=True)
         self.pump(0.5)
-        self.assertIn("HOLDING", self.app.rows["Top"].brake_var.get())
+        self.assertEqual("ENGAGED", self.app.rows["Top"].brake_var.get())
         self.app.platform.move_to_orientation(Orientation(26.0, 0.0, 0.0))
         self.pump(0.5)
-        self.assertIn("FREE", self.app.rows["Top"].brake_var.get())
+        self.assertEqual("DISENGAGED", self.app.rows["Top"].brake_var.get())
 
     # ---- the property that matters ---------------------------------------
 
@@ -583,7 +624,7 @@ class TestGui(unittest.TestCase):
         self.assertGreaterEqual(int(reserved), font.measure("West"))
 
     def test_brake_column_fits_its_longest_label(self):
-        """"released (inferred)" is the widest thing that column ever holds."""
+        """"DISENGAGED" is the widest thing that column ever holds."""
         import tkinter.font as tkfont
         from psct_motors.gui import MotorRow
 
@@ -696,8 +737,8 @@ class TestGui(unittest.TestCase):
 
     # ---- layout --------------------------------------------------------------
 
-    def test_nothing_in_the_actuator_table_shares_a_row_with_the_legend(self):
-        """The jog footer used to be gridded on the same row as the brake key,
+    def test_nothing_in_the_actuator_table_shares_a_row(self):
+        """The jog footer was once gridded on the same row as the brake key,
         so the key was drawn underneath it and only its tail showed."""
         from psct_motors.gui import MotorRow
         rows_used = {}

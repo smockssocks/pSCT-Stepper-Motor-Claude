@@ -56,7 +56,7 @@ class MoveRecord:
 
     #: Seconds since the epoch, when the move was commanded.
     timestamp: float
-    #: What kind of command it was: "move", "nudge", "jog", "level",
+    #: What kind of command it was: "move", "fine adjust", "jog", "level",
     #: "find-stop", "go-back" ... free text, for the eye.
     kind: str
     #: The orientation read from the motors just before the command.
@@ -73,7 +73,7 @@ class MoveRecord:
     #: "done", or the reason it was not.
     outcome: str = "done"
     #: Anything else worth writing down: which axis a search stopped on, the
-    #: nudge size, the jogged actuator.
+    #: fine adjustment size, the jogged actuator.
     note: str = ""
 
     @property

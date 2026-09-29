@@ -5,7 +5,7 @@ position the pSCT camera's focal plane.
 
 You give it a focus position — or a tip and tilt, if you need one. It works out
 which motors move and by how much, checks the move is safe, and drives all
-three together. No hand calculation, no working out which motor to nudge.
+three together. No hand calculation, no working out which motor to move.
 
 ```
 python -m psct_motors.cli --simulate gui      # try it, no hardware needed
@@ -84,8 +84,8 @@ drives.
   move held. These motors report no amps; set `rated_current_a` from the data
   plate and an approximate figure appears too.
 - Focus readout in mm and microns, and which way it is from zero.
-- Absolute focus moves with **Preview**, nudge buttons, and one-click step
-  sizes down to 1 µm.
+- Absolute focus moves with **Preview**, **fine adjust** buttons, and
+  one-click step sizes down to 1 µm.
 - A **position gauge** down the right: + towards M1 above, − towards M2 below,
   travel limits and found ends of travel marked, target shown while moving.
   The chooser above it sets what the numbers are measured **from**: the zero
@@ -94,22 +94,22 @@ drives.
   to that mirror, which nobody has yet — enter it under *Tools → Distances*
   (or the button under the gauge) once it is known; until then the gauge says
   "distance not set" rather than showing a made-up number.
-- Per-actuator position, mode, brake lamp, load, **supply voltage** and jog,
-  with a **key underneath** spelling out what every lamp and colour means.
-  The brake lamps are blue for HOLDING and amber for FREE, deliberately not
-  green/red: a released brake is not "good", it means the camera is hanging
-  on the drives. Supply shows volts once `cli supply` has recorded the scale,
-  and the raw register value until then.
+- Per-actuator position, mode, brake, load and **supply voltage**, with
+  Release/Engage for each brake. The brake says **ENGAGED** (blue) or
+  **DISENGAGED** (amber), deliberately not green/red: a disengaged brake is
+  not "good", it means the camera is hanging on the drives. Supply shows volts
+  once `cli supply` has recorded the scale, and the raw register value until
+  then. Jogging a single actuator is not on the main window; it is in
+  *Motion → Focal plane: tilt and jog*.
 - A timestamped log of everything the application did.
 
 Behind the menus, so the main window stays about the job:
 
 | where | what |
 |---|---|
-| **Motion → Tip and tilt** | the two tilt angles, with nudges and a Level button |
+| **Motion → Focal plane: tilt and jog** | one window with a live drawing of the plate on its three actuators, the two tilt angles with fine adjust buttons and Level, and a jog for each actuator |
 | **Motion → Go back to the previous position** | return to where the focal plane was before the last move — an ordinary checked move, with confirmation |
 | **View → Position log** | every move, newest first: where the plane was, where it was sent, where it ended up; select a line and go back to it |
-| **View → Focal plane picture** | live drawing of the plate on its three actuators |
 | **View → Load and torque** | how hard each motor is working, big enough to read across a room, with peaks, temperature and supply |
 | **Tools → Connection settings** | edit each motor's IP and port, use now or save |
 | **Tools → Motion limits** | focus, tilt and step limits; set them from the ends of travel that Find hard stop discovered |
@@ -192,7 +192,7 @@ is not giving you fresher numbers, it is queueing.
 The motors keep no history at all — there is no event log or fault buffer
 anywhere in the drive — so the software writes one. Every move it commands
 goes into `config/positions.jsonl`, beside the configuration: when, what kind
-of move (move, nudge, jog, find-stop, go-back), where the focal plane was
+of move (move, fine adjust, jog, find-stop, go-back), where the focal plane was
 before, where it was sent, where it actually ended up, and whether it
 finished. A halted move is recorded too, because its "after" is where the
 plane really is.
@@ -302,7 +302,8 @@ It only affects simulated axes. It cannot change what a real motor does.
 
 Worth trying:
 
-- **View → Focal plane picture** — the plate on its three actuators. The dashed
+- **Motion → Focal plane: tilt and jog** — the plate on its three actuators, with
+  the tilt and jog controls beside it. The dashed
   triangle is the zero plane, the solid one is where the focal plane is now,
   and the orange posts are each actuator's extension. Vertical travel is
   exaggerated by the labelled factor: the plate is about a metre across and
@@ -411,11 +412,11 @@ line in the Connection box:
 
 - **Connect**, then **Enable drives**. The drives come on holding exactly where
   they are.
-- **Release all brakes**. The relay switches and the line says *released*.
+- **Release all brakes**. The relay switches and the line says *disengaged*.
   Releasing is refused while any drive is off, because then nothing would be
   holding the camera.
-- Move or nudge focus. The brakes are released first if they are on.
-- **Jog** one actuator (▲/▼). Before any brake comes off it checks, in order:
+- Move or fine adjust focus. The brakes are released first if they are on.
+- **Jog** one actuator (▲/▼ in *Motion → Focal plane: tilt and jog*). Before any brake comes off it checks, in order:
   no drive reports an error, the supply has not failed (once `cli supply` has
   recorded a healthy reading), every drive is on and reads back as holding.
   Only then is the brake released (just that actuator's, if they are

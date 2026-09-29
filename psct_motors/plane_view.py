@@ -113,15 +113,15 @@ class FocalPlaneView(tk.Canvas):
                                     plan_scale, z_scale)
         self.create_line(axis_bottom[0], axis_bottom[1], axis_top[0], axis_top[1],
                          fill=COLOR_AXIS, width=1, dash=(2, 3))
-        self.create_text(axis_top[0], axis_top[1] - 10, text="towards M1",
-                         fill=COLOR_AXIS, font=("TkDefaultFont", 8))
-        self.create_text(axis_bottom[0], axis_bottom[1] + 10, text="towards M2",
-                         fill=COLOR_AXIS, font=("TkDefaultFont", 8))
+        # The ends of the axis are labelled last, once everything else is
+        # drawn, so they can step out of the way of an actuator's label.
+        taken = []
 
         if self._z is None or len(self._z) != len(self.points):
-            self.create_text(width / 2, height - 16,
-                             text=self._message or "no reading",
-                             fill=COLOR_BAD, font=("TkDefaultFont", 10, "bold"))
+            taken.append(self.bbox(self.create_text(
+                width / 2, height - 16, text=self._message or "no reading",
+                fill=COLOR_BAD, font=("TkDefaultFont", 10, "bold"))))
+            self._label_axis(axis_top, axis_bottom, taken, height)
             return
 
         # --- the plate itself -------------------------------------------------
@@ -135,8 +135,9 @@ class FocalPlaneView(tk.Canvas):
             self.create_line(nx, ny, sx, sy, fill=COLOR_POST, width=2)
             self.create_oval(sx - 4, sy - 4, sx + 4, sy + 4,
                              fill=COLOR_PLANE, outline="white", width=1)
-            self.create_text(sx, sy - 14, text=f"{name}  {z:+.3f}",
-                             fill=COLOR_LABEL, font=("TkDefaultFont", 8, "bold"))
+            taken.append(self.bbox(self.create_text(
+                sx, sy - 14, text=f"{name}  {z:+.3f}",
+                fill=COLOR_LABEL, font=("TkDefaultFont", 8, "bold"))))
 
         # --- centre of the plate ----------------------------------------------
         if self._focus is not None:
@@ -149,12 +150,40 @@ class FocalPlaneView(tk.Canvas):
                          text=f"vertical exaggerated x{exaggeration:,.0f}",
                          fill=COLOR_MUTED, font=("TkDefaultFont", 8))
         if self._focus is not None:
-            self.create_text(width / 2, height - 26, anchor="c",
-                             text=f"focus {self._focus:+.4f} mm",
-                             fill=COLOR_PLANE, font=("TkDefaultFont", 11, "bold"))
-            self.create_text(width / 2, height - 10, anchor="c",
-                             text=f"tip {self._tip:+.5f}°   tilt {self._tilt:+.5f}°",
-                             fill=COLOR_MUTED, font=("TkDefaultFont", 9))
+            taken.append(self.bbox(self.create_text(
+                width / 2, height - 26, anchor="c",
+                text=f"focus {self._focus:+.4f} mm",
+                fill=COLOR_PLANE, font=("TkDefaultFont", 11, "bold"))))
+            taken.append(self.bbox(self.create_text(
+                width / 2, height - 10, anchor="c",
+                text=f"tip {self._tip:+.5f}°   tilt {self._tilt:+.5f}°",
+                fill=COLOR_MUTED, font=("TkDefaultFont", 9))))
+        self._label_axis(axis_top, axis_bottom, taken, height)
+
+    def _label_axis(self, axis_top, axis_bottom, taken, height) -> None:
+        """Label the ends of the optical axis clear of every box in `taken`.
+
+        Each label starts just beyond its end of the axis and moves further
+        out (up for M1, down for M2) until it overlaps nothing, or failing
+        that, until it would leave the canvas.
+        """
+        for (x, y), text, step in ((axis_top, "towards M1", -1),
+                                   (axis_bottom, "towards M2", +1)):
+            item = self.create_text(x, y + step * 10, text=text,
+                                    fill=COLOR_AXIS, font=("TkDefaultFont", 8))
+            for _ in range(40):
+                box = self.bbox(item)
+                if not any(_overlaps(box, other) for other in taken if other):
+                    break
+                if box[1] + step * 4 < 0 or box[3] + step * 4 > height:
+                    break
+                self.move(item, 0, step * 4)
+            taken.append(self.bbox(item))
 
 
 __all__ = ["FocalPlaneView"]
+
+
+def _overlaps(a, b) -> bool:
+    """Whether two canvas bounding boxes (x1, y1, x2, y2) intersect."""
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
