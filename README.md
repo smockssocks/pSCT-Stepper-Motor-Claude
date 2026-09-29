@@ -86,6 +86,9 @@ drives.
 - Focus readout in mm and microns, and which way it is from zero.
 - Absolute focus moves with **Preview**, **fine adjust** buttons, and
   one-click step sizes down to 1 µm.
+- **Saved positions**: pick one ("Default", "Window open", anything you name)
+  and press **Go to**, or **Save current as...** to remember where the plane
+  is now. See [Saved positions](#saved-positions).
 - A **position gauge** down the right: + towards M1 above, − towards M2 below,
   travel limits and found ends of travel marked, target shown while moving.
   The chooser above it sets what the numbers are measured **from**: the zero
@@ -98,8 +101,8 @@ drives.
   Release/Engage for each brake. The brake says **ENGAGED** (blue) or
   **DISENGAGED** (amber), deliberately not green/red: a disengaged brake is
   not "good", it means the camera is hanging on the drives. Supply shows volts
-  once `cli supply` has recorded the scale, and the raw register value until
-  then. Jogging a single actuator is not on the main window; it is in
+  once the scale has been recorded (click a supply reading, or *Tools →
+  Supply voltage*), and the raw register value until then. Jogging a single actuator is not on the main window; it is in
   *Motion → Focal plane: tilt and jog*.
 - A timestamped log of everything the application did.
 
@@ -107,13 +110,15 @@ Behind the menus, so the main window stays about the job:
 
 | where | what |
 |---|---|
-| **Motion → Focal plane: tilt and jog** | one window with a live drawing of the plate on its three actuators, the two tilt angles with fine adjust buttons and Level, and a jog for each actuator |
+| **Motion → Focal plane: tilt and jog** | password protected. One window with a live drawing of the plate on its three actuators, the two tilt angles with fine adjust buttons and Level, and a jog for each actuator |
+| **Motion → Save current position / Saved positions** | name the current position, and see, rename, delete or go to the saved ones |
 | **Motion → Go back to the previous position** | return to where the focal plane was before the last move — an ordinary checked move, with confirmation |
 | **View → Position log** | every move, newest first: where the plane was, where it was sent, where it ended up; select a line and go back to it |
 | **View → Load and torque** | how hard each motor is working, big enough to read across a room, with peaks, temperature and supply |
 | **Tools → Connection settings** | edit each motor's IP and port, use now or save |
 | **Tools → Motion limits** | focus, tilt and step limits; set them from the ends of travel that Find hard stop discovered |
 | **Tools → Distances from zero to M1 and M2** | the two numbers the gauge needs to show distance to a mirror instead of distance from zero |
+| **Tools → Supply voltage** | enter the voltage the supply is at (MacTalk shows it) so the supply column reads in volts |
 | **Tools → Find hard stop** | run the actuators out to the end of travel |
 | **Tools → Run safety drills** | prove the guards still fire (simulated, safe any time) |
 
@@ -140,7 +145,10 @@ that there is no gap, in which case torque alone cannot find the stop and the
 
 ### Telling the software what a healthy supply looks like
 
-Run this once per motor, with the supply on and the motor behaving:
+Do this once, with the supply on and the motors behaving. In the GUI: click
+any supply reading (or *Tools → Supply voltage*), type the voltage the supply
+is at (MacTalk shows it on its main screen, or use a meter), and press
+**Record**. From the command line:
 
 ```
 python -m psct_motors.cli supply --volts 48                    # all three
@@ -207,6 +215,35 @@ is never an unchecked path.
 ```
 python -m psct_motors.cli history              # the same record, in text
 python -m psct_motors.cli go-back              # back to before the last move
+```
+
+### Saved positions
+
+Some positions get used again and again: the focus everyone agreed on, the
+focus with the new camera window fitted, a survey position. Save each under a
+name and anyone can go back to it without knowing the numbers.
+
+- **Save current as...** (in the Focus box, or *Motion → Save current
+  position*): pick "Default" or "Window open" from the list or type any name,
+  add a note if it helps, and Save. Saving under a name that already exists
+  asks before replacing it.
+- **Go to**: choose a name in the Focus box and press Go to. It is an ordinary
+  move: checked against the limits and step size, previewed, and confirmed.
+- **All saved...** (or *Motion → Saved positions*): every saved position with
+  its focus, tip, tilt, when it was saved and its note. Select one to see
+  exactly where it will send each actuator. Rename, Delete and Go to selected
+  are there too.
+
+They are kept in `config/saved_positions.json`, beside the configuration. Each
+one is stored as the motors' own encoder counts as well as focus/tip/tilt, so
+setting a new zero later does not move a saved position: it still goes to the
+same physical place, and the list says the numbers are now measured from the
+new zero.
+
+```
+python -m psct_motors.cli positions                       # list
+python -m psct_motors.cli positions save "Window open" --note "new window"
+python -m psct_motors.cli positions go "Window open"
 ```
 
 ### Finding the end of travel

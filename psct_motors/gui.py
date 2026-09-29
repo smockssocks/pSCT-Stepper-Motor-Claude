@@ -33,6 +33,8 @@ reason.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import queue
 import threading
 import time
@@ -47,6 +49,7 @@ from tkinter import messagebox, ttk
 from .config import load_config, save_config, default_config_path
 from .focus_gauge import REFERENCE_TITLES, REFERENCES, FocusGauge
 from .history import MoveRecord, default_history_path
+from .saved_positions import SUGGESTED_NAMES, default_saved_positions_path
 from .plane_view import FocalPlaneView
 from .jvl_motor import BrakeState
 from .kinematics import Orientation
@@ -82,6 +85,19 @@ BRAKE_WORDS = {
     BrakeState.RELEASED: "DISENGAGED",
     BrakeState.UNKNOWN: "unknown",
 }
+
+
+#: The focal plane window (tip, tilt and single-actuator jogs) asks for a
+#: password. Only a salted hash is kept here, so the password itself is not
+#: written in the source. To change it, put the new hash here:
+#:   python -c "import hashlib; print(hashlib.sha256(b'psct-tilt-lock:NEW').hexdigest())"
+TILT_PASSWORD_SALT = "psct-tilt-lock:"
+TILT_PASSWORD_SHA256 = "790025c677383208073807d644fad547bae45f5e95d4661ee0926879f9abbff5"
+
+
+def tilt_password_matches(text: str) -> bool:
+    digest = hashlib.sha256((TILT_PASSWORD_SALT + text).encode("utf-8")).hexdigest()
+    return hmac.compare_digest(digest, TILT_PASSWORD_SHA256)
 
 
 class Lamp(tk.Canvas):
@@ -243,9 +259,14 @@ class MotorRow:
         # the raw register value until then -- and labelled as raw, because
         # the drive's units are not documented and are not guessed at here.
         self.supply_var = tk.StringVar(value="--")
-        ttk.Label(parent, textvariable=self.supply_var, width=9, anchor="e",
-                  font=("TkFixedFont", 10), foreground="#333").grid(
-            row=row, column=9, padx=(2, 6))
+        self.supply_label = ttk.Label(parent, textvariable=self.supply_var,
+                                      width=9, anchor="e", cursor="hand2",
+                                      font=("TkFixedFont", 10), foreground="#333")
+        self.supply_label.grid(row=row, column=9, padx=(2, 6))
+        # Clicking it is the quickest way to the scale, which is what turns
+        # "raw" into volts.
+        self.supply_label.bind("<Button-1>",
+                               lambda _event: app.on_set_supply_scale())
 
         self.release_btn = ttk.Button(
             parent, text="Release", width=8,
@@ -365,6 +386,7 @@ class MotorApp:
         self.root.title(self._window_title())
 
         self._build_ui()
+        self._refresh_saved_positions()
         self._drain_ui()
         self.log(f"Configuration: {config_path or default_config_path()}")
         if simulate and "PLC IS REAL" in self._window_title():
@@ -411,6 +433,7 @@ class MotorApp:
             history_path=default_history_path(self.config_path),
             on_history_change=lambda: self.post(self._refresh_position_log),
             use_real_brakes=self.use_real_brakes,
+            saved_positions_path=default_saved_positions_path(self.config_path),
         )
 
     def _on_callback_error(self, exc_type, exc_value, exc_traceback) -> None:
@@ -508,6 +531,11 @@ class MotorApp:
         motion.add_command(label="Position log...",
                            command=self.on_open_position_log)
         motion.add_separator()
+        motion.add_command(label="Save current position...",
+                           command=self.on_save_position)
+        motion.add_command(label="Saved positions...",
+                           command=self.on_open_saved_positions)
+        motion.add_separator()
         motion.add_command(label="Set zero here", command=self.on_set_zero)
         motion.add_command(label="Copy current orientation into the boxes",
                            command=self.on_copy_current)
@@ -516,6 +544,8 @@ class MotorApp:
         view = tk.Menu(menubar, tearoff=0)
         view.add_command(label="Position log...",
                          command=self.on_open_position_log)
+        view.add_command(label="Saved positions...",
+                         command=self.on_open_saved_positions)
         view.add_command(label="Load and torque...",
                          command=self.on_open_load_view)
         menubar.add_cascade(label="View", menu=view)
@@ -527,6 +557,8 @@ class MotorApp:
                           command=self.on_edit_limits)
         tools.add_command(label="Distances from zero to M1 and M2...",
                           command=self.on_edit_reference_distances)
+        tools.add_command(label="Supply voltage (set the scale)...",
+                          command=self.on_set_supply_scale)
         tools.add_command(label="Find hard stop (calibration)...",
                           command=self.on_find_hard_stop)
         tools.add_command(label="Run safety drills (simulated)...",
@@ -703,7 +735,7 @@ class MotorApp:
 
         # --- fine adjustment ---
         fine = ttk.Frame(frame)
-        fine.grid(row=3, column=0, columnspan=10, sticky="w", padx=8, pady=(6, 10))
+        fine.grid(row=3, column=0, columnspan=10, sticky="w", padx=8, pady=(6, 2))
         ttk.Label(fine, text="Fine adjust focus by (mm):").grid(row=0, column=0, padx=(0, 6))
         self.focus_step_var = tk.StringVar(value="0.010")
         ttk.Entry(fine, textvariable=self.focus_step_var,
@@ -721,6 +753,22 @@ class MotorApp:
                            ("1 um", "10 um", "50 um", "0.5 mm")).index(label),
                               padx=2)
 
+        # --- saved positions ---
+        saved = ttk.Frame(frame)
+        saved.grid(row=4, column=0, columnspan=10, sticky="w", padx=8, pady=(6, 10))
+        ttk.Label(saved, text="Saved position:").grid(row=0, column=0, padx=(0, 6))
+        self.saved_choice_var = tk.StringVar(value="")
+        self.saved_combo = ttk.Combobox(saved, textvariable=self.saved_choice_var,
+                                        state="readonly", width=22)
+        self.saved_combo.grid(row=0, column=1, padx=2)
+        ttk.Button(saved, text="Go to",
+                   command=lambda: self._go_to_saved(self.saved_choice_var.get())
+                   ).grid(row=0, column=2, padx=(6, 2))
+        ttk.Button(saved, text="Save current as...",
+                   command=self.on_save_position).grid(row=0, column=3, padx=2)
+        ttk.Button(saved, text="All saved...",
+                   command=self.on_open_saved_positions).grid(row=0, column=4, padx=2)
+
         # --- tip/tilt and jog entries exist here but are shown in the -------
         # focal plane window. They live on the app so that window, the tests
         # and the move code can all reach them whether or not it is open.
@@ -729,6 +777,12 @@ class MotorApp:
         self.angle_step_var = tk.StringVar(value="0.010")
         self.jog_step_var = tk.StringVar(value="0.050")
         self._tilt_window = None
+        self._password_window = None
+        self._saved_window = None
+        self._save_dialog = None
+        self._supply_window = None
+        self._saved_tree = None
+        self._last_state = None
         self._hard_stop_window = None
         self._limits_window = None
         self._load_window = None
@@ -1106,6 +1160,7 @@ class MotorApp:
         self._poll_thread.start()
 
     def _apply_state(self, state: PlatformState) -> None:
+        self._last_state = state
         for status in state.motors:
             row = self.rows.get(status.name)
             if row:
@@ -1584,6 +1639,67 @@ class MotorApp:
                 supply_var.set(f"{status.bus_voltage} raw")
 
     def on_open_tilt(self) -> None:
+        """Ask for the password, then open the focal plane window.
+
+        The password is asked in a small window of its own rather than a
+        blocking dialog, so nothing else in the application stops while it is
+        up. A wrong password is said in that window, not in a message box.
+        """
+        if self._tilt_window is not None and self._tilt_window.winfo_exists():
+            self._tilt_window.lift()
+            return
+        if self._password_window is not None and self._password_window.winfo_exists():
+            self._password_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        self._password_window = window
+        window.title("Password")
+        window.transient(self.root)
+        window.resizable(False, False)
+        ttk.Label(window, text="Tilt and jog controls are password protected.",
+                  ).grid(row=0, column=0, columnspan=2, sticky="w",
+                         padx=12, pady=(12, 6))
+        ttk.Label(window, text="Password:").grid(row=1, column=0, sticky="e",
+                                                 padx=(12, 4))
+        password_var = tk.StringVar()
+        entry = ttk.Entry(window, textvariable=password_var, show="•", width=22)
+        entry.grid(row=1, column=1, sticky="w", padx=(0, 12))
+        status_var = tk.StringVar(value="")
+        ttk.Label(window, textvariable=status_var, foreground=COLOR_BAD).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=12)
+
+        def submit(_event=None):
+            if self._submit_tilt_password(password_var.get()):
+                return
+            password_var.set("")
+            status_var.set("Wrong password.")
+            entry.focus_set()
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", padx=12, pady=(6, 12))
+        ttk.Button(buttons, text="Open", command=submit).grid(row=0, column=0, padx=4)
+        ttk.Button(buttons, text="Cancel", command=window.destroy).grid(row=0, column=1)
+        entry.bind("<Return>", submit)
+        entry.focus_set()
+
+        def forget(event=None):
+            if event is None or event.widget is window:
+                self._password_window = None
+        window.bind("<Destroy>", forget)
+
+    def _submit_tilt_password(self, text: str) -> bool:
+        """Open the focal plane window if `text` is the password."""
+        if not tilt_password_matches(text):
+            self.log("Focal plane window: wrong password.")
+            return False
+        if self._password_window is not None and self._password_window.winfo_exists():
+            self._password_window.destroy()
+        self._password_window = None
+        self._open_tilt_window()
+        return True
+
+    def _open_tilt_window(self) -> None:
         """The focal plane window: the picture, tip/tilt and actuator jogs.
 
         Everything that changes the plane's ORIENTATION is here and nowhere
@@ -1985,6 +2101,7 @@ class MotorApp:
             pass
         self.platform = self._make_platform()
         self._refresh_position_log()
+        self._refresh_saved_positions()
         self.connect_btn.config(text="Connect")
         self.conn_var.set("disconnected")
         self.conn_lamp.set(COLOR_IDLE)
@@ -2681,6 +2798,388 @@ class MotorApp:
             reason=f"Go back to where the focal plane was before the "
                    f"{record.kind} at {record.when}:")
 
+    # ------------------------------------------------------- saved positions
+
+    def _refresh_saved_positions(self) -> None:
+        """Redraw everything that lists saved positions. UI thread."""
+        names = self.platform.saved_positions.names()
+        self.saved_combo.configure(values=names)
+        if self.saved_choice_var.get() not in names:
+            self.saved_choice_var.set(names[0] if names else "")
+        tree = self._saved_tree
+        if tree is None or not tree.winfo_exists():
+            return
+        selected = tree.selection()
+        for item in tree.get_children():
+            tree.delete(item)
+        for position in self.platform.saved_positions.all():
+            o = position.orientation
+            tree.insert("", "end", iid=position.name, values=(
+                position.name, f"{o.focus_mm:+.4f}", f"{o.tip_deg:+.5f}",
+                f"{o.tilt_deg:+.5f}", position.when, position.note))
+        if selected and tree.exists(selected[0]):
+            tree.selection_set(selected[0])
+        self._show_saved_detail()
+
+    def on_save_position(self) -> None:
+        """Ask for a name, then remember where the focal plane is now."""
+        if not self.platform.connected:
+            messagebox.showwarning("Not connected", "Connect first.")
+            return
+        if self._save_dialog is not None and self._save_dialog.winfo_exists():
+            self._save_dialog.lift()
+            return
+        try:
+            current = self.platform.read_orientation()
+        except Exception as exc:  # noqa: BLE001 -- say so, do not guess
+            messagebox.showerror("Cannot save",
+                                 f"The current position could not be read: {exc}")
+            return
+
+        window = tk.Toplevel(self.root)
+        self._save_dialog = window
+        window.title("Save current position")
+        window.transient(self.root)
+        window.resizable(False, False)
+
+        ttk.Label(window, text="The focal plane is now at:").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 0))
+        ttk.Label(window, text=current.describe(), font=("TkFixedFont", 10)).grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 8))
+
+        form = ttk.Frame(window)
+        form.grid(row=2, column=0, columnspan=2, sticky="w", padx=12)
+        ttk.Label(form, text="Name:").grid(row=0, column=0, sticky="e",
+                                           padx=(0, 4), pady=3)
+        existing = self.platform.saved_positions.names()
+        choices = list(existing) + [n for n in SUGGESTED_NAMES
+                                    if n.casefold() not in
+                                    {e.casefold() for e in existing}]
+        name_var = tk.StringVar(value="" if existing else SUGGESTED_NAMES[0])
+        name_box = ttk.Combobox(form, textvariable=name_var, values=choices,
+                                width=28)
+        name_box.grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Label(form, text="Note:").grid(row=1, column=0, sticky="e",
+                                           padx=(0, 4), pady=3)
+        note_var = tk.StringVar()
+        ttk.Entry(form, textvariable=note_var, width=40).grid(
+            row=1, column=1, sticky="w", pady=3)
+        ttk.Label(window, foreground="#777", font=("TkDefaultFont", 8),
+                  wraplength=380, justify="left",
+                  text=("Pick a name from the list or type a new one. Saving "
+                        "under a name that already exists replaces it.")).grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=12, pady=(2, 0))
+        status_var = tk.StringVar()
+        ttk.Label(window, textvariable=status_var, foreground=COLOR_BAD).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=12)
+
+        def save(_event=None):
+            name = name_var.get().strip()
+            if not name:
+                status_var.set("Give it a name first.")
+                return
+            if self._save_position(name, note_var.get(), parent=window):
+                window.destroy()
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", padx=12,
+                     pady=(6, 12))
+        ttk.Button(buttons, text="Save", command=save).grid(row=0, column=0, padx=4)
+        ttk.Button(buttons, text="Cancel", command=window.destroy).grid(row=0, column=1)
+        name_box.bind("<Return>", save)
+        name_box.focus_set()
+
+    def _save_position(self, name: str, note: str = "", parent=None) -> bool:
+        """Save the current position as `name`, asking before replacing one.
+        True if it was saved. UI thread."""
+        if self._busy or (self._last_state is not None and self._last_state.moving):
+            messagebox.showwarning(
+                "Still moving", "Wait for the move to finish, then save.",
+                parent=parent or self.root)
+            return False
+        existing = self.platform.saved_positions.get(name)
+        if existing is not None and not messagebox.askyesno(
+                "Replace?",
+                f"There is already a saved position called {existing.name!r}:\n\n"
+                f"{existing.orientation.describe()}\n(saved {existing.when})\n\n"
+                "Replace it with where the focal plane is now?",
+                parent=parent or self.root):
+            return False
+        try:
+            position, _replaced = self.platform.save_position(name, note)
+        except Exception as exc:  # noqa: BLE001 -- reported to the operator
+            messagebox.showerror("Not saved", str(exc), parent=parent or self.root)
+            return False
+        self.saved_choice_var.set(position.name)
+        self._refresh_saved_positions()
+        return True
+
+    def _go_to_saved(self, name: str) -> None:
+        """An ordinary checked, confirmed move to a saved position."""
+        if not name:
+            messagebox.showinfo(
+                "No saved position",
+                "Pick a saved position first, or save one with "
+                "\"Save current as...\".")
+            return
+        position = self.platform.saved_positions.get(name)
+        if position is None:
+            messagebox.showwarning("Not found",
+                                   f"There is no saved position called {name!r}.")
+            return
+        try:
+            target = self.platform.saved_position_target(position)
+        except PlatformError as exc:
+            messagebox.showerror("Cannot go there", str(exc))
+            return
+        self._move_with_confirmation(
+            target, kind="saved position", note=position.name,
+            reason=f"Go to the saved position \"{position.name}\" "
+                   f"(saved {position.when}):")
+
+    def on_open_saved_positions(self) -> None:
+        """Every saved position: its name, where it goes, and when it was saved."""
+        if self._saved_window is not None and self._saved_window.winfo_exists():
+            self._saved_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Saved positions")
+        self._saved_window = window
+        window.geometry("820x420")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+
+        tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=780,
+                 text=("Named positions, in the order they were first saved. "
+                       "Focus is mm from zero, tip and tilt are degrees. Select "
+                       "one to see exactly where it will send each actuator.")
+                 ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=12,
+                        pady=(10, 6))
+
+        columns = ("name", "focus (mm)", "tip (deg)", "tilt (deg)", "saved", "note")
+        tree = ttk.Treeview(window, columns=columns, show="headings",
+                            selectmode="browse", height=8)
+        widths = {"name": 150, "focus (mm)": 90, "tip (deg)": 90,
+                  "tilt (deg)": 90, "saved": 140, "note": 200}
+        for column in columns:
+            tree.heading(column, text=column)
+            tree.column(column, width=widths[column], anchor="w",
+                        stretch=(column == "note"))
+        tree.grid(row=1, column=0, sticky="nsew", padx=(12, 0))
+        scroll = ttk.Scrollbar(window, orient="vertical", command=tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns", padx=(0, 12))
+        tree.configure(yscrollcommand=scroll.set)
+        self._saved_tree = tree
+
+        self._saved_detail_var = tk.StringVar(value="")
+        ttk.Label(window, textvariable=self._saved_detail_var, justify="left",
+                  font=("TkFixedFont", 9)).grid(row=2, column=0, columnspan=2,
+                                                sticky="w", padx=12, pady=(8, 0))
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="w", padx=12,
+                     pady=(8, 12))
+        ttk.Button(buttons, text="Go to selected",
+                   command=lambda: self._go_to_saved(self._selected_saved())
+                   ).grid(row=0, column=0, padx=(0, 12))
+        ttk.Button(buttons, text="Save current as...",
+                   command=self.on_save_position).grid(row=0, column=1, padx=2)
+        ttk.Button(buttons, text="Rename...",
+                   command=self._rename_saved).grid(row=0, column=2, padx=2)
+        ttk.Button(buttons, text="Delete",
+                   command=self._delete_saved).grid(row=0, column=3, padx=2)
+        ttk.Button(buttons, text="Close", command=window.destroy).grid(
+            row=0, column=4, padx=(24, 0))
+
+        tree.bind("<<TreeviewSelect>>", lambda _event: self._show_saved_detail())
+        tree.bind("<Double-1>",
+                  lambda _event: self._go_to_saved(self._selected_saved()))
+
+        def forget(event=None):
+            if event is None or event.widget is window:
+                self._saved_window = None
+                self._saved_tree = None
+        window.bind("<Destroy>", forget)
+        self._refresh_saved_positions()
+
+    def _selected_saved(self) -> str:
+        tree = self._saved_tree
+        if tree is None or not tree.winfo_exists():
+            return ""
+        selected = tree.selection()
+        return selected[0] if selected else ""
+
+    def _show_saved_detail(self) -> None:
+        """Where the selected saved position will send each actuator."""
+        if self._saved_tree is None:
+            return
+        position = self.platform.saved_positions.get(self._selected_saved())
+        if position is None:
+            self._saved_detail_var.set("Select a position to see where it goes.")
+            return
+        try:
+            target = self.platform.saved_position_target(position)
+        except PlatformError as exc:
+            self._saved_detail_var.set(str(exc))
+            return
+        preview = self.platform.preview(target)
+        lines = [f"Goes to:  {target.describe()}",
+                 "          " + "   ".join(f"{n} {mm:+.4f} mm"
+                                           for n, mm in preview.items())]
+        o = position.orientation
+        if (abs(target.focus_mm - o.focus_mm) > 1e-4
+                or abs(target.tip_deg - o.tip_deg) > 1e-6
+                or abs(target.tilt_deg - o.tilt_deg) > 1e-6):
+            lines.append("The zero has been set again since this was saved. It "
+                         "still goes to the same physical place; the numbers "
+                         "above are measured from the new zero.")
+        if position.note:
+            lines.append(f"Note:     {position.note}")
+        self._saved_detail_var.set("\n".join(lines))
+
+    def _rename_saved(self) -> None:
+        name = self._selected_saved()
+        if not name:
+            messagebox.showinfo("Nothing selected", "Select a position first.",
+                                parent=self._saved_window)
+            return
+        from tkinter import simpledialog
+        new = simpledialog.askstring("Rename", f"New name for {name!r}:",
+                                     initialvalue=name, parent=self._saved_window)
+        if not new or new.strip() == name:
+            return
+        try:
+            self.platform.saved_positions.rename(name, new)
+        except (KeyError, ValueError) as exc:
+            messagebox.showerror("Not renamed", str(exc), parent=self._saved_window)
+            return
+        self.log(f"Saved position {name!r} renamed to {new.strip()!r}.")
+        self._refresh_saved_positions()
+
+    def _delete_saved(self) -> None:
+        name = self._selected_saved()
+        if not name:
+            messagebox.showinfo("Nothing selected", "Select a position first.",
+                                parent=self._saved_window)
+            return
+        if not messagebox.askyesno("Delete?", f"Delete the saved position {name!r}?",
+                                   parent=self._saved_window):
+            return
+        self.platform.saved_positions.delete(name)
+        self.log(f"Saved position {name!r} deleted.")
+        self._refresh_saved_positions()
+
+    # -------------------------------------------------------- supply scale
+
+    def on_set_supply_scale(self) -> None:
+        """Turn the supply column from raw numbers into volts.
+
+        The drive reports its supply in its own units. Tell it once what the
+        supply is really at (MacTalk shows it, or use a meter) and every
+        reading after that is shown in volts, scaled from that one pair.
+        """
+        if self._supply_window is not None and self._supply_window.winfo_exists():
+            self._supply_window.lift()
+            return
+        window = tk.Toplevel(self.root)
+        self._supply_window = window
+        window.title("Supply voltage")
+        window.transient(self.root)
+        window.resizable(False, False)
+
+        tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=440,
+                 text=("The drives report their supply in their own units, "
+                       "so the supply column says \"raw\" until it is told "
+                       "what those units mean. With the supply on, enter the "
+                       "voltage it is at (MacTalk shows it, or use a meter) "
+                       "and press Record. Each motor's reading right now is "
+                       "stored beside that voltage, and from then on the "
+                       "column shows volts.")).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 8))
+
+        readings_var = tk.StringVar(value="")
+        ttk.Label(window, textvariable=readings_var, justify="left",
+                  font=("TkFixedFont", 10)).grid(row=1, column=0, columnspan=3,
+                                                 sticky="w", padx=12)
+
+        def current_raw() -> dict:
+            state = self._last_state
+            if state is None:
+                return {}
+            return {m.name: m.bus_voltage for m in state.motors
+                    if not m.comms_error and m.bus_voltage}
+
+        def show() -> None:
+            raw = current_raw()
+            lines = []
+            for actuator in self.cfg.actuators:
+                reading = raw.get(actuator.name)
+                if reading is None:
+                    lines.append(f"{actuator.name:<6} not read")
+                    continue
+                line = f"{actuator.name:<6} reads {reading:>6} raw"
+                if actuator.supply_raw_at_nominal:
+                    volts = reading * actuator.supply_nominal_v / actuator.supply_raw_at_nominal
+                    line += (f"  = {volts:.1f} V  (recorded {actuator.supply_raw_at_nominal}"
+                             f" = {actuator.supply_nominal_v:g} V)")
+                lines.append(line)
+            readings_var.set("\n".join(lines))
+        show()
+
+        form = ttk.Frame(window)
+        form.grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(10, 4))
+        ttk.Label(form, text="Supply is at (V):").grid(row=0, column=0, padx=(0, 4))
+        volts_var = tk.StringVar(value="")
+        ttk.Entry(form, textvariable=volts_var, width=10).grid(row=0, column=1)
+        status_var = tk.StringVar(value="")
+        status = ttk.Label(window, textvariable=status_var, foreground=COLOR_BAD)
+        status.grid(row=3, column=0, columnspan=3, sticky="w", padx=12)
+
+        def record() -> None:
+            try:
+                volts = float(volts_var.get())
+            except ValueError:
+                status.configure(foreground=COLOR_BAD)
+                status_var.set("Enter the voltage as a number, e.g. 48.")
+                return
+            if not 5.0 <= volts <= 100.0:
+                status.configure(foreground=COLOR_BAD)
+                status_var.set("That is outside what these drives run on (5 to 100 V).")
+                return
+            raw = current_raw()
+            if not raw:
+                status.configure(foreground=COLOR_BAD)
+                status_var.set("No motor has reported its supply yet. Connect first.")
+                return
+            done = []
+            for actuator in self.cfg.actuators:
+                if actuator.name in raw:
+                    actuator.supply_nominal_v = volts
+                    actuator.supply_raw_at_nominal = int(raw[actuator.name])
+                    done.append(f"{actuator.name} {raw[actuator.name]} raw")
+            try:
+                path = save_config(self.cfg, self.config_path)
+            except Exception as exc:  # noqa: BLE001 -- reported to the operator
+                status.configure(foreground=COLOR_BAD)
+                status_var.set(f"Recorded for this session, but not saved: {exc}")
+                return
+            self.log(f"Supply scale recorded at {volts:g} V: {', '.join(done)}. "
+                     f"Saved to {path}.")
+            status.configure(foreground=COLOR_OK)
+            status_var.set(f"Recorded at {volts:g} V and saved.")
+            show()
+
+        buttons = ttk.Frame(window)
+        buttons.grid(row=4, column=0, columnspan=3, sticky="e", padx=12, pady=(6, 12))
+        ttk.Button(buttons, text="Record", command=record).grid(row=0, column=0, padx=4)
+        ttk.Button(buttons, text="Close", command=window.destroy).grid(row=0, column=1)
+
+        def forget(event=None):
+            if event is None or event.widget is window:
+                self._supply_window = None
+        window.bind("<Destroy>", forget)
+
     def _move_with_confirmation(self, target: Orientation, kind: str,
                                 note: str, reason: str) -> None:
         """The one path every absolute move takes: check, show, confirm, go.
@@ -2717,7 +3216,8 @@ class MotorApp:
             self.platform.move_to_orientation(target, kind=kind, note=note)
             self.log_threadsafe("Move complete.")
 
-        self.run_async("Move" if kind == "move" else "Go back", work)
+        self.run_async({"move": "Move", "go-back": "Go back",
+                        "saved position": f"Go to {note}"}.get(kind, "Move"), work)
 
     # ----------------------------------------------------------------- misc
 

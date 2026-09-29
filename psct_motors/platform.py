@@ -40,6 +40,7 @@ from .config import PlatformConfig, load_config, save_config
 from .history import MoveRecord, PositionHistory
 from .jvl_motor import BrakeState, JVLMotor, MotorFault, MotorStatus
 from .kinematics import Orientation, ThreePointPlatform, platform_from_config
+from .saved_positions import SavedPosition, SavedPositions, make_saved_position
 from .transport import ModbusError
 
 
@@ -273,7 +274,8 @@ class FocalPlanePlatform:
                  config_path: Optional[str] = None,
                  history_path: Optional[str] = None,
                  on_history_change: Optional[Callable[[], None]] = None,
-                 use_real_brakes: bool = False):
+                 use_real_brakes: bool = False,
+                 saved_positions_path: Optional[str] = None):
         self.cfg = cfg or load_config(config_path)
         self.cfg.validate()
         self.config_path = config_path
@@ -295,6 +297,10 @@ class FocalPlanePlatform:
         self.history = PositionHistory(path=history_path or None,
                                        on_change=on_history_change,
                                        logger=self._log)
+        #: Named positions ("Default", "Window open" ...). Written to
+        #: `saved_positions_path` when one is given, like the history.
+        self.saved_positions = SavedPositions(path=saved_positions_path or None,
+                                              logger=self._log)
         #: Said once, not on every move: there is no healthy supply reading to
         #: compare against. Repeating it every time would train people to
         #: ignore it.
@@ -923,6 +929,50 @@ class FocalPlanePlatform:
             record.before, wait=wait, kind="go-back",
             note=f"back to where it was before the {record.kind} at {record.when}")
 
+    # ------------------------------------------------------ saved positions
+
+    def save_position(self, name: str, note: str = "") -> tuple:
+        """Remember where the focal plane is now, under `name`.
+
+        Returns (the saved position, whether it replaced one of that name).
+        Reads every actuator's encoder: a saved position is somewhere the
+        plane has actually been, never a number somebody typed.
+        """
+        self._require_connected()
+        counts = {m.name: m.get_position_counts() for m in self.motors}
+        mm = {m.name: m.cfg.counts_to_mm(counts[m.name]) for m in self.motors}
+        orientation = self.geometry.orientation_from_actuators(
+            [mm[m.name] for m in self.motors])
+        position = make_saved_position(name, orientation, counts, mm, note)
+        replaced = self.saved_positions.put(position)
+        self._log(f"Saved position {position.name!r}: {orientation.describe()}")
+        return position, replaced
+
+    def saved_position_target(self, position: SavedPosition) -> Orientation:
+        """Where going to `position` means, measured from today's zero.
+
+        Worked out from the stored encoder counts, so the answer is the same
+        physical place even if the zero has been set again since it was saved.
+        """
+        missing = [m.name for m in self.motors
+                   if m.name not in position.actuator_counts]
+        if missing:
+            raise PlatformError(
+                f"Saved position {position.name!r} has no reading for "
+                f"{', '.join(missing)}, so it cannot be gone back to safely.")
+        return self.geometry.orientation_from_actuators(
+            [m.cfg.counts_to_mm(position.actuator_counts[m.name])
+             for m in self.motors])
+
+    def go_to_saved_position(self, name: str, wait: bool = True) -> PlatformState:
+        """An ordinary checked move to a saved position."""
+        position = self.saved_positions.get(name)
+        if position is None:
+            raise PlatformError(f"There is no saved position called {name!r}.")
+        return self.move_to_orientation(
+            self.saved_position_target(position), wait=wait,
+            kind="saved position", note=position.name)
+
     def move_to_polar_tilt(self, focus_mm: float, total_tilt_deg: float,
                            azimuth_deg: float, wait: bool = True) -> PlatformState:
         """Absolute move expressed as 'tilt this much, uphill towards there'."""
@@ -1091,8 +1141,9 @@ class FocalPlanePlatform:
             self._log(
                 "Note: no healthy supply reading has been recorded for "
                 + ", ".join(unknown)
-                + ", so a failed supply cannot be detected. Run `cli supply` "
-                "with the supply on to record one. Until then a motor that "
+                + ", so a failed supply cannot be detected. Record one with the "
+                "supply on: Tools -> Supply voltage in the GUI (or click a supply "
+                "reading), or `cli supply`. Until then a motor that "
                 "silently ignores its targets will look like a software fault."
             )
 

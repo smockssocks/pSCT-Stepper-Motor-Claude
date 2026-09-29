@@ -182,12 +182,28 @@ class TestGui(unittest.TestCase):
         self.assertIsNone(self.app._tilt_window)
         self.app.on_open_tilt()
         self.pump(0.3)
+        # Password first; the controls only open with the right one.
+        self.assertIsNone(self.app._tilt_window)
+        self.assertTrue(self.app._password_window.winfo_exists())
+        self.assertFalse(self.app._submit_tilt_password("wrong"))
+        self.assertIsNone(self.app._tilt_window)
+        self.assertTrue(self.app._submit_tilt_password("11328pixels!"))
+        self.pump(0.3)
         self.assertTrue(self.app._tilt_window.winfo_exists())
+        self.assertIsNone(self.app._password_window)
         self.app._tilt_window.destroy()
+
+    def test_the_password_is_not_in_the_source(self):
+        import inspect
+        from psct_motors import gui
+        self.assertNotIn("11328pixels", inspect.getsource(gui))
+        self.assertTrue(gui.tilt_password_matches("11328pixels!"))
+        self.assertFalse(gui.tilt_password_matches("11328pixels"))
+        self.assertFalse(gui.tilt_password_matches(""))
 
     def test_focal_plane_picture_shows_each_actuator(self):
         self.app._start_polling()
-        self.app.on_open_tilt()
+        self.app._open_tilt_window()
         self.pump(0.3)
         self.app.platform.move_to_orientation(Orientation(1.0, 0.1, -0.05))
         self.pump(0.6)
@@ -203,7 +219,7 @@ class TestGui(unittest.TestCase):
 
     def test_picture_refuses_to_draw_a_stale_plane(self):
         self.app._start_polling()
-        self.app.on_open_tilt()
+        self.app._open_tilt_window()
         self.pump(0.4)
         self.app.platform.motors[1]._transport.set_offline(True)
         self.pump(0.6)
@@ -229,7 +245,7 @@ class TestGui(unittest.TestCase):
         self.assertFalse(any("jog step" in t for t in main))
         self.assertFalse(any("key:" in t for t in main))
 
-        self.app.on_open_tilt()
+        self.app._open_tilt_window()
         self.pump(0.3)
         window = self.app._tilt_window
         inside = texts(window)
@@ -734,6 +750,79 @@ class TestGui(unittest.TestCase):
         self.assertAlmostEqual(self.app.platform.read_orientation().focus_mm,
                                before, places=4)
         self.assertEqual(len(self.app.platform.history), 0)
+
+    # ---- saved positions -----------------------------------------------------
+
+    def test_a_position_can_be_saved_and_gone_back_to(self):
+        self.app._start_polling()
+        self.pump(0.3)
+        start = self.app.platform.read_orientation().focus_mm
+        self.app.platform.move_to_orientation(Orientation(start + 1.5, 0.0, 0.0))
+        self.pump(0.4)
+        self.assertTrue(self._answer(True, lambda: self.app._save_position(
+            "Window open", "after the window swap")))
+        self.assertEqual(self.app.saved_combo.cget("values"), ("Window open",))
+        self.assertEqual(self.app.saved_choice_var.get(), "Window open")
+
+        self.app.platform.move_to_orientation(Orientation(start - 2.0, 0.0, 0.0))
+        self.pump(0.4)
+        self._answer(True, lambda: self.app._go_to_saved("Window open"))
+        self.pump(3.0)
+        self.assertAlmostEqual(self.app.platform.read_orientation().focus_mm,
+                               start + 1.5, places=2)
+        self.assertEqual(self.app.platform.history.last().kind, "saved position")
+        self.assertEqual(self.app.platform.history.last().note, "Window open")
+
+    def test_the_saved_positions_window_lists_and_explains_them(self):
+        self.app._start_polling()
+        self.pump(0.3)
+        self._answer(True, lambda: self.app._save_position("Default"))
+        self.app.on_open_saved_positions()
+        self.pump(0.2)
+        tree = self.app._saved_tree
+        self.assertEqual(tree.get_children(), ("Default",))
+        tree.selection_set("Default")
+        self.pump(0.1)
+        self.assertIn("Goes to:", self.app._saved_detail_var.get())
+        self.assertIn("Top", self.app._saved_detail_var.get())
+        self._answer(True, self.app._delete_saved)
+        self.assertEqual(tree.get_children(), ())
+        self.assertEqual(self.app.saved_choice_var.get(), "")
+        self.app._saved_window.destroy()
+
+    def test_replacing_a_saved_position_asks_first(self):
+        start = self.app.platform.read_orientation().focus_mm
+        self._answer(True, lambda: self.app._save_position("Default"))
+        self.app.platform.move_to_orientation(Orientation(start + 1.0, 0.0, 0.0))
+        self.assertFalse(self._answer(False, lambda: self.app._save_position("default")))
+        self.assertAlmostEqual(
+            self.app.platform.saved_positions.get("Default").orientation.focus_mm,
+            start, places=3)
+        self.assertTrue(self._answer(True, lambda: self.app._save_position("default")))
+        self.assertEqual(len(self.app.platform.saved_positions), 1)
+        self.assertAlmostEqual(
+            self.app.platform.saved_positions.get("Default").orientation.focus_mm,
+            start + 1.0, places=3)
+
+    # ---- supply scale ----------------------------------------------------------
+
+    def test_the_supply_dialog_turns_raw_into_volts(self):
+        self.app._start_polling()
+        self.pump(0.5)
+        self.assertIn("raw", self.app.rows["Top"].supply_var.get())
+        self.app.on_set_supply_scale()
+        self.pump(0.1)
+        window = self.app._supply_window
+        entry = [w for f in window.winfo_children() if isinstance(f, ttk.Frame)
+                 for w in f.winfo_children() if isinstance(w, ttk.Entry)][0]
+        entry.delete(0, "end")
+        entry.insert(0, "48")
+        buttons = [w for f in window.winfo_children() if isinstance(f, ttk.Frame)
+                   for w in f.winfo_children() if isinstance(w, ttk.Button)]
+        [b for b in buttons if b.cget("text") == "Record"][0].invoke()
+        self.pump(1.5)
+        self.assertEqual(self.app.rows["Top"].supply_var.get(), "48.0 V")
+        window.destroy()
 
     # ---- layout --------------------------------------------------------------
 

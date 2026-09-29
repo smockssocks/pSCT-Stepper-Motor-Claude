@@ -18,3 +18,9 @@ logs/
 # Where the focal plane has been: written by the application, one line per
 # move, beside the configuration. Belongs to the machine, not the repository.
 config/positions.jsonl
+
+# Named positions ("Default", "Window open"), saved from the GUI or
+# `cli positions save`. Also per machine: they are encoder counts on these
+# particular motors.
+config/saved_positions.json
+config/saved_positions.json.tmp

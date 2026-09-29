@@ -77,11 +77,14 @@ def make_platform(args) -> FocalPlanePlatform:
         cfg.poll_interval_s = args.poll
         cfg.idle_poll_interval_s = max(args.poll, cfg.idle_poll_interval_s)
     from .history import default_history_path
-    # The same position record the GUI keeps, so a move made from the command
-    # line shows up in the window's log and vice versa.
+    from .saved_positions import default_saved_positions_path
+    # The same position record and saved positions the GUI keeps, so a move
+    # made from the command line shows up in the window's log and vice versa.
     platform = FocalPlanePlatform(cfg=cfg, simulate=args.simulate, logger=out,
                                   config_path=args.config,
                                   history_path=default_history_path(args.config),
+                                  saved_positions_path=default_saved_positions_path(
+                                      args.config),
                                   use_real_brakes=getattr(args, "real_brakes", False))
     if platform.is_mixed:
         out("BENCH MODE: " + ", ".join(platform.simulated_names)
@@ -605,6 +608,74 @@ def cmd_go_back(args) -> int:
         return 0
     except PlatformError as exc:
         out(f"Move failed: {exc}")
+        return 1
+    finally:
+        platform.disconnect()
+
+
+def cmd_positions(args) -> int:
+    """Named positions: list them, save the current one, or go to one."""
+    from .saved_positions import SavedPositions, default_saved_positions_path
+    action = args.action
+    if action == "list":
+        path = default_saved_positions_path(args.config)
+        saved = SavedPositions(path=path, logger=out).all()
+        rule("Saved positions")
+        out(f"  {path}")
+        if not saved:
+            out("  None yet. Save one with `positions save NAME`, or from the "
+                "GUI (Motion -> Save current position).")
+            return 0
+        out("")
+        for p in saved:
+            out(f"  {p.name:<20} {p.orientation.describe()}")
+            out(f"  {'':<20} saved {p.when}"
+                + (f" -- {p.note}" if p.note else ""))
+        return 0
+
+    if not args.name:
+        out(f"`positions {action}` needs a name.")
+        return 1
+    platform = make_platform(args)
+    try:
+        platform.connect()
+    except PlatformError as exc:
+        out(str(exc))
+        return 1
+    try:
+        if action == "save":
+            existing = platform.saved_positions.get(args.name)
+            if existing and not confirm(
+                    f"Replace the saved position {existing.name!r}?", args.yes):
+                return 1
+            position, _ = platform.save_position(args.name, note=args.note or "")
+            out(f"Saved {position.name!r}: {position.orientation.describe()}")
+            return 0
+        if action == "delete":
+            if not platform.saved_positions.delete(args.name):
+                out(f"There is no saved position called {args.name!r}.")
+                return 1
+            out(f"Deleted {args.name!r}.")
+            return 0
+        # go
+        position = platform.saved_positions.get(args.name)
+        if position is None:
+            out(f"There is no saved position called {args.name!r}. "
+                f"Saved: {', '.join(platform.saved_positions.names()) or 'none'}.")
+            return 1
+        target = platform.saved_position_target(position)
+        current = platform.read_orientation()
+        out(f"Now:    {current.describe()}")
+        out(f"Target: {target.describe()}   ({position.name}, saved {position.when})")
+        platform.check_orientation(target, current=current)
+        if not confirm("Command this move?", args.yes):
+            return 1
+        state = platform.go_to_saved_position(position.name, wait=not args.no_wait)
+        if state.orientation:
+            out(f"Done:   {state.orientation.describe()}")
+        return 0
+    except PlatformError as exc:
+        out(str(exc))
         return 1
     finally:
         platform.disconnect()
@@ -1598,6 +1669,8 @@ commissioning order
   status / move        normal operation
   history / go-back    where the focal plane has been, and back to the
                        position before the last move
+  positions            named positions ("Default", "Window open"):
+                       list, save NAME, go NAME, delete NAME
 
 one motor on a bench
 --------------------
@@ -1696,6 +1769,14 @@ one motor on a bench
                    help="how many moves to show (default 30)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_history)
+
+    p = command("positions", help="named positions: list, save, go to, delete")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=("list", "save", "go", "delete"))
+    p.add_argument("name", nargs="?", help='e.g. "Window open"')
+    p.add_argument("--note", help="a note to save with the position")
+    p.add_argument("--no-wait", action="store_true")
+    p.set_defaults(func=cmd_positions)
 
     p = command("jog", help="move a single actuator (commissioning)")
     p.add_argument("--motor", required=True)
