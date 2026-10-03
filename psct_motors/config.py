@@ -510,6 +510,41 @@ class PlatformConfig:
     #: Velocity floor when synchronising; below this the motor may stall.
     min_velocity_raw: int = 20
 
+    # --- keeping the three together during a move ---------------------------
+    #: Speed scaling makes the three arrive together on paper. A motor under
+    #: more load can still fall behind, and the plate then tilts on its way.
+    #: So the move is watched: when one actuator gets this far ahead of where
+    #: the slowest one says the plate should be, it is held until the slowest
+    #: catches up, then sent on a little slower. 0.05 mm across a plate about
+    #: a metre wide is around 20 arcseconds.
+    sync_pause_mm: float = 0.05
+    #: Out of step by this much, the move is stopped and the brakes applied:
+    #: holding and waiting has not kept them together, so something is wrong.
+    sync_abort_mm: float = 0.5
+    #: How long the others are held waiting for one that is behind before the
+    #: move is stopped and the brakes applied.
+    sync_max_wait_s: float = 5.0
+
+    # --- the big-error stop --------------------------------------------------
+    #: Any actuator this far from where it was told to be -- while moving
+    #: (following error) or after arriving -- stops the move and applies the
+    #: brakes. A stepper that falls more than a step or two behind its command
+    #: (12.7 um a full step here) has slipped, so 0.1 mm is never normal.
+    max_position_error_mm: float = 0.1
+
+    # --- settling at the target ---------------------------------------------
+    #: After a move, each motor's encoder is compared with its target, and one
+    #: that is off by more than `settle_deadband_counts` is sent the
+    #: difference, up to `settle_max_tries` times. Under load a stepper sits a
+    #: little behind its command (231 counts, 1.4 um, on the bench motor);
+    #: asking for that much more puts the shaft where it was meant to be.
+    settle_enabled: bool = True
+    #: 50 counts is 0.3 um. The motor takes commands in 1/409600 of a turn
+    #: (2048 per full step, about 6 nm here), but how finely it actually
+    #: lands is not that fine; corrections smaller than this are not tried.
+    settle_deadband_counts: int = 50
+    settle_max_tries: int = 3
+
     #: Seconds between live status polls.
     #: How fast a *simulated* actuator travels at its configured full
     #: velocity, in millimetres per second.
@@ -580,9 +615,9 @@ class PlatformConfig:
     gauge_reference: str = "zero"
 
     def validate(self) -> None:
-        if self.gauge_reference not in ("zero", "m1", "m2"):
+        if self.gauge_reference not in ("zero", "m1", "m2", "top", "bottom"):
             raise ValueError(
-                f"gauge_reference must be 'zero', 'm1' or 'm2', got "
+                f"gauge_reference must be 'zero', 'm1', 'm2', 'top' or 'bottom', got "
                 f"{self.gauge_reference!r}")
         for name in ("zero_to_m1_mm", "zero_to_m2_mm"):
             value = getattr(self, name)
@@ -619,6 +654,15 @@ class PlatformConfig:
             raise ValueError("idle_poll_interval_s must be positive")
         if self.slow_poll_every < 1:
             raise ValueError("slow_poll_every must be at least 1")
+        if not 0 < self.sync_pause_mm < self.sync_abort_mm:
+            raise ValueError("sync_pause_mm must be positive and below sync_abort_mm")
+        if self.sync_max_wait_s <= 0:
+            raise ValueError("sync_max_wait_s must be positive")
+        if self.max_position_error_mm <= 0:
+            raise ValueError("max_position_error_mm must be positive")
+        if self.settle_deadband_counts < 1 or self.settle_max_tries < 0:
+            raise ValueError("settle_deadband_counts must be at least 1 and "
+                             "settle_max_tries at least 0")
         if self.poll_interval_s <= 0:
             raise ValueError("poll_interval_s must be positive")
 

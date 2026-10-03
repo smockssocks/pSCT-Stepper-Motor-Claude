@@ -814,6 +814,7 @@ class MotorApp:
         self._brake_window_read = None
         self._load_rows = {}
         self._limit_entries = ()
+        self._stops_unlocked = False
         self._password_action = None
         self.plane_view = None
 
@@ -860,6 +861,8 @@ class MotorApp:
         "zero": "from zero",
         "m1": "to M1 (primary)",
         "m2": "to M2 (secondary)",
+        "top": "from top stop",
+        "bottom": "from bottom stop",
     }
 
     def _build_gauge(self, parent) -> None:
@@ -902,6 +905,10 @@ class MotorApp:
         self.gauge.set_limits(limits.min_focus_mm, limits.max_focus_mm,
                               hard_stop_low_mm=limits.hard_stop_low_mm,
                               hard_stop_high_mm=limits.hard_stop_high_mm)
+        # Measuring from an end of travel depends on these, so the title has
+        # to follow them.
+        if getattr(self, "gauge_frame", None) is not None:
+            self._apply_gauge_reference(self.gauge.reference)
 
     def _apply_gauge_reference(self, reference: str) -> None:
         """Point the gauge at a reference and retitle the frame to match."""
@@ -910,7 +917,7 @@ class MotorApp:
                                  zero_to_m2_mm=self.cfg.zero_to_m2_mm)
         title = self.gauge.reference_title
         if not self.gauge.reference_available:
-            title += "  (distance not set)"
+            title += f"  ({self.gauge.missing_text})"
         self.gauge_frame.configure(text=title)
         choice = self.REFERENCE_CHOICES[reference]
         if self.gauge_reference_var.get() != choice:
@@ -925,6 +932,12 @@ class MotorApp:
         self.cfg.gauge_reference = reference
         self._apply_gauge_reference(reference)
         if not self.gauge.reference_available:
+            if reference in ("top", "bottom"):
+                which = "upper" if reference == "top" else "lower"
+                self.log(f"The gauge cannot measure from the {which} end of "
+                         "travel until it is known: run Tools > Find hard stop, "
+                         "or enter it in Tools > Motion limits.")
+                return
             self.log(f"The gauge cannot show the distance to "
                      f"{reference.upper()} until the distance from zero to "
                      f"{reference.upper()} has been entered. Use the button "
@@ -2032,19 +2045,64 @@ class MotorApp:
 
         # --- what find-stop found, and a one-click way to use it -------------
         row = 1 + len(fields)
-        found = ttk.LabelFrame(window, text="Ends of travel found by Find hard stop")
+        found = ttk.LabelFrame(window, text="Ends of travel (hard stops)")
         found.grid(row=row, column=0, columnspan=3, sticky="ew",
                    padx=12, pady=(10, 4))
 
-        def describe(value, which):
-            if value is None:
-                return f"{which}: not found yet"
-            return f"{which}: {value:+.4f} mm"
+        # Found by Find hard stop, or entered here behind the password: they
+        # are what the soft limits are checked against, so a wrong one is a
+        # safety problem, not a typo.
+        def shown(value):
+            return "" if value is None else f"{value:+.4f}"
 
-        ttk.Label(found, text=describe(limits.hard_stop_low_mm, "lower")).grid(
-            row=0, column=0, sticky="w", padx=8, pady=(6, 0))
-        ttk.Label(found, text=describe(limits.hard_stop_high_mm, "upper")).grid(
-            row=1, column=0, sticky="w", padx=8)
+        self.stop_low_var = tk.StringVar(value=shown(limits.hard_stop_low_mm))
+        self.stop_high_var = tk.StringVar(value=shown(limits.hard_stop_high_mm))
+        stop_entries = []
+        for r, (text, var) in enumerate((("lower end of travel (mm)", self.stop_low_var),
+                                         ("upper end of travel (mm)", self.stop_high_var))):
+            ttk.Label(found, text=text).grid(row=r, column=0, sticky="e", padx=8,
+                                            pady=(6 if r == 0 else 2, 0))
+            entry = ttk.Entry(found, textvariable=var, width=12, state="disabled")
+            entry.grid(row=r, column=1, sticky="w", pady=(6 if r == 0 else 2, 0))
+            stop_entries.append(entry)
+        self._stop_entries = stop_entries
+        stops_note = tk.StringVar(value="blank = not known. Changing these "
+                                        "needs the password.")
+        ttk.Label(found, textvariable=stops_note, foreground="#777",
+                  font=("TkDefaultFont", 8)).grid(row=0, column=2, rowspan=2,
+                                                  sticky="w", padx=8)
+
+        def unlock_stops() -> None:
+            for entry in stop_entries:
+                entry.configure(state="normal")
+            stops_note.set("Unlocked: edit, then Use for this session or "
+                           "Use and save.")
+            self._stops_unlocked = True
+        self._stops_unlocked = False
+        self._unlock_stops = unlock_stops
+        ttk.Button(found, text="Change ends of travel...",
+                   command=lambda: self._ask_password(
+                       "Changing the ends of travel needs the password.",
+                       unlock_stops)).grid(row=3, column=0, sticky="w",
+                                           padx=8, pady=(4, 0))
+
+        def read_stops():
+            """(low, high) from the boxes; None for blank. Raises ValueError."""
+            out = []
+            for label, var in (("Lower end of travel", self.stop_low_var),
+                               ("Upper end of travel", self.stop_high_var)):
+                text = var.get().strip()
+                if not text:
+                    out.append(None)
+                    continue
+                try:
+                    out.append(float(text))
+                except ValueError:
+                    raise ValueError(f"{label} must be a number, or blank.")
+            low, high = out
+            if low is not None and high is not None and not low < high:
+                raise ValueError("The lower end of travel has to be below the upper.")
+            return low, high
 
         margin_var = tk.StringVar(value="1.0")
         ttk.Label(found, text="keep this much margin (mm):").grid(
@@ -2063,18 +2121,22 @@ class MotorApp:
                 messagebox.showerror("Check the number",
                                      "Margin cannot be negative.", parent=window)
                 return
-            if limits.hard_stop_low_mm is None and limits.hard_stop_high_mm is None:
+            try:
+                low, high = read_stops()
+            except ValueError as exc:
+                messagebox.showerror("Check the number", str(exc), parent=window)
+                return
+            if low is None and high is None:
                 messagebox.showwarning(
-                    "Nothing found yet",
-                    "Run Tools > Find hard stop in each direction first.",
+                    "Nothing known yet",
+                    "Run Tools > Find hard stop in each direction first, or "
+                    "enter the ends of travel.",
                     parent=window)
                 return
-            if limits.hard_stop_low_mm is not None:
-                entries["min_focus_mm"].set(
-                    f"{limits.hard_stop_low_mm + margin:g}")
-            if limits.hard_stop_high_mm is not None:
-                entries["max_focus_mm"].set(
-                    f"{limits.hard_stop_high_mm - margin:g}")
+            if low is not None:
+                entries["min_focus_mm"].set(f"{low + margin:g}")
+            if high is not None:
+                entries["max_focus_mm"].set(f"{high - margin:g}")
 
         ttk.Button(found, text="Set focus limits from these",
                    command=from_stops).grid(row=2, column=2, padx=8, pady=4)
@@ -2089,6 +2151,16 @@ class MotorApp:
                                          f"{label} must be a number.",
                                          parent=window)
                     return
+
+            if self._stops_unlocked:
+                try:
+                    values["hard_stop_low_mm"], values["hard_stop_high_mm"] = read_stops()
+                except ValueError as exc:
+                    messagebox.showerror("Check the numbers", str(exc), parent=window)
+                    return
+            stops_changed = self._stops_unlocked and (
+                values["hard_stop_low_mm"] != limits.hard_stop_low_mm
+                or values["hard_stop_high_mm"] != limits.hard_stop_high_mm)
 
             # Validate on a copy, so a rejected edit cannot leave the live
             # limits half-applied.
@@ -2109,6 +2181,12 @@ class MotorApp:
                      f"{limits.min_focus_mm:+g} to {limits.max_focus_mm:+g} mm, "
                      f"max tilt {limits.max_tilt_deg:g} deg, max step "
                      f"{limits.max_step_mm:g} mm.")
+            if stops_changed:
+                def say(v):
+                    return "not known" if v is None else f"{v:+.4f} mm"
+                self.log(f"Ends of travel changed by hand: lower "
+                         f"{say(limits.hard_stop_low_mm)}, upper "
+                         f"{say(limits.hard_stop_high_mm)}.")
             if persist:
                 path = save_config(self.cfg, self.config_path)
                 self.log(f"Saved to {path}")

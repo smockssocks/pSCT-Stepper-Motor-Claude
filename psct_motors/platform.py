@@ -270,6 +270,65 @@ class PlatformState:
         }
 
 
+class _InStep:
+    """Where each actuator is along its own move, for keeping them together.
+
+    Each actuator's progress is how far it has gone as a fraction of its own
+    move. If the plate is to stay on the straight line between the two
+    orientations, those fractions must stay equal; the smallest says where the
+    plate should be, and anything further along is "ahead" by that much.
+    """
+
+    #: Moves shorter than this have no meaningful progress to compare.
+    MIN_MOVE_MM = 0.005
+
+    def __init__(self, motors, starts, targets, velocities):
+        self.names = [m.name for m in motors]
+        self.index = {name: i for i, name in enumerate(self.names)}
+        self.starts = starts
+        self.targets = targets
+        self.velocities = velocities
+        #: name -> when it was held.
+        self.paused: Dict[str, float] = {}
+        #: Motors whose move has finished. They count as all the way there:
+        #: one with a standing lag would otherwise look behind for ever, and
+        #: the others would be held waiting for it. Settling deals with it.
+        self.finished = set()
+        #: Sent on again in this round of checks.
+        self.resumed = set()
+
+    def _moving(self):
+        return [i for i in range(len(self.names))
+                if abs(self.targets[i] - self.starts[i]) > self.MIN_MOVE_MM]
+
+    def _progress(self, positions):
+        out = {}
+        for i in self._moving():
+            if self.names[i] in self.finished:
+                out[i] = 1.0
+                continue
+            delta = self.targets[i] - self.starts[i]
+            out[i] = min(1.0, max(0.0, (positions[i] - self.starts[i]) / delta))
+        return out
+
+    def leads(self, positions) -> Dict[str, float]:
+        """How far, in mm, each actuator is ahead of the slowest."""
+        progress = self._progress(positions)
+        if len(progress) < 2:
+            return {}
+        slowest = min(progress.values())
+        return {self.names[i]: (p - slowest) * abs(self.targets[i] - self.starts[i])
+                for i, p in progress.items()}
+
+    def slowest(self, positions) -> str:
+        progress = self._progress(positions)
+        return self.names[min(progress, key=progress.get)] if progress else ""
+
+    def arrived(self, motor, positions) -> bool:
+        i = self.index[motor.name]
+        return abs(positions[i] - self.targets[i]) <= self.MIN_MOVE_MM
+
+
 class FocalPlanePlatform:
     """Coordinated control of the three focal-plane actuators."""
 
@@ -922,14 +981,16 @@ class FocalPlanePlatform:
             commanded = False
             try:
                 self._prepare_for_motion()
-                self._apply_synchronised_velocities(targets)
+                starts = [m.get_position_mm() for m in self.motors]
+                velocities = self._apply_synchronised_velocities(targets)
 
                 for motor, target in zip(self.motors, targets):
                     motor.command_position_mm(target)
                     commanded = True
 
                 if wait:
-                    self._wait_for_all()
+                    self._wait_for_all(targets, starts, velocities)
+                    self._settle(list(zip(self.motors, targets)))
             except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised
                 outcome = "failed: " + str(exc).splitlines()[0][:160]
                 raise
@@ -1114,6 +1175,7 @@ class FocalPlanePlatform:
             for other in self.motors:
                 if other.connected:
                     other.ensure_position_mode()
+            self._refuse_if_straining(self.motors)
             self._log(f"{motor.name}: drive on and holding (read back); "
                       "brakes may now be released.")
             self._release_brake_if_controlled(motor)
@@ -1131,7 +1193,9 @@ class FocalPlanePlatform:
                 motor.command_position_mm(target)
                 commanded = True
                 self._log(f"{motor.name}: single-axis move to {target:.4f} mm.")
-                if wait and not motor.wait_for_in_position():
+                if wait and motor.wait_for_in_position():
+                    self._settle([(motor, target)])
+                elif wait:
                     # wait_for_in_position has already halted this axis.
                     outcome = "failed: timed out"
                     raise PlatformError(
@@ -1180,9 +1244,35 @@ class FocalPlanePlatform:
         self._check_drive_power()
         for motor in self.motors:
             motor.ensure_position_mode()
+        self._refuse_if_straining(self.motors)
         for motor in self.motors:
             self._release_brake_if_controlled(motor)
         self._release_external_brakes()
+
+    def _refuse_if_straining(self, motors) -> None:
+        """No move starts while a motor is already over its torque limit.
+
+        A motor working that hard before it has been asked to go anywhere is
+        pushing against something. Moving would force it, and the limit check
+        during a move only stops it after it has pushed for a few readings.
+        Checked with the drives on and holding, before any brake comes off.
+        """
+        straining = []
+        for motor in motors:
+            if not motor.connected or not motor.cfg.stall_protection:
+                continue
+            percent = motor.get_torque_percent()
+            if percent is not None and percent >= motor.cfg.stall_torque_percent:
+                straining.append(f"{motor.name} at {percent:.0f}% "
+                                 f"(limit {motor.cfg.stall_torque_percent:.0f}%)")
+        if straining:
+            raise PlatformError(
+                "Not moving: " + ", ".join(straining) + " is already over the "
+                "torque limit while standing still, so something is pushing "
+                "against it. Forcing a move could damage the telescope. Nothing "
+                "was commanded and the brakes were not touched. Find out what "
+                "it is pressing on first (an end stop, an obstruction, a brake "
+                "that is on).")
 
     def _check_drive_power(self) -> None:
         """Refuse to move if a drive's supply has failed.
@@ -1299,7 +1389,7 @@ class FocalPlanePlatform:
             return
         motor.release_brake()
 
-    def _apply_synchronised_velocities(self, targets_mm: Sequence[float]) -> None:
+    def _apply_synchronised_velocities(self, targets_mm: Sequence[float]) -> Dict[str, int]:
         """Scale each axis' speed so all three finish at the same moment.
 
         Without this the shortest of the three moves finishes first, and until
@@ -1307,10 +1397,11 @@ class FocalPlanePlatform:
         pivoting on its ball joints. Scaling by distance keeps the plate on a
         straight line between the two orientations.
         """
+        velocities = {m.name: int(m.cfg.velocity_raw) for m in self.motors}
         if not self.cfg.synchronize_moves:
             for motor in self.motors:
                 motor.set_velocity(motor.cfg.velocity_raw)
-            return
+            return velocities
 
         deltas = [
             abs(target - motor.get_position_mm())
@@ -1318,16 +1409,28 @@ class FocalPlanePlatform:
         ]
         longest = max(deltas)
         if longest <= 0:
-            return
+            return velocities
         for motor, delta in zip(self.motors, deltas):
             scaled = motor.cfg.velocity_raw * (delta / longest)
-            motor.set_velocity(max(self.cfg.min_velocity_raw, int(round(scaled))))
+            velocities[motor.name] = max(self.cfg.min_velocity_raw, int(round(scaled)))
+            motor.set_velocity(velocities[motor.name])
+        return velocities
 
-    def _wait_for_all(self) -> None:
-        """Wait for every axis, then report all stragglers together."""
+    def _wait_for_all(self, targets_mm: Optional[Sequence[float]] = None,
+                      starts_mm: Optional[Sequence[float]] = None,
+                      velocities: Optional[Dict[str, int]] = None) -> None:
+        """Wait for every axis, then report all stragglers together.
+
+        Given where each started and where each is going, it also keeps them
+        together on the way (see `_keep_in_step`).
+        """
         deadline = time.monotonic() + max(m.cfg.move_timeout_s for m in self.motors)
         pending = list(self.motors)
-        while pending and time.monotonic() < deadline:
+        sync = None
+        if targets_mm is not None and starts_mm is not None:
+            sync = _InStep(self.motors, list(starts_mm), list(targets_mm),
+                           dict(velocities or {}))
+        while (pending or (sync and sync.paused)) and time.monotonic() < deadline:
             if self._abort.is_set():
                 raise PlatformError(
                     "Move did not finish: STOP (or EMERGENCY) was used while it "
@@ -1360,6 +1463,18 @@ class FocalPlanePlatform:
                         "read the current orientation before commanding anything "
                         "else."
                     ) from exc
+            if sync is not None:
+                sync.finished = {m.name for m in self.motors
+                                 if m not in still_pending and m.name not in sync.paused}
+                sync.resumed = set()
+                self._keep_in_step(sync)
+                # A held motor reads as arrived -- it is where it was told to
+                # be -- but it is not where it is going; nor is one that was
+                # sent on again just now.
+                for motor in self.motors:
+                    if ((motor.name in sync.paused or motor.name in sync.resumed)
+                            and motor not in still_pending):
+                        still_pending.append(motor)
             if not still_pending:
                 return
             pending = still_pending
@@ -1412,8 +1527,166 @@ class FocalPlanePlatform:
                 f"orientation before continuing."
             )
 
+        try:
+            lag = motor.get_follow_error()
+        except ModbusError:
+            lag = 0
+        limit = self._big_error_counts(motor)
+        if abs(lag) > limit:
+            brakes = self._halt_and_brake(f"{motor.name} fell too far behind")
+            raise PlatformError(
+                f"{motor.name} fell {abs(lag) / motor.cfg.resolved_counts_per_mm:.3f} mm "
+                f"behind where it was being driven (the limit is "
+                f"{self.cfg.max_position_error_mm:g} mm), so it has slipped or is "
+                f"blocked. All three were halted and {brakes}. Read the current "
+                "orientation before continuing.")
+
         if not motor.is_in_position():
             still_pending.append(motor)
+
+    # ------------------------------------------------- staying together
+
+    def _big_error_counts(self, motor: JVLMotor) -> float:
+        return self.cfg.max_position_error_mm * motor.cfg.resolved_counts_per_mm
+
+    def _halt_and_brake(self, reason: str) -> str:
+        """Stop all three, holding, then apply the brakes. Says how that went.
+
+        The drives stay on and holding: with the brakes also on, nothing can
+        drop. Never raises, because it runs on the way to reporting something
+        else.
+        """
+        self._halt_all_quietly(reason)
+        try:
+            results = self.set_all_brakes(engaged=True)
+        except Exception as exc:  # noqa: BLE001 -- reported, not raised
+            results = {"all": str(exc)}
+        failed = {k: v for k, v in results.items() if not str(v).startswith("ok")}
+        if not failed:
+            self._log(f"Stopped and brakes applied: {reason}.")
+            return "the brakes were applied (drives still holding)"
+        detail = "; ".join(f"{k}: {v}" for k, v in failed.items())
+        self._log(f"Stopped ({reason}); the brakes could not be applied: {detail}")
+        return (f"the brakes could NOT be applied ({detail}), so the drives are "
+                "holding it on their own")
+
+    def _keep_in_step(self, sync: "_InStep") -> None:
+        """Hold any actuator that gets ahead, so the plate does not tilt.
+
+        Progress along each actuator's own move is compared. The slowest one
+        says where the plate should be; one more than `sync_pause_mm` ahead of
+        that is held where it is, and sent on again -- a fifth slower -- once
+        the slowest has caught up to half that. Out of step by
+        `sync_abort_mm`, or the others held for `sync_max_wait_s` without the
+        slow one catching up, and the move is stopped with the brakes applied.
+        """
+        cfg = self.cfg
+        positions = [m.get_position_mm() for m in self.motors]
+        leads = sync.leads(positions)
+        if not leads:
+            return
+        worst_name = max(leads, key=leads.get)
+        slowest = sync.slowest(positions)
+        if leads[worst_name] > cfg.sync_abort_mm:
+            load = self._torque_note(slowest)
+            brakes = self._halt_and_brake("the actuators got out of step")
+            raise PlatformError(
+                f"The actuators got out of step: {worst_name} was "
+                f"{leads[worst_name]:.3f} mm ahead of {slowest} (the limit is "
+                f"{cfg.sync_abort_mm:g} mm), which tilts the plate. All three "
+                f"were halted and {brakes}. {slowest} may be under more load "
+                f"or obstructed{load}. Read the current orientation before "
+                "continuing.")
+
+        now = time.monotonic()
+        for motor in self.motors:
+            name = motor.name
+            lead = leads.get(name)
+            if lead is None:
+                continue
+            if name in sync.paused:
+                if lead <= cfg.sync_pause_mm / 2:
+                    sync.velocities[name] = max(
+                        cfg.min_velocity_raw,
+                        int(sync.velocities.get(name, motor.cfg.velocity_raw) * 0.8))
+                    motor.set_velocity(sync.velocities[name])
+                    motor.command_position_mm(sync.targets[sync.index[name]])
+                    del sync.paused[name]
+                    sync.resumed.add(name)
+                    self._log(f"{name}: {slowest} caught up; going on a little slower.")
+                elif now - sync.paused[name] > cfg.sync_max_wait_s:
+                    load = self._torque_note(slowest)
+                    brakes = self._halt_and_brake(f"{slowest} is not keeping up")
+                    raise PlatformError(
+                        f"{slowest} is not keeping up: {name} was held for "
+                        f"{cfg.sync_max_wait_s:g} s waiting for it and it did not "
+                        f"catch up. All three were halted and {brakes}. "
+                        f"{slowest} may be blocked or straining{load}. Read the "
+                        "current orientation before continuing.")
+            elif lead > cfg.sync_pause_mm and not sync.arrived(motor, positions):
+                motor.command_position_counts(motor.get_projected_position_counts())
+                sync.paused[name] = now
+                self._log(f"{name}: {lead:.3f} mm ahead of {slowest}; holding "
+                          "it until the others catch up.")
+
+    def _torque_note(self, name: str) -> str:
+        """", resisting at 62% torque" for the error message, or nothing."""
+        try:
+            percent = self.motor(name).get_torque_percent()
+        except Exception:  # noqa: BLE001 -- extra detail only
+            return ""
+        return "" if percent is None else f" (it was resisting at {percent:.0f}% torque)"
+
+    def _settle(self, pairs) -> None:
+        """Nudge each motor until its encoder is on its target.
+
+        Under load a stepper sits slightly behind its command. Asking for the
+        difference on top puts the shaft where it was meant to be. Tried at
+        most `settle_max_tries` times, for differences bigger than
+        `settle_deadband_counts`; anything still off is reported, not chased.
+        A difference beyond `max_position_error_mm` is not a settling matter:
+        the move is stopped and the brakes applied.
+        """
+        cfg = self.cfg
+        pairs = [(m, cfg_target) for m, cfg_target in pairs
+                 if m.name not in self.copied_names]
+        if not pairs:
+            return
+        start_errors = {}
+        corrections = 0
+        for attempt in range(cfg.settle_max_tries + 1):
+            off = []
+            for motor, target_mm in pairs:
+                target = motor.cfg.mm_to_counts(target_mm)
+                error = target - motor.get_position_counts()
+                start_errors.setdefault(motor.name, error)
+                if abs(error) > self._big_error_counts(motor):
+                    brakes = self._halt_and_brake(f"{motor.name} is far off its target")
+                    raise PlatformError(
+                        f"{motor.name} ended {abs(error) / motor.cfg.resolved_counts_per_mm:.3f} mm "
+                        f"from its target (the limit is {cfg.max_position_error_mm:g} "
+                        f"mm). All three were halted and {brakes}. Read the "
+                        "current orientation before continuing.")
+                if abs(error) > cfg.settle_deadband_counts:
+                    off.append((motor, error))
+            if not off or not cfg.settle_enabled or attempt == cfg.settle_max_tries:
+                break
+            corrections += 1
+            for motor, error in off:
+                motor.command_position_counts(motor.get_target_counts() + error)
+            for motor, _error in off:
+                if not motor.wait_for_in_position(timeout_s=10.0):
+                    raise PlatformError(
+                        f"Settling did not finish: {motor.name} was stopped or "
+                        "did not arrive.")
+        if not corrections:
+            return
+        final = {m.name: m.cfg.mm_to_counts(t) - m.get_position_counts()
+                 for m, t in pairs}
+        self._log("Settled at the target ("
+                  + ", ".join(f"{n} {start_errors[n]:+d} -> {final[n]:+d} counts"
+                              for n in final)
+                  + f", {corrections} correction{'s' if corrections > 1 else ''}).")
 
     # ----------------------------------------------------- hard-stop seeking
 

@@ -863,6 +863,8 @@ def cmd_plc(args) -> int:
     controller = BrakeController(ExternalBrakeConfig.from_settings(settings),
                                  names=[a.name for a in cfg.actuators])
     rule(controller.describe())
+    if args.watch:
+        return _watch_plc(controller, args.watch, args.every)
     try:
         io = controller.read_io(fresh=True)
     except BrakeError as exc:
@@ -897,6 +899,76 @@ def cmd_plc(args) -> int:
     except BrakeError as exc:
         out(f"  brakes: cannot be worked out -- {exc}")
     return 0
+
+
+def _watch_plc(controller, seconds: float, every: float) -> int:
+    """Read the PLC over and over, timing each reply, to find a flaky link.
+
+    One attempt per read, no retry, so every hiccup shows. Reads only.
+    """
+    import time as _time
+    from .external_brake import BrakeError
+    out(f"  Reading every {every:g} s for {seconds:g} s (Ctrl+C to stop early).")
+    out("  Every failure is printed with its reason; a summary follows.")
+    out("")
+    times, failures = [], []
+    end = _time.monotonic() + seconds
+    next_note = _time.monotonic() + 30
+    try:
+        while _time.monotonic() < end:
+            began = _time.monotonic()
+            try:
+                controller._cbw_request(None, timeout=1.5)
+                times.append(_time.monotonic() - began)
+            except BrakeError as exc:
+                failures.append(str(exc))
+                out(f"  {_time.strftime('%H:%M:%S')}  FAILED after "
+                    f"{_time.monotonic() - began:.2f} s: {exc}")
+            if _time.monotonic() > next_note:
+                next_note += 30
+                out(f"  {_time.strftime('%H:%M:%S')}  {len(times)} ok, "
+                    f"{len(failures)} failed so far")
+            _time.sleep(max(0.0, every - (_time.monotonic() - began)))
+    except KeyboardInterrupt:
+        out("  stopped")
+    total = len(times) + len(failures)
+    out("")
+    rule("Summary")
+    if not total:
+        out("  Nothing was read.")
+        return 1
+    out(f"  {total} reads, {len(failures)} failed "
+        f"({100.0 * len(failures) / total:.1f}%)")
+    if times:
+        ordered = sorted(times)
+        out(f"  reply time: typical {ordered[len(ordered) // 2] * 1000:.0f} ms, "
+            f"slowest {ordered[-1] * 1000:.0f} ms")
+    kinds = {"timed out": 0, "refused": 0, "reset": 0, "unreachable": 0}
+    for text in failures:
+        for kind in kinds:
+            if kind in text:
+                kinds[kind] += 1
+    out("")
+    if not failures:
+        out("  The link held up the whole time. If the GUI still loses it, the")
+        out("  difference is load: is the PLC's web page open in a browser too?")
+    if kinds["timed out"]:
+        out("  Timeouts: the PLC answered slowly or packets were lost. Close any")
+        out("  browser tab showing the PLC's own page, and run `ping -t` to the PLC")
+        out("  alongside this: if ping drops too, it is the network or the PLC's")
+        out("  power; if ping is clean, the PLC is busy.")
+    if kinds["refused"]:
+        out("  Refused: the PLC would not take another connection. Something else")
+        out("  is holding connections open (a browser tab on its page, another")
+        out("  copy of this GUI), or the PLC was rebooting.")
+    if kinds["reset"]:
+        out("  Resets: the PLC dropped connections part-way. Often its power: does")
+        out("  it happen when relays switch? A supply that sags when the relay")
+        out("  coils pull in will reboot it.")
+    if kinds["unreachable"]:
+        out("  Unreachable: the laptop had no route at that moment. Check the cable,")
+        out("  the switch port, and the network adapter's power saving.")
+    return 0 if not failures else 1
 
 
 def cmd_clear_errors(args) -> int:
@@ -1826,6 +1898,12 @@ one motor on a bench
                             "input (reads only)")
     p.add_argument("--raw", action="store_true",
                    help="print the PLC's state page exactly as it sent it")
+    p.add_argument("--watch", type=float, metavar="SECONDS",
+                   help="read it repeatedly for this long, timing every reply "
+                        "and printing every failure, to find a flaky link")
+    p.add_argument("--every", type=float, default=0.4, metavar="SECONDS",
+                   help="with --watch: time between reads (default 0.4, what "
+                        "the GUI does)")
     p.set_defaults(func=cmd_plc)
 
     p = command("clear-errors", help="best-effort error clear on all motors")

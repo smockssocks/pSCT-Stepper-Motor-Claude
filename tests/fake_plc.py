@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
@@ -35,6 +36,10 @@ class FakeX432:
         #: Relays the "PLC's own logic" forces, whatever is asked.
         self.stuck: Dict[int, int] = {}
         self.requests: List[str] = []
+        #: The next this-many requests are answered only after `slow_s`
+        #: seconds, longer than the client waits: a busy or flaky PLC.
+        self.slow_next = 0
+        self.slow_s = 2.0
         self._lock = threading.Lock()
         self._server: Optional[ThreadingHTTPServer] = None
 
@@ -71,6 +76,12 @@ class FakeX432:
 
             def do_GET(self):
                 plc.requests.append(self.path)
+                with plc._lock:
+                    slow = plc.slow_next > 0
+                    if slow:
+                        plc.slow_next -= 1
+                if slow:
+                    time.sleep(plc.slow_s)
                 if plc.password:
                     expected = "Basic " + base64.b64encode(
                         f"{plc.username}:{plc.password}".encode()).decode()
@@ -115,6 +126,9 @@ class FakeX432:
                 self.wfile.write(body)
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        # A client that gave up on a slow reply closes its end; writing the
+        # reply then fails, which is expected here and not worth a traceback.
+        self._server.handle_error = lambda request, client_address: None
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
         return self
 

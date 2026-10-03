@@ -30,6 +30,10 @@ Three choices, because the people at the telescope think in more than one:
              towards M1. This is what every command is expressed in.
     "m1"     millimetres from the focal plane to M1, the primary mirror.
     "m2"     millimetres from the focal plane to M2, the secondary.
+    "top"    millimetres from the upper end of travel (the upper hard stop
+             reads 0, everything below it is negative).
+    "bottom" millimetres from the lower end of travel (the lower hard stop
+             reads 0, everything above it is positive).
 
 The last two need one extra number each: how far the zero reference is from
 that mirror. Nobody has that figure yet, and it can change (the zero can be
@@ -63,12 +67,19 @@ COLOR_BAND = "#cfe0f2"
 COLOR_HARD_STOP = "#b3231f"
 
 #: The three things the gauge can measure from, and what to call each.
-REFERENCES = ("zero", "m1", "m2")
+REFERENCES = ("zero", "m1", "m2", "top", "bottom")
 REFERENCE_TITLES = {
     "zero": "Distance from zero",
     "m1": "Distance to M1",
     "m2": "Distance to M2",
+    "top": "Distance from top stop",
+    "bottom": "Distance from bottom stop",
 }
+#: The short caption under the readout.
+REFERENCE_CAPTIONS = {"zero": "from zero", "m1": "to M1", "m2": "to M2",
+                      "top": "from top stop", "bottom": "from bottom stop"}
+#: Signed (+ towards M1) or a plain distance.
+SIGNED_REFERENCES = ("zero", "top", "bottom")
 
 
 class FocusGauge(tk.Canvas):
@@ -149,7 +160,18 @@ class FocusGauge(tk.Canvas):
             return self.zero_to_m1_mm is not None
         if self.reference == "m2":
             return self.zero_to_m2_mm is not None
+        if self.reference == "top":
+            return self.hard_stop_high_mm is not None
+        if self.reference == "bottom":
+            return self.hard_stop_low_mm is not None
         return True
+
+    @property
+    def missing_text(self) -> str:
+        """What the readout says when the reference cannot be shown."""
+        if self.reference in ("top", "bottom"):
+            return "end of travel not set"
+        return "distance not set"
 
     def display_value(self, focus_mm: float) -> Optional[float]:
         """A focus position, expressed in the chosen reference.
@@ -166,6 +188,14 @@ class FocusGauge(tk.Canvas):
             if self.zero_to_m2_mm is None:
                 return None
             return self.zero_to_m2_mm + focus_mm
+        if self.reference == "top":
+            if self.hard_stop_high_mm is None:
+                return None
+            return focus_mm - self.hard_stop_high_mm
+        if self.reference == "bottom":
+            if self.hard_stop_low_mm is None:
+                return None
+            return focus_mm - self.hard_stop_low_mm
         return focus_mm
 
     def focus_for_display(self, value: float) -> Optional[float]:
@@ -178,14 +208,22 @@ class FocusGauge(tk.Canvas):
             if self.zero_to_m2_mm is None:
                 return None
             return value - self.zero_to_m2_mm
+        if self.reference == "top":
+            if self.hard_stop_high_mm is None:
+                return None
+            return value + self.hard_stop_high_mm
+        if self.reference == "bottom":
+            if self.hard_stop_low_mm is None:
+                return None
+            return value + self.hard_stop_low_mm
         return value
 
     def format_value(self, focus_mm: float, decimals: int = 4) -> str:
         """The readout text for a focus position in the chosen reference."""
         value = self.display_value(focus_mm)
         if value is None:
-            return "distance not set"
-        if self.reference == "zero":
+            return self.missing_text
+        if self.reference in SIGNED_REFERENCES:
             return f"{value:+.{decimals}f} mm"
         return f"{value:.{decimals}f} mm"
 
@@ -334,7 +372,7 @@ class FocusGauge(tk.Canvas):
                          track_half, COLOR_NOW, filled=True)
 
         # --- readout, on its own two lines below the direction label ---------
-        caption = {"zero": "from zero", "m1": "to M1", "m2": "to M2"}[self.reference]
+        caption = REFERENCE_CAPTIONS[self.reference]
         if self._valid and self._position_mm is not None:
             if self.reference_available:
                 text = self.format_value(self._position_mm)
@@ -343,7 +381,7 @@ class FocusGauge(tk.Canvas):
                     colour = COLOR_LIMIT
                     caption += "   OUT OF RANGE"
             else:
-                text, colour = "distance not set", COLOR_LIMIT
+                text, colour = self.missing_text, COLOR_LIMIT
                 caption = f"enter the zero-to-{self.reference.upper()} distance"
         else:
             text, colour = "no reading", COLOR_LIMIT
@@ -437,4 +475,4 @@ class FocusGauge(tk.Canvas):
         return [mm for _value, mm in self._ticks()]
 
 
-__all__ = ["FocusGauge", "REFERENCES", "REFERENCE_TITLES"]
+__all__ = ["FocusGauge", "REFERENCES", "REFERENCE_TITLES", "REFERENCE_CAPTIONS"]

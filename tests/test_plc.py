@@ -194,6 +194,60 @@ class TestPlcProblems(unittest.TestCase):
         self.assertLess(time.monotonic() - again, 0.05)
         self.assertLess(again - started, 2.0)
 
+    def test_one_slow_reply_is_retried_rather_than_reported(self):
+        """A small web PLC misses the odd reply. One miss used to show the
+        brakes as unreadable for two seconds, which looked like the PLC
+        dropping off the network and coming back."""
+        with FakeX432() as plc:
+            said = []
+            controller = BrakeController(cbw(plc), logger=said.append)
+            plc.slow_next = 1
+            self.assertIs(controller.read_state(fresh=True), BrakeState.ENGAGED)
+            self.assertEqual(controller.link_stats["retried"], 1)
+            self.assertEqual(controller.link_stats["failed"], 0)
+            self.assertTrue(any("missed one read" in line for line in said), said)
+
+    def test_two_in_a_row_are_reported_with_the_reason(self):
+        with FakeX432() as plc:
+            said = []
+            controller = BrakeController(cbw(plc), logger=said.append)
+            plc.slow_next = 2
+            with self.assertRaises(BrakeError) as ctx:
+                controller.read_state(fresh=True)
+            self.assertIn("timed out", str(ctx.exception))
+            self.assertEqual(controller.link_stats["failed"], 1)
+            self.assertTrue(any(line.startswith("Lost the PLC") for line in said))
+            # ...and coming back is said too.
+            self.assertIs(controller.read_state(fresh=True), BrakeState.ENGAGED)
+            self.assertIn("PLC answering again.", said)
+
+    def test_watch_reports_a_clean_link(self):
+        import contextlib
+        import io
+        from psct_motors.cli import _watch_plc
+        with FakeX432() as plc:
+            controller = BrakeController(cbw(plc))
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = _watch_plc(controller, 0.6, 0.1)
+            self.assertEqual(code, 0)
+            self.assertIn("0 failed (0.0%)", buffer.getvalue())
+
+    def test_watch_shows_each_failure(self):
+        import contextlib
+        import io
+        from psct_motors.cli import _watch_plc
+        with FakeX432() as plc:
+            controller = BrakeController(cbw(plc))
+            plc.slow_next = 1
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = _watch_plc(controller, 2.0, 0.2)
+            text = buffer.getvalue()
+            self.assertEqual(code, 1)
+            self.assertIn("FAILED after", text)
+            self.assertIn("Timeouts:", text)
+
     def test_an_incomplete_configuration_is_refused(self):
         with self.assertRaises(ValueError):
             ExternalBrakeConfig(mode="controlbyweb").validate()

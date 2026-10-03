@@ -97,6 +97,10 @@ class SimulatedJVLTransport:
         #: motor shows a flat plane that moves only in focus.
         self.follow: Optional[Callable[[], Optional[tuple]]] = None
         self._followed_target: Optional[int] = None
+        #: Fraction of the commanded speed this axis actually manages. Below
+        #: 1, it is a motor under more load than the others, which is what
+        #: keeping the three together during a move has to cope with.
+        self.speed_factor = 1.0
 
         #: Mechanical end stops, in counts. The shaft cannot pass them, and
         #: torque climbs while the drive pushes against one -- which is what
@@ -236,15 +240,20 @@ class SimulatedJVLTransport:
             # mechanical stop, which is what it is.
             self.registers[12] = 0
             target = float(self.registers.get(3, 0))
+            # Straining only if told to be somewhere the shaft is not. The
+            # shaft is where the encoder says: a drive told to hold exactly
+            # there (which is what enabling it does) is not pushing.
+            shaft = self._position - self.follow_error_counts
             self.registers[217] = (self.stalled_torque
-                                   if abs(target - self._position) > 1
+                                   if abs(target - shaft) > 1
                                    else self.idle_torque)
             self._publish_position()
             return
 
         if mode == int(MotorMode.POSITION) and self.registers.get(35, 0) == 0:
             target = float(self.registers.get(3, 0))
-            speed = max(1.0, abs(self.registers.get(5, 1000))) * self.COUNTS_PER_SECOND_PER_VSOLL
+            speed = (max(1.0, abs(self.registers.get(5, 1000)))
+                     * self.COUNTS_PER_SECOND_PER_VSOLL * self.speed_factor)
             delta = target - self._position
             step = speed * dt
             if abs(delta) <= step:

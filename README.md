@@ -96,7 +96,10 @@ drives.
   or the distance to M1 or to M2. The last two need the distance from zero
   to that mirror, which nobody has yet — enter it under *Tools → Distances*
   (or the button under the gauge) once it is known; until then the gauge says
-  "distance not set" rather than showing a made-up number.
+  "distance not set" rather than showing a made-up number. **From top stop**
+  makes the upper end of travel read 0 (everything below it negative), and
+  **from bottom stop** the lower end. These only change the labels; every
+  command is still in the same zero, so nothing moves.
 - Per-actuator position, mode, brake, load and **supply voltage**, with
   Release/Engage for each brake. The brake says **ENGAGED** (blue) or
   **DISENGAGED** (amber), deliberately not green/red: a disengaged brake is
@@ -116,7 +119,7 @@ Behind the menus, so the main window stays about the job:
 | **View → Position log** | every move, newest first: where the plane was, where it was sent, where it ended up; select a line and go back to it |
 | **View → Load and torque** | how hard each motor is working, big enough to read across a room, with peaks, temperature and supply; how many readings per second; and the torque limit (changing it needs the password) |
 | **Tools → Connection settings** | edit each motor's IP and port, use now or save |
-| **Tools → Motion limits** | focus, tilt and step limits; set them from the ends of travel that Find hard stop discovered |
+| **Tools → Motion limits** | focus, tilt and step limits; the ends of travel (found by Find hard stop, or typed in behind the password); set the focus limits from the ends of travel with a margin |
 | **Tools → Distances from zero to M1 and M2** | the two numbers the gauge needs to show distance to a mirror instead of distance from zero |
 | **Tools → Supply voltage** | only if a motor's volts disagree with MacTalk: enter what the supply is really at, and that motor uses its own reading from then on |
 | **Tools → Find hard stop** | run the actuators out to the end of travel |
@@ -144,6 +147,44 @@ It reports what torque reads at rest, moving freely and pressed against the
 stop, and recommends a threshold from the gap between them — or says plainly
 that there is no gap, in which case torque alone cannot find the stop and the
 "commanded a step and barely moved" check is what does.
+
+### Keeping the three together, settling, and the big-error stop
+
+Every coordinated move is watched while it runs, and checked when it ends.
+
+- **Staying in step.** The three speeds are scaled so they arrive together,
+  but a motor under more load can fall behind, and the plate tilts on the way.
+  Each actuator's progress along its own move is compared every tenth of a
+  second. One more than `sync_pause_mm` (0.05 mm) ahead of the slowest is held
+  where it is until the slowest catches up, then sent on a fifth slower. If
+  they get `sync_abort_mm` (0.5 mm) out of step, or the slow one has not caught
+  up after `sync_max_wait_s` (5 s), the move is stopped.
+- **Settling.** Under load a stepper sits slightly behind its command (the
+  bench motor sat 231 counts, about 1.4 µm, short). After a move each motor's
+  encoder is compared with its target; one more than `settle_deadband_counts`
+  (50 counts, 0.3 µm) off is sent the difference, up to `settle_max_tries`
+  (3) times. The log says what it did: `Settled at the target (Top +231 -> +4
+  counts, ...)`. The motor takes commands in 1/409,600 of a turn (2,048 per
+  full step, about 6 nm of travel here), but it does not land that finely,
+  which is why there is a deadband and a try limit rather than chasing every
+  count. Single-actuator jogs settle too.
+- **The big-error stop.** An actuator more than `max_position_error_mm`
+  (0.1 mm) from where it is being driven, during the move or after it, means
+  it has slipped or is blocked: a stepper that is more than a step or two
+  (12.7 µm a full step) behind has lost its grip. All three are halted,
+  holding, and the brakes are applied; the message says which motor and by
+  how much.
+
+- **Already straining.** A move or jog is refused before anything happens
+  if any motor is already at or over its torque stop level while standing
+  still: something is pushing against it, and forcing a move could damage the
+  telescope. Nothing is commanded and the brakes are not touched. The check
+  is made with the drives on and holding, just before the brakes would come
+  off.
+
+The out-of-step stop and the big-error stop both leave the drives on and
+holding *and* the brakes on. All of the numbers above are in the
+configuration file; `settle_enabled: false` turns settling off.
 
 ### Supply voltage
 
@@ -466,6 +507,34 @@ line in the Connection box:
   **keeps the drives on**, and the log says why (see below).
 - `python -m psct_motors.cli plc` prints every relay and input from the command
   line. It only reads.
+
+**If the PLC drops out now and then.** The GUI gives a status read 1.5 s, and
+tries once more straight away if the PLC misses one; only two misses in a row
+show the brakes as NOT READABLE (for 2 s, then it tries again). The log says
+`Lost the PLC: <reason>` and `PLC answering again.`, so the reason is on
+record. To find the cause, close the GUI and run:
+
+```
+python -m psct_motors.cli plc --watch 600        # ten minutes, reads only
+```
+
+It reads the PLC every 0.4 s (what the GUI does), times every reply, prints
+every failure with its reason, and ends with a summary that says what the
+pattern points to. Run `ping -t <PLC address>` in a second window at the same
+time. Then:
+
+- **Ping drops too:** the network or the PLC's power. Check the cable and
+  switch port, turn off power saving on the laptop's Ethernet adapter
+  (Device Manager → adapter → Power Management, and "Energy Efficient
+  Ethernet" under Advanced), and check the PLC's supply. If it happens when
+  relays switch, a supply that sags when the coils pull in will reboot it.
+- **Ping is clean but reads time out or are refused:** the PLC is busy or
+  out of connections. Close any browser tab showing the PLC's own page (it
+  refreshes itself constantly) and make sure only one copy of the GUI is
+  running.
+- **Two IP addresses on the laptop's adapter** (one for the motors, one for
+  the PLC) works, but moving the PLC onto the motors' network (for example
+  192.168.0.60) is simpler and removes one thing that can go wrong.
 
 **Relay state vs brake state.** A relay reading "off" means the PLC was told to
 turn it off. It does not prove the brake clamped: reversed polarity, a blown

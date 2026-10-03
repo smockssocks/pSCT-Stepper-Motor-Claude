@@ -89,6 +89,23 @@ from .jvl_motor import BrakeState
 MODES = ("none", "controlbyweb", "modbus", "http")
 
 
+def _plain_reason(reason, timeout: float) -> str:
+    """What a network failure means, in words that point at a cause."""
+    import socket
+    text = str(reason)
+    if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in text:
+        return (f"no answer within {timeout:g} s (timed out: the PLC was slow "
+                "or busy, or the packets were lost)")
+    if isinstance(reason, ConnectionRefusedError) or "refused" in text.lower():
+        return ("connection refused (the PLC is up but would not take the "
+                "connection, e.g. too many at once, or it is rebooting)")
+    if isinstance(reason, ConnectionResetError) or "reset" in text.lower():
+        return "connection reset by the PLC part-way through"
+    if "unreachable" in text.lower() or "no route" in text.lower():
+        return f"network unreachable ({text}): a cable, switch or address problem"
+    return text
+
+
 class BrakeError(RuntimeError):
     """The brake could not be commanded, or its state could not be read."""
 
@@ -307,6 +324,10 @@ class BrakeController:
     #: trying again. An unreachable PLC would otherwise cost every status poll
     #: a full timeout, and the motor readouts would freeze behind it.
     FAILURE_BACKOFF_S = 2.0
+    #: A status read that fails is tried once more straight away. One slow
+    #: or dropped reply from a small web PLC is common; reporting the brakes
+    #: as unreadable for two seconds because of it is not useful.
+    STATUS_RETRIES = 1
 
     def __init__(self, cfg: ExternalBrakeConfig, logger=None,
                  names: Optional[Sequence[str]] = None):
@@ -325,6 +346,14 @@ class BrakeController:
         self._io_time = 0.0
         self._io_error: Optional[str] = None
         self._io_error_time = 0.0
+        #: How the link has been doing, for diagnosing a flaky connection:
+        #: reads, reads that needed the retry, reads that failed outright,
+        #: the slowest reply, and the last few failure reasons.
+        self.link_stats = {"reads": 0, "retried": 0, "failed": 0,
+                           "slowest_s": 0.0, "recent_errors": []}
+        # Never through a proxy: the PLC is on the local network, and on a
+        # Windows machine Python otherwise picks up the system proxy settings.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         #: Which state page the device answered on, once known.
         self._endpoint = "state.json"
 
@@ -524,14 +553,36 @@ class BrakeController:
                     raise BrakeError(self._io_error)
                 if self._io is not None and now - self._io_time < self.STATUS_CACHE_S:
                     return self._io
-            try:
-                io = self._cbw_request(None, timeout=min(self.cfg.timeout_s, 1.5))
-            except BrakeError as exc:
-                self._io_error, self._io_error_time = str(exc), now
-                raise
+            io = None
+            for attempt in range(self.STATUS_RETRIES + 1):
+                began = time.monotonic()
+                try:
+                    io = self._cbw_request(None, timeout=min(self.cfg.timeout_s, 1.5))
+                    break
+                except BrakeError as exc:
+                    self._note_link_error(str(exc))
+                    if attempt == self.STATUS_RETRIES:
+                        self.link_stats["failed"] += 1
+                        if self._io_error is None:
+                            self._log(f"Lost the PLC: {exc}")
+                        self._io_error, self._io_error_time = str(exc), now
+                        raise
+                    self.link_stats["retried"] += 1
+                    if self._io_error is None:
+                        self._log(f"PLC missed one read, trying again: {exc}")
+            elapsed = time.monotonic() - began
+            if self._io_error is not None:
+                self._log("PLC answering again.")
+            self.link_stats["reads"] += 1
+            self.link_stats["slowest_s"] = max(self.link_stats["slowest_s"], elapsed)
             self._io_error = None
             self._io, self._io_time = io, now
             return io
+
+    def _note_link_error(self, text: str) -> None:
+        recent = self.link_stats["recent_errors"]
+        recent.append((time.strftime("%H:%M:%S"), text))
+        del recent[:-10]
 
     def _cbw_write(self, name: str, release: bool) -> None:
         energize = release if self.cfg.energized_releases else not release
@@ -573,7 +624,7 @@ class BrakeController:
             url = f"{self._base_url()}/{endpoint}{suffix}"
             try:
                 request = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(request, timeout=timeout) as response:
+                with self._opener.open(request, timeout=timeout) as response:
                     body = response.read().decode("utf-8", "replace")
             except urllib.error.HTTPError as exc:
                 if exc.code == 401:
@@ -590,7 +641,8 @@ class BrakeController:
             except (urllib.error.URLError, OSError) as exc:
                 reason = getattr(exc, "reason", exc)
                 raise BrakeError(
-                    f"Could not reach the PLC at {self._base_url()}: {reason}"
+                    f"Could not reach the PLC at {self._base_url()}: "
+                    f"{_plain_reason(reason, timeout)}"
                 ) from exc
             payload = self._parse_body(endpoint, body)
             self._endpoint = endpoint

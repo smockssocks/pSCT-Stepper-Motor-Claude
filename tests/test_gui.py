@@ -820,6 +820,63 @@ class TestGui(unittest.TestCase):
         self.assertEqual(self.app.rows["Top"].supply_var.get(), "24.0 V")
         window.destroy()
 
+    # ---- ends of travel -------------------------------------------------------
+
+    def _limits_button(self, text):
+        def find(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, ttk.Button) and child.cget("text") == text:
+                    return child
+                hit = find(child)
+                if hit is not None:
+                    return hit
+            return None
+        return find(self.app._limits_window)
+
+    def test_the_ends_of_travel_need_the_password_and_are_checked(self):
+        from psct_motors.config import load_config
+        limits = self.app.cfg.limits
+        self.app.on_edit_limits()
+        self.pump(0.2)
+        low_entry, high_entry = self.app._stop_entries
+        self.assertEqual(str(high_entry.cget("state")), "disabled")
+        self._limits_button("Change ends of travel...").invoke()
+        self.assertFalse(self.app._submit_password("nope"))
+        self.assertEqual(str(high_entry.cget("state")), "disabled")
+        self.assertTrue(self.app._submit_password("11328pixels!"))
+        self.assertEqual(str(high_entry.cget("state")), "normal")
+
+        # Inside the focus limits is refused: a limit beyond a stop drives
+        # into it.
+        self.app.stop_low_var.set(f"{limits.min_focus_mm - 0.5:g}")
+        self.app.stop_high_var.set(f"{limits.max_focus_mm - 1.0:g}")
+        self._answer(True, self._limits_button("Use and save").invoke)
+        self.assertIsNone(limits.hard_stop_high_mm)
+
+        high = limits.max_focus_mm + 0.5
+        self.app.stop_high_var.set(f"{high:g}")
+        self._answer(True, self._limits_button("Use and save").invoke)
+        self.assertEqual(limits.hard_stop_high_mm, high)
+        self.assertEqual(load_config(self.app.config_path).limits.hard_stop_high_mm, high)
+        self.assertIn("Ends of travel changed by hand", self.app.log_text.get("1.0", "end"))
+
+    def test_the_gauge_can_measure_from_either_end_of_travel(self):
+        gauge = self.app.gauge
+        self.app._apply_gauge_reference("top")
+        self.assertFalse(gauge.reference_available)
+        self.assertIn("end of travel not set", self.app.gauge_frame.cget("text"))
+        self.app.cfg.limits.hard_stop_low_mm = -25.0
+        self.app.cfg.limits.hard_stop_high_mm = 25.4
+        self.app._refresh_gauge_limits()
+        self.assertEqual(self.app.gauge_frame.cget("text"),
+                         "Distance from top stop")
+        self.assertEqual(gauge.format_value(25.4), "+0.0000 mm")
+        self.assertEqual(gauge.format_value(20.4), "-5.0000 mm")
+        self.app._apply_gauge_reference("bottom")
+        self.assertEqual(gauge.format_value(-25.0), "+0.0000 mm")
+        self.assertEqual(gauge.format_value(0.0), "+25.0000 mm")
+        self.assertAlmostEqual(gauge.focus_for_display(25.0), 0.0)
+
     # ---- torque limit and update rate ----------------------------------------
 
     def test_the_torque_limit_needs_the_password_and_is_saved(self):

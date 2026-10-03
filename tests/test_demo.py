@@ -325,7 +325,9 @@ class TestHaltOnFault(unittest.TestCase):
             injectors[2].arm(Fault.STUCK_POSITION)
             with self.assertRaises(PlatformError) as ctx:
                 platform.move_to_orientation(Orientation(30.0, 0.0, 0.0))
-            self.assertIn("Timed out", str(ctx.exception))
+            # Caught by the in-step watch (the other two were held for it
+            # and it never caught up) well before the move timeout would be.
+            self.assertIn("is not keeping up", str(ctx.exception))
             for injector in injectors:
                 injector.clear()
 
