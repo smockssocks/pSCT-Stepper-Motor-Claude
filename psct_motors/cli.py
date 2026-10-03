@@ -768,8 +768,8 @@ def cmd_passivate(args) -> int:
             out("Drives off.")
             return 0
 
-        out("Halts all three, engages the brakes, and turns the drives off only")
-        out("if the brakes are confirmed holding. Use --force to turn them off")
+        out("Halts all three, engages the brakes, and turns the drives off once")
+        out("the PLC reports the brakes engaged. Use --force to turn them off")
         out("regardless.")
         if not confirm("Emergency stop all three motors?", args.yes):
             return 1

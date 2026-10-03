@@ -165,6 +165,13 @@ class ExternalBrakeConfig:
     feedback_inputs: Dict[str, int] = field(default_factory=dict)
     #: True when a feedback input reading ON means the brake is released.
     feedback_on_means_released: bool = True
+    #: Take the PLC's relay reading as the brake's state. The site's brakes
+    #: are fail-safe (power releases them, no power clamps them) and the PLC
+    #: reports its relays correctly, so a relay reading "off" is a clamped
+    #: brake. False goes back to treating it as only what the PLC was told,
+    #: which keeps the drives on after EMERGENCY unless a feedback input
+    #: confirms the brake.
+    trust_relay_state: bool = True
     http_port: int = 80
     use_https: bool = False
     #: The device's login, if it has a password set for its state page.
@@ -325,9 +332,16 @@ class BrakeController:
     #: a full timeout, and the motor readouts would freeze behind it.
     FAILURE_BACKOFF_S = 2.0
     #: A status read that fails is tried once more straight away. One slow
-    #: or dropped reply from a small web PLC is common; reporting the brakes
-    #: as unreadable for two seconds because of it is not useful.
+    #: or dropped reply from a small web PLC is common.
     STATUS_RETRIES = 1
+    #: The display's reading comes from a background reader, so a slow PLC
+    #: never holds up the motor readouts. The last good reading stands until
+    #: it is this old; only then are the brakes shown as unreadable. Anything
+    #: about to act on the brakes (a move, a release, EMERGENCY) reads the PLC
+    #: itself, there and then, and does not use this.
+    STALE_AFTER_S = 3.0
+    #: The background reader stops when nobody has asked for a while.
+    READER_IDLE_S = 5.0
 
     def __init__(self, cfg: ExternalBrakeConfig, logger=None,
                  names: Optional[Sequence[str]] = None):
@@ -346,6 +360,13 @@ class BrakeController:
         self._io_time = 0.0
         self._io_error: Optional[str] = None
         self._io_error_time = 0.0
+        #: Guards the cached reading only, so the display never waits behind a
+        #: slow request (which holds `_lock`).
+        self._io_lock = threading.Lock()
+        self._reader: Optional[threading.Thread] = None
+        self._reader_stop = threading.Event()
+        self._last_asked = 0.0
+        self._said_stale = False
         #: How the link has been doing, for diagnosing a flaky connection:
         #: reads, reads that needed the retry, reads that failed outright,
         #: the slowest reply, and the last few failure reasons.
@@ -401,7 +422,7 @@ class BrakeController:
         are confirmed holding, and a relay turned off is not a clamped brake.
         """
         if self.cfg.mode == "controlbyweb":
-            return bool(self._cbw_feedback_for(name))
+            return self.cfg.trust_relay_state or bool(self._cbw_feedback_for(name))
         if self.cfg.mode == "modbus":
             return True
         if self.cfg.mode == "http":
@@ -545,17 +566,39 @@ class BrakeController:
         return BrakeState.UNKNOWN
 
     def _cbw_io(self, fresh: bool) -> dict:
+        """The PLC's I/O. `fresh` asks the PLC now; otherwise the latest
+        reading from the background reader, while it is under
+        `STALE_AFTER_S` old."""
+        if fresh:
+            return self._fetch_io()
         now = time.monotonic()
+        with self._io_lock:
+            self._last_asked = now
+            io, age = self._io, now - self._io_time
+            error, error_age = self._io_error, now - self._io_error_time
+        if io is not None and age < self.STALE_AFTER_S:
+            self._ensure_reader()
+            return io
+        if io is not None:
+            self._ensure_reader()
+            text = error or f"The PLC has not answered for {age:.0f} s."
+            if not self._said_stale:
+                self._said_stale = True
+                self._log(f"No reply from the PLC for {self.STALE_AFTER_S:g} s: {text}")
+            raise BrakeError(text)
+        # Nothing read yet. Ask now, unless that failed a moment ago: a dead
+        # PLC must not cost every poll a full timeout.
+        if error is not None and error_age < self.FAILURE_BACKOFF_S:
+            raise BrakeError(error)
+        io = self._fetch_io()
+        self._ensure_reader()
+        return io
+
+    def _fetch_io(self) -> dict:
+        """One read of the PLC (retried once), recorded in the cache."""
         with self._lock:
-            if not fresh:
-                if (self._io_error is not None
-                        and now - self._io_error_time < self.FAILURE_BACKOFF_S):
-                    raise BrakeError(self._io_error)
-                if self._io is not None and now - self._io_time < self.STATUS_CACHE_S:
-                    return self._io
-            io = None
+            began = time.monotonic()
             for attempt in range(self.STATUS_RETRIES + 1):
-                began = time.monotonic()
                 try:
                     io = self._cbw_request(None, timeout=min(self.cfg.timeout_s, 1.5))
                     break
@@ -563,21 +606,40 @@ class BrakeController:
                     self._note_link_error(str(exc))
                     if attempt == self.STATUS_RETRIES:
                         self.link_stats["failed"] += 1
-                        if self._io_error is None:
-                            self._log(f"Lost the PLC: {exc}")
-                        self._io_error, self._io_error_time = str(exc), now
+                        with self._io_lock:
+                            self._io_error = str(exc)
+                            self._io_error_time = time.monotonic()
                         raise
                     self.link_stats["retried"] += 1
-                    if self._io_error is None:
-                        self._log(f"PLC missed one read, trying again: {exc}")
-            elapsed = time.monotonic() - began
-            if self._io_error is not None:
-                self._log("PLC answering again.")
             self.link_stats["reads"] += 1
-            self.link_stats["slowest_s"] = max(self.link_stats["slowest_s"], elapsed)
-            self._io_error = None
-            self._io, self._io_time = io, now
+            self.link_stats["slowest_s"] = max(self.link_stats["slowest_s"],
+                                               time.monotonic() - began)
+            with self._io_lock:
+                self._io_error = None
+                self._io, self._io_time = io, time.monotonic()
             return io
+
+    def _ensure_reader(self) -> None:
+        """Start the background reader if it is not running."""
+        with self._io_lock:
+            if self._reader is not None and self._reader.is_alive():
+                return
+            self._reader_stop.clear()
+            self._reader = threading.Thread(target=self._read_forever,
+                                            name="plc-reader", daemon=True)
+            self._reader.start()
+
+    def _read_forever(self) -> None:
+        while not self._reader_stop.wait(self.STATUS_CACHE_S):
+            if time.monotonic() - self._last_asked > self.READER_IDLE_S:
+                return
+            try:
+                self._fetch_io()
+                if self._said_stale:
+                    self._said_stale = False
+                    self._log("The PLC is answering again.")
+            except BrakeError:
+                pass        # the display says so once the reading is stale
 
     def _note_link_error(self, text: str) -> None:
         recent = self.link_stats["recent_errors"]
@@ -597,7 +659,8 @@ class BrakeController:
                 time.sleep(0.2)
                 io = self._cbw_request(None, timeout=self.cfg.timeout_s)
                 wrong = [n for n in numbers if io["relays"].get(n) is not energize]
-            self._io, self._io_time, self._io_error = io, time.monotonic(), None
+            with self._io_lock:
+                self._io, self._io_time, self._io_error = io, time.monotonic(), None
         if wrong:
             raise BrakeError(
                 f"The PLC was told to turn relay(s) "
@@ -783,6 +846,7 @@ class BrakeController:
         return BrakeState.UNKNOWN
 
     def close(self) -> None:
+        self._reader_stop.set()
         with self._lock:
             if self._client is not None:
                 try:

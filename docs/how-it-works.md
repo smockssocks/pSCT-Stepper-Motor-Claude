@@ -170,9 +170,9 @@ Say this first, not last. It is the part that makes the rest credible.
   software can now drive it over HTTP. But it has only been tested against a
   stand-in that speaks the same protocol, not the real unit. Which relay drives
   the brakes, which way round, and whether anything reports the brake's real
-  state all have to be found on the hardware. Until an input reports the brake
-  itself, the software treats "relay off" as "told to clamp", not "clamped",
-  so EMERGENCY keeps the drives on. The test that settles the rest: release
+  state all have to be found on the hardware. The PLC's relay reading is taken
+  as the brake state (`trust_relay_state`), since the brakes are fail-safe.
+  The test that settles the rest: release
   from the GUI, check by hand that the brake is free, engage, check it is
   holding.
 * **The error bit meanings.** `ERR_BITS` is confirmed as the register, and 0 is

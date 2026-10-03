@@ -406,6 +406,8 @@ class ExternalBrakeSettings:
     relays: Dict[str, int] = field(default_factory=dict)
     feedback_inputs: Dict[str, int] = field(default_factory=dict)
     feedback_on_means_released: bool = True
+    #: The PLC's relay reading is the brake state (see external_brake.py).
+    trust_relay_state: bool = True
     http_port: int = 80
     use_https: bool = False
     username: str = "admin"
@@ -531,6 +533,14 @@ class PlatformConfig:
     #: brakes. A stepper that falls more than a step or two behind its command
     #: (12.7 um a full step here) has slipped, so 0.1 mm is never normal.
     max_position_error_mm: float = 0.1
+
+    # --- the falling watch ------------------------------------------------------
+    #: Watched on every status poll: an axis the drive is not driving (passive,
+    #: another mode, or holding with its move finished) that moves more than
+    #: `fall_limit_mm` on its own is falling or slipping. All the brakes are
+    #: engaged at once and every drive takes hold where it is.
+    fall_watch: bool = True
+    fall_limit_mm: float = 0.05
 
     # --- resting on the brakes ------------------------------------------------
     #: Brakes on, then drives off, so a parked focal plane is held by the
@@ -669,6 +679,8 @@ class PlatformConfig:
             raise ValueError("sync_pause_mm must be positive and below sync_abort_mm")
         if self.sync_max_wait_s <= 0:
             raise ValueError("sync_max_wait_s must be positive")
+        if self.fall_limit_mm <= 0:
+            raise ValueError("fall_limit_mm must be positive")
         if self.rest_watch_s < 0 or self.rest_sink_limit_mm <= 0:
             raise ValueError("rest_watch_s must be >= 0 and rest_sink_limit_mm positive")
         if self.max_position_error_mm <= 0:

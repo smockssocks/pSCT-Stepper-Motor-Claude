@@ -368,6 +368,10 @@ class FocalPlanePlatform:
         #: Rest on the brakes (brakes on, drives off) after every move. Set
         #: from the configuration, or by the GUI's checkbox.
         self.rest_after_moves = bool(self.cfg.rest_on_brakes_after_moves)
+        #: Falling watch: where each axis was when the drive stopped driving
+        #: it, and the last alarm raised, for the GUI to show.
+        self._fall_ref: Dict[str, tuple] = {}
+        self._fall_alarm: Optional[str] = None
         #: Whether a person has accepted the brake relay's word for "engaged"
         #: when nothing senses the brakes. Never set by this module.
         self.trust_relay_brakes = False
@@ -661,6 +665,9 @@ class FocalPlanePlatform:
         pool, self._pool = getattr(self, "_pool", None), None
         if pool is not None:
             pool.shutdown(wait=False)
+        close = getattr(self.external_brake, "close", None)
+        if close is not None:
+            close()          # stops its background reader; restarts on demand
 
     def __enter__(self) -> "FocalPlanePlatform":
         self.connect()
@@ -690,6 +697,7 @@ class FocalPlanePlatform:
         raw = list(self._poll_pool().map(
             lambda m: m.read_status(include_slow), self.motors))
         statuses = [self._with_external_brake(s, brake) for s in raw]
+        self._watch_for_falling(statuses)
         valid = all(s.connected and not s.comms_error for s in statuses)
         orientation = None
         message = ""
@@ -707,6 +715,89 @@ class FocalPlanePlatform:
         return PlatformState(motors=statuses, orientation=orientation,
                              orientation_valid=valid, message=message,
                              brake_summary=self.brake_summary)
+
+    def _watch_for_falling(self, statuses) -> None:
+        """Brakes on at once if an axis nobody is driving moves on its own.
+
+        "Not being driven" is a passive drive (or any mode but Position), or
+        one in Position mode whose move has finished -- its profile output is
+        at its target. While that holds, the shaft should stay put. If its
+        encoder moves more than `fall_limit_mm` from where it was when that
+        began, the axis is falling (or slipping under the drive): every brake
+        is engaged, every passive drive takes hold where it now is, and an
+        alarm is raised. The reference resets whenever the drive is driving,
+        so a move, a STOP or a hard-stop search never looks like a fall.
+        Never raises: this runs inside the status poll.
+        """
+        from .registers import MotorMode
+        cfg = self.cfg
+        if not cfg.fall_watch:
+            return
+        falling = []
+        for status in statuses:
+            if status.comms_error or not status.connected:
+                self._fall_ref.pop(status.name, None)
+                continue
+            idle = (status.mode != int(MotorMode.POSITION)
+                    or abs(status.projected_counts - status.target_counts) <= 2)
+            if not idle:
+                self._fall_ref.pop(status.name, None)
+                continue
+            try:
+                motor = self.motor(status.name)
+                per_mm = motor.cfg.resolved_counts_per_mm
+            except Exception:  # noqa: BLE001 -- no scale, no judgement
+                continue
+            # A reference taken before the drive was last commanded is stale:
+            # a whole move can finish between two polls.
+            sent = motor.commands_sent
+            if status.name in self.copied_names:
+                # A bench copy moves when the motor it copies is commanded.
+                sent += self.motor(self.copy_source).commands_sent
+            ref = self._fall_ref.get(status.name)
+            if ref is None or ref[1] != sent:
+                self._fall_ref[status.name] = (status.position_counts, sent)
+                continue
+            moved = abs(status.position_counts - ref[0]) / per_mm
+            if moved > cfg.fall_limit_mm:
+                falling.append((status.name, moved,
+                                "drive off" if status.mode != int(MotorMode.POSITION)
+                                else "drive holding"))
+        if falling:
+            self._respond_to_fall(falling)
+
+    def _respond_to_fall(self, falling) -> None:
+        """Brakes on, drives take hold, alarm. Never raises."""
+        what = ", ".join(f"{name} moved {mm:.3f} mm with the {state}"
+                         for name, mm, state in falling)
+        try:
+            results = self.set_all_brakes(engaged=True)
+            failed = {k: v for k, v in results.items() if not str(v).startswith("ok")}
+            brakes = ("all brakes engaged" if not failed else
+                      "the brakes could NOT be engaged: "
+                      + "; ".join(f"{k}: {v}" for k, v in failed.items()))
+        except Exception as exc:  # noqa: BLE001 -- keep going to take hold
+            brakes = f"the brakes could NOT be engaged: {exc}"
+        # Anything still being driven stops too: nothing should push against
+        # brakes that have just come on.
+        self._halt_all_quietly("an axis was falling")
+        try:
+            taken = self._take_hold()
+        except Exception as exc:  # noqa: BLE001
+            taken = []
+            self._log(f"Could not take hold after a fall: {exc}")
+        alarm = (f"FALLING: {what}. {brakes[0].upper()}{brakes[1:]}"
+                 + (f"; {', '.join(taken)} turned on and holding" if taken else "")
+                 + ". Find out why before moving again.")
+        self._log(alarm)
+        self._fall_alarm = alarm
+        # Start again from here: if it keeps going, that is said again.
+        self._fall_ref.clear()
+
+    def pop_fall_alarm(self) -> Optional[str]:
+        """The last falling alarm, once, for the GUI to show."""
+        alarm, self._fall_alarm = self._fall_alarm, None
+        return alarm
 
     def _poll_pool(self):
         """Worker threads for reading the motors side by side."""

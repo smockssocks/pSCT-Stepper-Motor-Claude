@@ -139,7 +139,7 @@ class TestCli(unittest.TestCase):
             self.assertEqual(main(["--simulate", "--real-brakes", "brake",
                                    "status"]), 0)
         self.assertIn("ControlByWeb", buffer.getvalue())
-        self.assertIn("relay state", buffer.getvalue())
+        self.assertIn("ENGAGED", buffer.getvalue())
 
     def test_go_back_with_no_record_is_refused(self):
         import tempfile

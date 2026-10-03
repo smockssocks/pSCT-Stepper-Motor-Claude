@@ -102,8 +102,15 @@ class TestDriver(unittest.TestCase):
             controller.release(drives_holding=False)
         self.assertEqual(self.plc.relays[1], 0)
 
-    def test_without_feedback_the_state_is_the_relays_not_the_brakes(self):
+    def test_by_default_the_relay_reading_is_the_brake_state(self):
+        """The site's brakes are fail-safe and the PLC reports its relays
+        correctly, so the relay reading counts as the brake's state."""
         controller = BrakeController(cbw(self.plc), names=["Top", "East", "West"])
+        self.assertTrue(controller.state_is_measured("all"))
+
+    def test_without_trusting_the_relay_the_state_is_the_relays_not_the_brakes(self):
+        controller = BrakeController(cbw(self.plc, trust_relay_state=False),
+                                     names=["Top", "East", "West"])
         self.assertFalse(controller.state_is_measured("all"))
 
     def test_feedback_inputs_make_it_a_measurement(self):
@@ -125,7 +132,8 @@ class TestDriver(unittest.TestCase):
 
     def test_partial_feedback_confirms_nothing(self):
         controller = BrakeController(
-            cbw(self.plc, relays={"all": 1}, feedback_inputs={"Top": 5}),
+            cbw(self.plc, relays={"all": 1}, feedback_inputs={"Top": 5},
+                trust_relay_state=False),
             names=["Top", "East", "West"])
         self.assertFalse(controller.state_is_measured("all"))
 
@@ -205,21 +213,53 @@ class TestPlcProblems(unittest.TestCase):
             self.assertIs(controller.read_state(fresh=True), BrakeState.ENGAGED)
             self.assertEqual(controller.link_stats["retried"], 1)
             self.assertEqual(controller.link_stats["failed"], 0)
-            self.assertTrue(any("missed one read" in line for line in said), said)
+            self.assertEqual(said, [], "a hiccup is not worth a log line")
 
     def test_two_in_a_row_are_reported_with_the_reason(self):
         with FakeX432() as plc:
-            said = []
-            controller = BrakeController(cbw(plc), logger=said.append)
+            controller = BrakeController(cbw(plc))
             plc.slow_next = 2
             with self.assertRaises(BrakeError) as ctx:
                 controller.read_state(fresh=True)
             self.assertIn("timed out", str(ctx.exception))
             self.assertEqual(controller.link_stats["failed"], 1)
-            self.assertTrue(any(line.startswith("Lost the PLC") for line in said))
-            # ...and coming back is said too.
             self.assertIs(controller.read_state(fresh=True), BrakeState.ENGAGED)
-            self.assertIn("PLC answering again.", said)
+
+    def test_the_display_rides_out_a_slow_plc(self):
+        """The display's reading comes from a background reader: a PLC that
+        stops answering for a moment neither freezes the poll nor flips the
+        brakes to unreadable, until the last reading is 3 s old."""
+        with FakeX432() as plc:
+            said = []
+            controller = BrakeController(cbw(plc), logger=said.append)
+            self.addCleanup(controller.close)
+            self.assertIs(controller.read_state(), BrakeState.ENGAGED)
+            plc.slow_next = 4                      # about two failed reads
+            started = time.monotonic()
+            for _ in range(15):
+                self.assertIs(controller.read_state(), BrakeState.ENGAGED)
+                time.sleep(0.1)
+            # Fifteen polls in about 1.5 s: none waited on the PLC.
+            self.assertLess(time.monotonic() - started, 2.5)
+            self.assertEqual(said, [])
+
+    def test_a_plc_gone_for_good_is_reported_after_the_grace(self):
+        plc = FakeX432().start()
+        said = []
+        controller = BrakeController(cbw(plc), logger=said.append)
+        self.addCleanup(controller.close)
+        self.assertIs(controller.read_state(), BrakeState.ENGAGED)
+        plc.stop()
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            try:
+                controller.read_state()
+            except BrakeError:
+                break
+            time.sleep(0.2)
+        else:
+            self.fail("the brakes were never reported unreadable")
+        self.assertTrue(any("No reply from the PLC" in line for line in said), said)
 
     def test_watch_reports_a_clean_link(self):
         import contextlib
@@ -317,10 +357,19 @@ class TestPlatformWithThePlc(unittest.TestCase):
                                (platform.cfg.limits.min_focus_mm
                                 + platform.cfg.limits.max_focus_mm) / 2, places=2)
 
-    def test_emergency_without_feedback_leaves_the_drives_holding(self):
-        """The relay reads off, but nothing says the brake clamped, so the
-        drives stay on. A reversed relay or a blown fuse would read the same."""
+    def test_emergency_trusting_the_relay_turns_the_drives_off(self):
         platform = self._platform()
+        platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
+        result = platform.emergency_stop()
+        self.assertEqual(self.plc.relays[1], 0)            # brakes on
+        self.assertTrue(result.drives_off)
+        self.assertTrue(all(m.get_mode() == int(MotorMode.PASSIVE)
+                            for m in platform.motors))
+
+    def test_emergency_without_feedback_leaves_the_drives_holding(self):
+        """With trust_relay_state off: the relay reads off, but nothing says
+        the brake clamped, so the drives stay on."""
+        platform = self._platform(trust_relay_state=False)
         platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
         result = platform.emergency_stop()
         self.assertEqual(self.plc.relays[1], 0)            # brakes commanded on
@@ -341,6 +390,10 @@ class TestPlatformWithThePlc(unittest.TestCase):
         platform = self._platform()
         state = platform.read_state()
         self.assertIn("ControlByWeb", state.brake_summary)
+        self.assertNotIn("relay state", state.brake_summary)
+        self.assertFalse(any(m.brake.inferred for m in state.motors))
+        platform = self._platform(trust_relay_state=False)
+        state = platform.read_state()
         self.assertIn("relay state", state.brake_summary)
         self.assertTrue(all(m.brake.inferred for m in state.motors))
 

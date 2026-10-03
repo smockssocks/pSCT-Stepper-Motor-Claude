@@ -159,13 +159,14 @@ What the software will and will not believe about the PLC:
 
 - **Which relay, which way round** are settings (`relays`,
   `energized_releases`), because the wiring is not known from here.
-- **A relay's state is not a brake's state.** Relay off means the PLC was told
-  to clamp. Reversed polarity, a blown fuse or a loose wire all read the same.
-  Unless a digital input reports the brake itself (`feedback_inputs`), the
-  Brakes line says "relay state; nothing measures the brake itself", and **EMERGENCY will not turn the drives
-  off**: it only does that when the brakes are confirmed holding. The same rule
-  now applies to an HTTP device that only echoes the last command. Before this
-  it would have counted that as confirmation.
+- **The PLC's report is the brake state** (`trust_relay_state`, on by
+  default): the brakes are fail-safe and the PLC reports its relays
+  correctly. EMERGENCY turns the drives off once the PLC reports the brakes
+  engaged, and keeps them on and holding if it cannot. With
+  `trust_relay_state` false, a relay reading counts only as what the PLC was
+  told, and EMERGENCY keeps the drives on unless a feedback input confirms the
+  brake. An HTTP device that only echoes the last command never counts as
+  confirmation.
 - **Releasing is interlocked**: it is refused unless every drive is enabled
   and holding. **Enable drives** turns them on holding exactly where they are.
   The target is set to the encoder position first, so a stale target cannot

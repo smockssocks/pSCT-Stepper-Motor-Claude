@@ -370,6 +370,16 @@ class TestBenchCopies(unittest.TestCase):
         self.assertAlmostEqual(after[1], after[0], places=4)
         self.assertAlmostEqual(after[2], after[0], places=4)
 
+    def test_a_jog_between_polls_is_not_taken_for_a_fall(self):
+        """The copies move when Top is commanded, not when they are, so the
+        falling watch has to count Top's commands for them."""
+        platform = self._platform()
+        platform.read_state()
+        platform.move_actuator_mm("Top", 0.3, relative=True)
+        time.sleep(0.2)
+        platform.read_state()
+        self.assertIsNone(platform.pop_fall_alarm())
+
     def test_tilts_and_stand_in_jogs_are_refused_with_a_reason(self):
         from psct_motors.kinematics import Orientation
         platform = self._platform()

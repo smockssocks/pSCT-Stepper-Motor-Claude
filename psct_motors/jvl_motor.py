@@ -202,6 +202,8 @@ class JVLMotor:
         #: CL: Current Max (212), cached. A configuration value, not a
         #: measurement, so it is read once rather than on every poll.
         self._current_limit: Optional[int] = None
+        #: Mode and target writes so far (see write_register).
+        self.commands_sent = 0
         #: Highest torque percentage seen during the most recent move, so a
         #: move that finished can still say how hard it had to work.
         self.peak_torque_percent: Optional[float] = None
@@ -293,6 +295,10 @@ class JVLMotor:
         words = int32_to_words(value, self.word_order)
         with self._lock:
             self._transport.write_holding(modbus_address(number), words)
+            if number in (2, 3):        # MODE_REG, P_SOLL
+                # Counted, so a watcher can tell "the shaft moved" from "the
+                # shaft was told to move" without catching the command live.
+                self.commands_sent += 1
 
     def read_registers(self, regs: List[Union[int, str]]) -> Dict[str, int]:
         """Read several registers, keyed by the name or number given."""

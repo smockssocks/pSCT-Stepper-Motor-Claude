@@ -285,5 +285,91 @@ class TestRestingOnTheBrakes(_Base):
         self.assertTrue(platform.history.last().completed)
         self.assertTrue(any("did NOT rest on the brakes" in line for line in self.log))
 
+
+class TestFallingWatch(_Base):
+    """An axis nobody is driving that moves on its own: brakes on at once."""
+
+    def _poll_until(self, platform, seconds, condition):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            platform.read_state()
+            if condition():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_a_passive_axis_that_starts_falling_gets_the_brakes(self):
+        from psct_motors.registers import MotorMode
+        platform = self._platform()
+        platform.enable_drives()
+        platform.set_all_brakes(engaged=False)
+        platform.read_state()
+        # The drive on East drops out and nothing holds it.
+        east = platform.motor("East")
+        east.passivate(stop_first=False)
+        caught = self._poll_until(platform, 3.0,
+                                  lambda: platform._fall_alarm is not None
+                                  or self._brakes_engaged(platform))
+        self.assertTrue(caught, "the fall was never noticed")
+        alarm = platform.pop_fall_alarm()
+        self.assertIn("FALLING: East moved", alarm)
+        self.assertIn("drive off", alarm)
+        self.assertTrue(self._brakes_engaged(platform))
+        self.assertEqual(east.get_mode(), int(MotorMode.POSITION))
+        # And it has stopped falling.
+        settled = east.get_position_mm()
+        for _ in range(5):
+            platform.read_state()
+            time.sleep(0.05)
+        self.assertAlmostEqual(east.get_position_mm(), settled, places=3)
+
+    def test_moves_and_stops_never_look_like_a_fall(self):
+        platform = self._platform()
+        start = platform.read_orientation().focus_mm
+        done = threading.Event()
+
+        def poll():
+            while not done.is_set():
+                platform.read_state()
+                time.sleep(0.05)
+
+        poller = threading.Thread(target=poll, daemon=True)
+        poller.start()
+        try:
+            platform.move_to_orientation(Orientation(start + 1.0, 0.0, 0.0))
+            platform.move_actuator_mm("Top", 0.3, relative=True)
+            platform.move_to_orientation(Orientation(start, 0.0, 0.0))
+        finally:
+            done.set()
+            poller.join(timeout=1.0)
+        self.assertIsNone(platform.pop_fall_alarm())
+
+    def test_a_move_finished_between_two_polls_is_not_a_fall(self):
+        platform = self._platform(rest_watch_s=0.2)
+        platform.rest_after_moves = True
+        start = platform.read_orientation().focus_mm
+        platform.move_to_orientation(Orientation(start + 0.5, 0.0, 0.0))
+        platform.read_state()
+        platform.move_to_orientation(Orientation(start + 1.0, 0.0, 0.0))
+        platform.read_state()
+        self.assertIsNone(platform.pop_fall_alarm())
+
+    def test_a_still_axis_does_not_trip_it(self):
+        platform = self._platform()
+        for _ in range(10):
+            platform.read_state()
+            time.sleep(0.05)
+        self.assertIsNone(platform.pop_fall_alarm())
+
+    def test_it_can_be_turned_off(self):
+        platform = self._platform(fall_watch=False)
+        platform.enable_drives()
+        platform.set_all_brakes(engaged=False)
+        platform.motor("East").passivate(stop_first=False)
+        for _ in range(10):
+            platform.read_state()
+            time.sleep(0.05)
+        self.assertIsNone(platform.pop_fall_alarm())
+
 if __name__ == "__main__":
     unittest.main()

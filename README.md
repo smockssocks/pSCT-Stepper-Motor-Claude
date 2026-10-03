@@ -175,6 +175,14 @@ Every coordinated move is watched while it runs, and checked when it ends.
   holding, and the brakes are applied; the message says which motor and by
   how much.
 
+- **Falling watch.** On every status poll, any axis the drive is not
+  driving (passive, any mode other than Position, or holding with its move
+  finished) is watched. If it moves more than `fall_limit_mm` (0.05 mm) on its
+  own, it is falling or slipping: every brake is engaged at once, anything
+  being driven is stopped, every passive drive takes hold where it now is, and
+  the red bar says which motor moved and how far. It resets whenever a drive
+  is driving its axis, so moves, STOP and the hard-stop search never trip it.
+  It needs nobody at the controls, only the GUI (or anything polling) running.
 - **Already straining.** A move or jog is refused before anything happens
   if any motor is already at or over its torque stop level while standing
   still: something is pushing against it, and forcing a move could damage the
@@ -199,10 +207,9 @@ make no small corrections:
    drives are turned straight back on, holding where they are, and the log
    says which motor moved and how far.
 
-If the brakes cannot be read back as engaged, the drives stay on. When nothing
-senses the brakes themselves (the brake line says "relay state"), "engaged"
-only means the PLC was told to clamp, so the GUI asks once per session whether
-to rely on the relay; the encoder watch in step 3 still applies.
+If the PLC does not report the brakes engaged, the drives stay on. (With
+`trust_relay_state` set to false, the GUI also asks once per session before
+relying on the relay reading.)
 
 Tick **Disable drives after each move** to do this automatically when every
 move or jog finishes (for this session). The next move turns the drives back on
@@ -562,14 +569,22 @@ time. Then:
   the PLC) works, but moving the PLC onto the motors' network (for example
   192.168.0.60) is simpler and removes one thing that can go wrong.
 
-**Relay state vs brake state.** A relay reading "off" means the PLC was told to
-turn it off. It does not prove the brake clamped: reversed polarity, a blown
-fuse or a loose wire all read the same. So unless a digital input reports what
-the brake actually did (a switch on the brake, or a sense on its supply), the
-GUI marks the brake state with **?** and says *relay state*, and EMERGENCY will
-not turn the drives off, because it cannot confirm anything else is holding the
-camera. If the X-432 has a spare input wired to such a signal, set it under
-*Brake feedback inputs* and both of those change.
+**The PLC's report is the brake state.** The brakes are fail-safe (power
+releases them, no power clamps them), and the PLC reports its relays
+correctly, so a relay reading "off" is taken as a clamped brake
+(`trust_relay_state`, on by default). EMERGENCY and Disable drives turn the
+drives off once the PLC reports the brakes engaged; if the PLC cannot be read,
+the drives stay on and holding. Disable drives also watches the encoders after
+the drives go off and turns them straight back on if anything moves, so a brake
+that does not actually hold is caught. If a switch on the brake is ever wired to
+a PLC input, set it under *Brake feedback inputs* and that reading is used
+instead.
+
+**If the PLC drops a reply.** The display reads the PLC in the background and
+keeps the last good reading for up to 3 s, so a slow reply does not show up as
+the brakes going unreadable. Anything that acts on the brakes (a move, a
+release, EMERGENCY) reads the PLC there and then. The log only says so if the
+PLC has not answered for 3 s, and again when it is back.
 
 If the PLC's own logic (a task or script on the X-432) switches the brake
 relay, the software notices: a relay that does not end up where it was sent is

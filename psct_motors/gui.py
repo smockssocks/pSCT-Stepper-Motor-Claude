@@ -626,9 +626,9 @@ class MotorApp:
         explanation = tk.Label(
             bar,
             text="STOP decelerates and holds position with the drives still on. "
-                 "EMERGENCY does that too, then engages the brakes, and turns the "
-                 "drives off ONLY if the brakes are confirmed holding -- otherwise "
-                 "they stay on, because they are the only thing holding the camera. "
+                 "EMERGENCY does that too, then engages the brakes and, once the "
+                 "PLC reports them engaged, turns the drives off. If the PLC "
+                 "cannot confirm the brakes, the drives stay on and holding. "
                  "Neither asks for confirmation.",
             bg=COLOR_STOP_DARK, fg="#ffd7d7", font=("TkDefaultFont", 8),
             justify="left", anchor="w",
@@ -1209,6 +1209,9 @@ class MotorApp:
 
     def _apply_state(self, state: PlatformState) -> None:
         self._last_state = state
+        alarm = self.platform.pop_fall_alarm()
+        if alarm:
+            self._announce(alarm, COLOR_BAD)
         for status in state.motors:
             row = self.rows.get(status.name)
             if row:
@@ -1230,8 +1233,12 @@ class MotorApp:
                 f"({o.total_tilt_arcsec:.1f} arcsec) towards azimuth "
                 f"{o.tilt_azimuth_deg:.1f} deg"
             )
+            # Only while something is moving. At rest the drive's command and
+            # the encoder differ by the standing lag (about 1.4 um on these
+            # motors, and settling leaves the command offset by it on purpose),
+            # so comparing them kept the target drawn after arrival.
             target = None
-            if state.all_connected:
+            if state.all_connected and state.moving:
                 try:
                     target = self.platform.geometry.orientation_from_actuators(
                         [m.target_mm for m in state.motors]).focus_mm
@@ -1394,8 +1401,9 @@ class MotorApp:
         else:
             self._announce_threadsafe(
                 f"{stamp}  EMERGENCY done: stopped and HOLDING. The drives are "
-                f"still on, on purpose -- the brakes are not confirmed, and "
-                f"cutting power would leave the focal plane held by nothing.",
+                f"still on, on purpose: the PLC did not confirm the brakes "
+                f"engaged, and cutting power would leave the focal plane held "
+                f"by nothing.",
                 COLOR_STOP)
         self.post(lambda: self._set_busy(False))
 
@@ -2509,11 +2517,10 @@ class MotorApp:
         feedback = ttk.LabelFrame(window, text="Brake feedback inputs (optional)")
         feedback.grid(row=3, column=0, sticky="nsew", padx=(12, 6), pady=4)
         tk.Label(feedback, justify="left", anchor="w", fg="#555", wraplength=300,
-                 text=("A digital input that reports what the brake actually "
-                       "did: a switch on the brake, or a sense on its supply. "
-                       "Without one, the state shown is the relay's, not the "
-                       "brake's, and EMERGENCY keeps the drives on because it "
-                       "cannot confirm the brakes are holding.")
+                 text=("Not needed: the PLC's relay reading is taken as the "
+                       "brake state. If a switch on the brake is ever wired "
+                       "to a PLC input, give it here and that reading is used "
+                       "instead.")
                  ).grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=4)
         fb = settings.feedback_inputs
         fb_mode = tk.StringVar(value=("none" if not fb else
@@ -2719,7 +2726,8 @@ class MotorApp:
                 self.log("  This is a simulation, so the PLC is NOT being used. "
                          "Start with --real-brakes to switch it from a "
                          "simulation, or --bench to test it with one real motor.")
-            if new.mode == "controlbyweb" and not new.feedback_inputs:
+            if (new.mode == "controlbyweb" and not new.feedback_inputs
+                    and not new.trust_relay_state):
                 self.log("  No feedback inputs: the brake state shown is the "
                          "relay's, and EMERGENCY will keep the drives on.")
             if persist:

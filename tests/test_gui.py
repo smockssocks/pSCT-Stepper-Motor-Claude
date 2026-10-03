@@ -1018,14 +1018,19 @@ class TestGui(unittest.TestCase):
         line = self.app.brake_ctrl_var.get()
         self.assertIn("ControlByWeb", line)
         self.assertIn("engaged", line)
-        self.assertIn("relay state", line)
+        # The PLC's report is the brake state, so no "relay state" caveat.
+        self.assertNotIn("relay state", line)
 
     def test_the_brake_line_shows_a_dead_plc(self):
         plc = self._use_fake_plc()
         self.app._start_polling()
         self.pump(0.6)
         plc.stop()
+        # The last good reading stands for 3 s, so a dropped reply or two
+        # does not flip the line; after that it says so.
         self.pump(1.5)
+        self.assertNotIn("NOT READABLE", self.app.brake_ctrl_var.get())
+        self.pump(3.0)
         self.assertIn("NOT READABLE", self.app.brake_ctrl_var.get())
 
     def test_the_brake_settings_read_the_plc_and_apply(self):
