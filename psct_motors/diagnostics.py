@@ -444,27 +444,23 @@ def _check_supply(motor: JVLMotor) -> List[Finding]:
                         f"Could not read the bus voltage: {exc}")]
 
     # A failed supply is the documented first thing to check when a pSCT motor
-    # will not move. The check compares this motor's reading against its own
-    # recorded healthy one, which is the only comparison here that does not
-    # assume a scale nobody has established.
+    # will not move. Register 97 is judged on its own scale (1804 raw = 48 V,
+    # measured against MacTalk), never against register 139.
     verdict, explanation = motor.supply_is_healthy(voltage)
     if verdict is False:
         findings.append(Finding(
             BLOCKING, "Supply has failed",
-            f"Compared against this motor's own recorded healthy reading, "
-            f"{explanation}. A drive with no main supply still answers Modbus "
+            f"{explanation[0].upper()}{explanation[1:]}. A drive with no main supply still answers Modbus "
             "from its control supply: it accepts targets and ignores them.",
             "Check the motor supply and its breaker, then re-read this.",
             data={"voltage": voltage,
-                  "healthy_raw": motor.cfg.supply_raw_at_nominal},
+                  "healthy_raw": motor.supply_scale()[1]},
         ))
     elif verdict is None:
         findings.append(Finding(
             UNKNOWN, "Supply cannot be judged",
             explanation,
-            f"Run `cli supply --motor {motor.name}` with the supply on. "
-            "Without it, a motor that silently ignores its targets because "
-            "its supply has dropped will look like a software fault.",
+            "Check the connection to the motor and read this again.",
             data={"voltage": voltage},
         ))
 

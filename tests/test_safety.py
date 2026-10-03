@@ -308,6 +308,83 @@ class TestBenchMode(unittest.TestCase):
         self.assertAlmostEqual(platform.read_orientation().focus_mm, 1.0, places=2)
 
 
+class TestBenchCopies(unittest.TestCase):
+    """On a one-motor bench the stand-ins copy the real motor.
+
+    As independent simulated axes they tilted the plane as soon as they
+    disagreed with it, and sagged under gravity with the drives off.
+    """
+
+    def _platform(self, copy=True):
+        from psct_motors.cli import apply_bench
+        from psct_motors.simulator import simulated_motor
+
+        class Bench(FocalPlanePlatform):
+            # A simulated motor in the place of the real one: no hardware in
+            # a test, but built through the real-motor path.
+            def _build_real_motor(self, a):
+                return simulated_motor(a, start_mm=3.0, follow_error_counts=7)
+
+        cfg = safety.bench_config()
+        apply_bench(cfg, "Top")
+        cfg.bench_stand_ins_copy_real = copy
+        platform = Bench(cfg=cfg, simulate=False)
+        platform.connect()
+        self.addCleanup(platform.disconnect)
+        return platform
+
+    def test_the_stand_ins_sit_where_the_real_motor_is(self):
+        platform = self._platform()
+        self.assertEqual(platform.copied_names, ["East", "West"])
+        self.assertEqual(platform.copy_source, "Top")
+        top, east, west = platform.read_actuator_positions_mm()
+        self.assertAlmostEqual(east, top, places=4)
+        self.assertAlmostEqual(west, top, places=4)
+
+    def test_they_do_not_sag_with_the_drives_off(self):
+        platform = self._platform()
+        before = platform.read_actuator_positions_mm()
+        time.sleep(0.5)
+        self.assertEqual([round(v, 4) for v in platform.read_actuator_positions_mm()],
+                         [round(v, 4) for v in before])
+
+    def test_a_focus_move_keeps_the_plane_flat_and_finishes(self):
+        from psct_motors.kinematics import Orientation
+        platform = self._platform()
+        platform.move_to_orientation(Orientation(5.0, 0.0, 0.0))
+        state = platform.read_state()
+        self.assertFalse(state.moving)
+        self.assertLess(state.orientation.total_tilt_deg, 1e-4)
+        positions = platform.read_actuator_positions_mm()
+        self.assertAlmostEqual(max(positions) - min(positions), 0.0, places=4)
+
+    def test_jogging_the_real_motor_moves_the_copies(self):
+        platform = self._platform()
+        start = platform.read_actuator_positions_mm()
+        platform.move_actuator_mm("Top", 0.5, relative=True)
+        time.sleep(0.2)
+        state = platform.read_state()
+        self.assertFalse(state.moving)
+        after = platform.read_actuator_positions_mm()
+        self.assertAlmostEqual(after[0] - start[0], 0.5, delta=0.01)
+        self.assertAlmostEqual(after[1], after[0], places=4)
+        self.assertAlmostEqual(after[2], after[0], places=4)
+
+    def test_tilts_and_stand_in_jogs_are_refused_with_a_reason(self):
+        from psct_motors.kinematics import Orientation
+        platform = self._platform()
+        with self.assertRaises(PlatformError) as ctx:
+            platform.move_to_orientation(Orientation(3.0, 0.1, 0.0))
+        self.assertIn("bench mode", str(ctx.exception))
+        with self.assertRaises(PlatformError) as ctx:
+            platform.move_actuator_mm("East", 0.1, relative=True)
+        self.assertIn("copy of Top", str(ctx.exception))
+
+    def test_copying_can_be_turned_off(self):
+        platform = self._platform(copy=False)
+        self.assertEqual(platform.copied_names, [])
+
+
 class TestSimulatedBoundsAreCoherent(unittest.TestCase):
     """The simulated end stops have to agree with the configured limits.
 
@@ -569,12 +646,19 @@ class TestSupplyVoltage(unittest.TestCase):
         platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
         self.assertAlmostEqual(platform.read_orientation().focus_mm, 1.0, places=2)
 
-    def test_without_a_baseline_the_supply_cannot_be_judged(self):
+    def test_without_a_recording_the_measured_scale_is_used(self):
+        """1804 raw read 48.0 V on MacTalk; nothing needs entering."""
         platform = self._platform(supply_nominal_v=None,
                                   supply_raw_at_nominal=None)
-        verdict, explanation = platform.motors[0].supply_is_healthy()
-        self.assertIsNone(verdict)
-        self.assertIn("cli supply", explanation)
+        motor = platform.motors[0]
+        verdict, explanation = motor.supply_is_healthy(1804)
+        self.assertTrue(verdict)
+        self.assertIn("48.0 V", explanation)
+        self.assertAlmostEqual(motor.get_supply_volts(1794), 47.7, places=1)
+        self.assertAlmostEqual(platform.read_state().motors[0].supply_volts,
+                               48.0, places=1)
+        verdict, _ = motor.supply_is_healthy(int(1804 * 0.7))
+        self.assertFalse(verdict)
 
     def test_a_recorded_baseline_gives_volts(self):
         platform = self._platform(supply_nominal_v=48.0,
@@ -582,20 +666,22 @@ class TestSupplyVoltage(unittest.TestCase):
         motor = platform.motors[0]
         self.assertAlmostEqual(motor.get_supply_volts(4485), 48.0, places=3)
         self.assertAlmostEqual(motor.get_supply_volts(2242), 24.0, places=1)
+        # The simulated drive reads 1804, which on a 4485 = 48 V recording
+        # is 19.3 V: a recording overrides the measured scale.
         self.assertAlmostEqual(platform.read_state().motors[0].supply_volts,
-                               48.0, places=1)
+                               1804 * 48.0 / 4485, places=1)
 
     def test_a_real_supply_failure_is_caught_once_there_is_a_baseline(self):
         from psct_motors.kinematics import Orientation
         platform = self._platform(supply_nominal_v=48.0,
                                   supply_raw_at_nominal=4485)
         for motor in platform.motors:
-            motor._transport.set_powered(False)        # drops 97 to 1794
+            motor._transport.set_powered(False)        # drops 97 to 300
         with self.assertRaises(PlatformError) as ctx:
             platform.move_to_orientation(Orientation(1.0, 0.0, 0.0))
         message = str(ctx.exception)
         self.assertIn("supply has failed", message.lower())
-        self.assertIn("19.2 V", message)               # 1794 scaled to volts
+        self.assertIn("3.2 V", message)                # 300 on the 4485 = 48 V scale
 
     def test_a_reading_a_little_low_is_still_accepted(self):
         """48 V nominal, a few volts of sag, still fine."""

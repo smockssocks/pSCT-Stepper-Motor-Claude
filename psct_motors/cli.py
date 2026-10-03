@@ -94,6 +94,10 @@ def make_platform(args) -> FocalPlanePlatform:
             + " is a real motor.")
         out("Anything the simulated axes report is made up. Use this to")
         out("exercise the application, not to believe its numbers.")
+        if platform.copied_names:
+            out(" and ".join(platform.copied_names) + " copy "
+                + platform.copy_source + ", so the plane stays flat; tip, tilt "
+                "and jogging them on their own are refused.")
     return platform
 
 
@@ -1275,11 +1279,15 @@ def cmd_supply(args) -> int:
             existing = motor.cfg.supply_raw_at_nominal
             out(f"  {motor.name:<6} reads {raw:>8}   "
                 f"(acceptance register {acceptance}, lowest ever {lowest})")
+            volts = motor.get_supply_volts(raw)
             if existing:
-                volts = motor.get_supply_volts(raw)
                 out(f"         previously recorded {existing} = "
-                    f"{motor.cfg.supply_nominal_v:g} V"
-                    + (f", so this reading is {volts:.1f} V" if volts else ""))
+                    f"{motor.cfg.supply_nominal_v:g} V, so this reading is "
+                    f"{volts:.1f} V")
+            else:
+                out(f"         {volts:.1f} V on the measured scale "
+                    f"({motor.cfg.supply_raw_per_volt:.2f} raw per volt). "
+                    "Recording is only needed if that is wrong for this motor.")
 
         if not readings:
             out("")
@@ -1662,9 +1670,9 @@ commissioning order
   calibrate            measure counts per millimetre           (per motor)
   probe-brake          confirm brake control and polarity      (per motor)
   plc                  read the brake PLC (X-432): every relay and input
-  supply               record what the bus-voltage register reads with the
-                       supply healthy, so volts can be shown and a failed
-                       supply can be told from a normal reading
+  supply               show each drive's supply in volts, and optionally
+                       record a reading if a motor's scale differs from the
+                       measured 1804 raw = 48 V
   set-zero             define the reference orientation
   status / move        normal operation
   history / go-back    where the focal plane has been, and back to the
@@ -1903,14 +1911,13 @@ one motor on a bench
 
     p = command(
         "supply",
-        help="record what the supply reads when healthy, so volts can be shown",
+        help="show the supply in volts; record a reading if the scale differs",
         description=(
-            "Register 97 is in the drive's own raw units and the register map "
-            "does not say what they are worth. Read it with the supply known "
-            "good, say what the voltage actually is, and the software can then "
-            "report volts and tell a real supply failure from a normal "
-            "reading. Until this is done it cannot do either, and says so "
-            "rather than guessing."
+            "Register 97 is in the drive's own raw units: 1804 of them read "
+            "48.0 V on the pSCT motor, against MacTalk's display, and that "
+            "scale is used by default. If a motor reads differently, give the "
+            "voltage the supply is really at and this motor's reading is "
+            "recorded beside it, overriding the default for that motor."
         ),
     )
     p.add_argument("--volts", type=float,

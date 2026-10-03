@@ -669,17 +669,12 @@ class TestGui(unittest.TestCase):
 
     # ---- supply column ---------------------------------------------------
 
-    def test_each_row_shows_the_supply(self):
-        """Raw until `cli supply` has recorded the scale, volts afterwards."""
+    def test_each_row_shows_the_supply_in_volts_with_nothing_entered(self):
+        """1804 raw = 48.0 V, measured against MacTalk, so no setup."""
         self.app._start_polling()
         self.pump(0.5)
         for row in self.app.rows.values():
-            self.assertIn("raw", row.supply_var.get())
-        for actuator in self.app.cfg.actuators:
-            actuator.supply_nominal_v = 48.0
-            actuator.supply_raw_at_nominal = 4485       # what the simulator reads
-        self.pump(1.5)                  # more than one idle poll interval
-        self.assertEqual(self.app.rows["Top"].supply_var.get(), "48.0 V")
+            self.assertEqual(row.supply_var.get(), "48.0 V")
 
     # ---- gauge reference ---------------------------------------------------
 
@@ -806,23 +801,63 @@ class TestGui(unittest.TestCase):
 
     # ---- supply scale ----------------------------------------------------------
 
-    def test_the_supply_dialog_turns_raw_into_volts(self):
+    def test_the_supply_dialog_can_override_the_scale(self):
         self.app._start_polling()
         self.pump(0.5)
-        self.assertIn("raw", self.app.rows["Top"].supply_var.get())
+        self.assertEqual(self.app.rows["Top"].supply_var.get(), "48.0 V")
         self.app.on_set_supply_scale()
         self.pump(0.1)
         window = self.app._supply_window
         entry = [w for f in window.winfo_children() if isinstance(f, ttk.Frame)
                  for w in f.winfo_children() if isinstance(w, ttk.Entry)][0]
         entry.delete(0, "end")
-        entry.insert(0, "48")
+        entry.insert(0, "24")
         buttons = [w for f in window.winfo_children() if isinstance(f, ttk.Frame)
                    for w in f.winfo_children() if isinstance(w, ttk.Button)]
         [b for b in buttons if b.cget("text") == "Record"][0].invoke()
         self.pump(1.5)
-        self.assertEqual(self.app.rows["Top"].supply_var.get(), "48.0 V")
+        # A recording overrides the measured scale for that motor.
+        self.assertEqual(self.app.rows["Top"].supply_var.get(), "24.0 V")
         window.destroy()
+
+    # ---- torque limit and update rate ----------------------------------------
+
+    def test_the_torque_limit_needs_the_password_and_is_saved(self):
+        from psct_motors.config import load_config
+        self.app.on_open_load_view()
+        self.pump(0.2)
+        warn_entry, stall_entry = self.app._limit_entries
+        self.assertEqual(str(stall_entry.cget("state")), "disabled")
+        self.app._ask_password("x", self.app._unlock_torque_limits)
+        self.assertFalse(self.app._submit_password("wrong"))
+        self.assertEqual(str(stall_entry.cget("state")), "disabled")
+        self.assertTrue(self.app._submit_password("11328pixels!"))
+        self.assertEqual(str(stall_entry.cget("state")), "normal")
+
+        self.app.warn_limit_var.set("50")
+        self.app.stall_limit_var.set("40")             # amber above the stop
+        self.assertFalse(self.app._apply_torque_limits())
+        self.assertEqual(self.app.cfg.actuators[0].stall_torque_percent, 45.0)
+
+        self.app.warn_limit_var.set("35")
+        self.app.stall_limit_var.set("55")
+        self.assertTrue(self.app._apply_torque_limits())
+        for actuator in self.app.cfg.actuators:
+            self.assertEqual((actuator.torque_warn_percent,
+                              actuator.stall_torque_percent), (35.0, 55.0))
+        self.assertEqual(self.app.rows["Top"].load_bar.stall_percent, 55.0)
+        self.assertEqual(load_config(self.app.config_path).actuators[0]
+                         .stall_torque_percent, 55.0)
+        self.assertEqual(str(stall_entry.cget("state")), "disabled")
+        self.app._load_window.destroy()
+
+    def test_the_update_rate_can_be_raised(self):
+        self.app._set_readings_per_second("10")
+        self.assertAlmostEqual(self.app.cfg.idle_poll_interval_s, 0.1)
+        self.assertAlmostEqual(self.app.cfg.poll_interval_s, 0.1)
+        self.app._set_readings_per_second("2")
+        self.assertAlmostEqual(self.app.cfg.idle_poll_interval_s, 0.5)
+        self.assertAlmostEqual(self.app.cfg.poll_interval_s, 0.1)
 
     # ---- layout --------------------------------------------------------------
 

@@ -561,6 +561,17 @@ class TestConfigValidation(unittest.TestCase):
         self.assertEqual(restored.actuators[0].brake.mode, "output")
         self.assertEqual(restored.actuators[0].brake.output_bit, 3)
 
+    def test_untouched_old_poll_rates_get_the_new_defaults(self):
+        """0.15 s / 0.5 s were the old defaults and every saved file has them.
+        A file that still does was never tuned, so it gets the faster ones;
+        one that someone changed keeps its value."""
+        from psct_motors.config import PlatformConfig, config_from_dict
+        old = config_from_dict({"poll_interval_s": 0.15, "idle_poll_interval_s": 0.5})
+        self.assertEqual(old.poll_interval_s, PlatformConfig.poll_interval_s)
+        self.assertEqual(old.idle_poll_interval_s, PlatformConfig.idle_poll_interval_s)
+        tuned = config_from_dict({"poll_interval_s": 0.15, "idle_poll_interval_s": 1.0})
+        self.assertEqual(tuned.idle_poll_interval_s, 1.0)
+
     def test_unknown_config_key_is_reported_not_ignored(self):
         from psct_motors.config import config_from_dict
         with self.assertRaises(ValueError) as ctx:

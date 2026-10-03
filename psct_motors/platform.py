@@ -53,6 +53,11 @@ from .transport import ModbusError
 #: ordinary move first.
 SIMULATED_STOP_MARGIN_MM = 1.4
 
+#: In bench mode the stand-ins copy the real motor, so no tilt can be made.
+#: A target is "flat" below this: a saved position or a log entry from the
+#: bench carries a few counts of rounding, which is far below anything real.
+COPY_TILT_TOLERANCE_DEG = 1e-3
+
 
 class PlatformError(RuntimeError):
     """A move was refused, or the platform is not in a state to move."""
@@ -310,16 +315,72 @@ class FocalPlanePlatform:
         # one actuator asks to be. The mixed case is the point: one real motor
         # on a bench, two stood in, so everything above the driver can be
         # exercised before all three are wired.
+        self._stand_ins = [a.name for a in self.cfg.actuators
+                           if simulate or a.simulated]
         self.motors: List[JVLMotor] = [
-            self._build_motor(a, simulate or a.simulated)
+            self._build_motor(a, a.name in self._stand_ins)
             for a in self.cfg.actuators
         ]
+        #: Stand-ins that copy a real motor (bench mode), and which motor.
+        self.copied_names: List[str] = []
+        self.copy_source: Optional[str] = None
+        self._attach_copies()
+
+    def _build_real_motor(self, a) -> JVLMotor:
+        return JVLMotor(a, timeout_s=self.cfg.modbus_timeout_s,
+                        retries=self.cfg.modbus_retries, logger=self._log)
+
+    def _attach_copies(self) -> None:
+        """Bench mode: make each stand-in a copy of the real motor.
+
+        With one real motor and two independent simulated ones, the plane
+        tilted as soon as they disagreed, and with the drives off and no brake
+        the simulated two sagged under gravity without end. As copies they sit
+        wherever the real motor is and go wherever it is sent, so the plane is
+        flat and moves only in focus, which is all one motor can show anyway.
+        """
+        if not self.cfg.bench_stand_ins_copy_real:
+            return
+        real = [m for m in self.motors if m.name not in self._stand_ins]
+        if not real or len(real) == len(self.motors):
+            return
+        source = real[0]
+        cache = {"at": 0.0, "reading": None}
+        lock = threading.Lock()
+
+        def source_reading():
+            """(encoder, projected, target) of the real motor, in its counts,
+            read at most every 0.1 s however many copies ask."""
+            with lock:
+                now = time.monotonic()
+                if cache["reading"] is None or now - cache["at"] > 0.1:
+                    try:
+                        cache["reading"] = (source.get_position_counts(),
+                                            source.get_projected_position_counts(),
+                                            source.get_target_counts())
+                        cache["at"] = now
+                    except Exception:  # noqa: BLE001 -- not connected yet, say
+                        return None
+                return cache["reading"]
+
+        for motor in self.motors:
+            if motor.name not in self._stand_ins:
+                continue
+
+            def follow(cfg=motor.cfg):
+                reading = source_reading()
+                if reading is None:
+                    return None
+                return tuple(cfg.mm_to_counts(source.cfg.counts_to_mm(c))
+                             for c in reading)
+            motor._transport.follow = follow
+            self.copied_names.append(motor.name)
+        self.copy_source = source.name
 
     def _build_motor(self, a, simulated: bool) -> JVLMotor:
         """One motor: real Modbus, or a stand-in."""
         if not simulated:
-            return JVLMotor(a, timeout_s=self.cfg.modbus_timeout_s,
-                            retries=self.cfg.modbus_retries, logger=self._log)
+            return self._build_real_motor(a)
 
         from .simulator import simulated_motor
         # Start the simulated actuators mid-travel so relative moves in both
@@ -378,9 +439,7 @@ class FocalPlanePlatform:
     @property
     def simulated_names(self) -> List[str]:
         """Which actuators are stood in rather than real."""
-        from .simulator import SimulatedJVLTransport
-        return [m.name for m in self.motors
-                if isinstance(m._transport, SimulatedJVLTransport)]
+        return list(self._stand_ins)
 
     @property
     def is_mixed(self) -> bool:
@@ -534,6 +593,9 @@ class FocalPlanePlatform:
     def disconnect(self) -> None:
         for m in self.motors:
             m.disconnect()
+        pool, self._pool = getattr(self, "_pool", None), None
+        if pool is not None:
+            pool.shutdown(wait=False)
 
     def __enter__(self) -> "FocalPlanePlatform":
         self.connect()
@@ -558,8 +620,11 @@ class FocalPlanePlatform:
         voltage and reuses the last ones, which is what a fast poll loop wants.
         """
         brake = self._external_brake_reading()
-        statuses = [self._with_external_brake(m.read_status(include_slow), brake)
-                    for m in self.motors]
+        # In parallel: each motor has its own connection, so reading them one
+        # after another made every poll three times as long as it needed to be.
+        raw = list(self._poll_pool().map(
+            lambda m: m.read_status(include_slow), self.motors))
+        statuses = [self._with_external_brake(s, brake) for s in raw]
         valid = all(s.connected and not s.comms_error for s in statuses)
         orientation = None
         message = ""
@@ -577,6 +642,15 @@ class FocalPlanePlatform:
         return PlatformState(motors=statuses, orientation=orientation,
                              orientation_valid=valid, message=message,
                              brake_summary=self.brake_summary)
+
+    def _poll_pool(self):
+        """Worker threads for reading the motors side by side."""
+        pool = getattr(self, "_pool", None)
+        if pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            pool = self._pool = ThreadPoolExecutor(
+                max_workers=max(1, len(self.motors)), thread_name_prefix="read")
+        return pool
 
     def _external_brake_reading(self):
         """One read of the brake device per poll, shared by all three axes.
@@ -670,6 +744,12 @@ class FocalPlanePlatform:
             problems.append(
                 f"total tilt {total_tilt:.4f} deg exceeds the {limits.max_tilt_deg:.3f} "
                 f"deg limit (tip {orientation.tip_deg:+.4f}, tilt {orientation.tilt_deg:+.4f})"
+            )
+        if self.copied_names and total_tilt > COPY_TILT_TOLERANCE_DEG:
+            problems.append(
+                f"tip/tilt is not possible in bench mode: "
+                f"{' and '.join(self.copied_names)} copy {self.copy_source}, "
+                "so the plane can only move in focus"
             )
 
         targets = self.geometry.actuators_from_orientation(orientation)
@@ -991,6 +1071,11 @@ class FocalPlanePlatform:
         orientation is not yet meaningful -- but it still enforces that
         actuator's own travel limits.
         """
+        if name in self.copied_names:
+            raise PlatformError(
+                f"{name} is standing in as a copy of {self.copy_source} in bench "
+                f"mode, so it cannot be moved on its own. Jog {self.copy_source}, "
+                "and the copies follow it.")
         with self._move_lock:
             motor = self.motor(name)
             if not motor.connected:
@@ -1114,9 +1199,10 @@ class FocalPlanePlatform:
         old check read as "below acceptance" and would have refused every move
         on a motor running perfectly well at 48 V.
 
-        Until `cli supply` has recorded a healthy reading there is nothing
-        trustworthy to compare against, so this says so once and lets the move
-        proceed rather than blocking on a guess.
+        Register 97 is judged on its own scale: 1804 raw = 48.0 V, measured
+        against MacTalk on the pSCT motor, or a reading recorded for that
+        motor. A supply that cannot be read at all is said once and does not
+        block, since the motor answering Modbus is itself evidence of power.
         """
         dead = []
         unknown = []
@@ -1139,12 +1225,10 @@ class FocalPlanePlatform:
         if unknown and not self._warned_no_supply_baseline:
             self._warned_no_supply_baseline = True
             self._log(
-                "Note: no healthy supply reading has been recorded for "
+                "Note: the supply voltage could not be read on "
                 + ", ".join(unknown)
-                + ", so a failed supply cannot be detected. Record one with the "
-                "supply on: Tools -> Supply voltage in the GUI (or click a supply "
-                "reading), or `cli supply`. Until then a motor that "
-                "silently ignores its targets will look like a software fault."
+                + ", so a failed supply cannot be detected there. A motor that "
+                "silently ignores its targets would look like a software fault."
             )
 
     def _release_external_brakes(self, name: Optional[str] = None) -> None:

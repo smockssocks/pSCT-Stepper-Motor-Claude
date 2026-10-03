@@ -727,18 +727,30 @@ class TestBusVoltage(unittest.TestCase):
         finally:
             motor.disconnect()
 
-    def test_without_a_recorded_value_it_says_so_rather_than_guessing(self):
+    def test_with_nothing_recorded_the_measured_scale_judges_it(self):
+        """1804 raw = 48.0 V was measured against MacTalk, so a motor with no
+        reading of its own recorded is still judged, not left unknown."""
         motor = healthy_motor()
         try:
             result = diagnose(motor)
             titles = [f.title for f in result.findings]
-            self.assertIn("Supply cannot be judged", titles)
+            self.assertNotIn("Supply cannot be judged", titles)
             self.assertEqual([f.title for f in result.blockers], [])
+            self.assertAlmostEqual(motor.get_supply_volts(1804), 48.0, places=3)
+        finally:
+            motor.disconnect()
+
+    def test_a_dead_supply_blocks_with_nothing_recorded(self):
+        motor = healthy_motor()
+        try:
+            motor._transport.set_powered(False)
+            titles = [f.title for f in diagnose(motor).blockers]
+            self.assertIn("Supply has failed", titles)
         finally:
             motor.disconnect()
 
     def test_powered_motor_does_not_trip_it(self):
-        motor = healthy_motor(supply_nominal_v=48.0, supply_raw_at_nominal=4485)
+        motor = healthy_motor(supply_nominal_v=48.0, supply_raw_at_nominal=1804)
         try:
             titles = [f.title for f in diagnose(motor).blockers]
             self.assertNotIn("Supply has failed", titles)

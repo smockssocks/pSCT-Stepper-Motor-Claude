@@ -68,11 +68,11 @@ out whether writes are landing at all. `--no-write-probe` turns even that off.
 
 ### Supply voltage: what the software knows and what it does not
 
-Register 97 `Bus voltage` reads in the drive's own raw units. **Nothing in the
-register map, and nothing in the dump, says what those units are worth in
-volts.** So the software does not guess. `cli supply` records the raw reading
-beside the voltage you measured with a meter, once, and everything after that
-is a straight ratio from a pair of numbers somebody actually observed.
+Register 97 `Bus voltage` reads in the drive's own raw units. Nothing in the
+register map says what those are worth, so the scale was measured: 1804 raw
+read exactly 48.0 V on MacTalk's display. Everything is a straight ratio from
+that pair. If a motor ever disagrees with MacTalk or a meter, `cli supply`
+records that motor's own pair.
 
 Two consequences worth knowing before anyone asks:
 

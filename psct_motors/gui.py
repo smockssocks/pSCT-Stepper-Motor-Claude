@@ -87,8 +87,11 @@ BRAKE_WORDS = {
 }
 
 
-#: The focal plane window (tip, tilt and single-actuator jogs) asks for a
-#: password. Only a salted hash is kept here, so the password itself is not
+#: Offered in the Load and torque window, readings per second while idle.
+READING_RATES = ("2", "5", "10")
+
+#: The focal plane window (tip, tilt and single-actuator jogs) and changing
+#: the torque limit ask for a password. Only a salted hash is kept here, so the password itself is not
 #: written in the source. To change it, put the new hash here:
 #:   python -c "import hashlib; print(hashlib.sha256(b'psct-tilt-lock:NEW').hexdigest())"
 TILT_PASSWORD_SALT = "psct-tilt-lock:"
@@ -160,13 +163,28 @@ class LoadBar(tk.Canvas):
                                           fill=COLOR_OK, width=0)
         self._peak_mark = self.create_line(0, 0, 0, 0, fill="#444", width=1,
                                            state="hidden")
-        for percent, colour in ((warn_percent, "#c77700"),
-                                (stall_percent, COLOR_BAD)):
-            x = self._x(percent)
-            self.create_line(x, 0, x, self.HEIGHT, fill=colour, width=1,
-                             dash=(2, 2))
+        self._marks = [self.create_line(0, 0, 0, 0, fill=colour, width=1,
+                                        dash=(2, 2))
+                       for colour in ("#c77700", COLOR_BAD)]
         self._text = self.create_text(self.WIDTH // 2, self.HEIGHT // 2,
                                       text="--", font=("TkDefaultFont", 7))
+        self.set_thresholds(warn_percent, stall_percent)
+
+    def resize(self, width: int, height: int) -> None:
+        self.WIDTH, self.HEIGHT = width, height
+        self.configure(width=width, height=height)
+        self.coords(self._text, width // 2, height // 2)
+        self.set_thresholds(self.warn_percent, self.stall_percent)
+        if self._percent is not None:
+            self.set(self._percent)
+
+    def set_thresholds(self, warn_percent: float, stall_percent: float) -> None:
+        """Move the warning and stop marks, e.g. after the limit is changed."""
+        self.warn_percent = warn_percent
+        self.stall_percent = stall_percent
+        for mark, percent in zip(self._marks, (warn_percent, stall_percent)):
+            x = self._x(percent)
+            self.coords(mark, x, 0, x, self.HEIGHT)
 
     def _x(self, percent: float) -> float:
         return max(1.0, min(self.WIDTH, self.WIDTH * percent / 100.0))
@@ -408,6 +426,12 @@ class MotorApp:
                                  if m.name not in self.platform.simulated_names)
                      + " is a real motor, and everything the others report is "
                        "made up.")
+            if self.platform.copied_names:
+                self.log(" and ".join(self.platform.copied_names) + " copy "
+                         + self.platform.copy_source + ": they sit wherever it "
+                         "is and go wherever it is sent, so the plane stays "
+                         "flat. Tip, tilt and jogging them on their own are "
+                         "refused.")
         for actuator in self.cfg.actuators:
             if not actuator.scale_is_measured:
                 self.log(
@@ -789,6 +813,8 @@ class MotorApp:
         self._brake_window = None
         self._brake_window_read = None
         self._load_rows = {}
+        self._limit_entries = ()
+        self._password_action = None
         self.plane_view = None
 
     def _build_actuators(self, parent) -> None:
@@ -1528,11 +1554,7 @@ class MotorApp:
                  text=("Torque as a percentage of each drive's current limit "
                        "(Actual Torque / CL: Current Max). These motors have "
                        "no register that reports amps, so this is the honest "
-                       "measure of how hard they are working. Supply shows "
-                       "volts once `cli supply` has been run with a meter on "
-                       "it, and the raw register value until then -- the "
-                       "drive's units are not documented and are not guessed "
-                       "at here.")
+                       "measure of how hard they are working.")
                  ).grid(row=0, column=0, columnspan=6, sticky="w",
                         padx=12, pady=(12, 8))
 
@@ -1557,8 +1579,9 @@ class MotorApp:
             bar = LoadBar(window,
                           warn_percent=actuator.torque_warn_percent,
                           stall_percent=actuator.stall_torque_percent)
-            bar.configure(width=170, height=20)
-            bar.WIDTH, bar.HEIGHT = 170, 20
+            # Resized through the bar, so its marks move with it. Setting the
+            # size from outside left them where an 86-pixel bar has them.
+            bar.resize(170, 20)
             bar.grid(row=row, column=2, padx=6)
 
             peak_var = tk.StringVar(value="--")
@@ -1578,26 +1601,132 @@ class MotorApp:
 
         footer = ttk.Frame(window)
         footer.grid(row=2 + len(self.cfg.actuators), column=0, columnspan=6,
-                    sticky="w", padx=12, pady=(4, 10))
-        actuator = self.cfg.actuators[0]
-        ttk.Label(
-            footer, foreground="#777", wraplength=520, justify="left",
-            text=(f"Amber above {actuator.torque_warn_percent:.0f}%, and a move "
-                  f"is stopped above {actuator.stall_torque_percent:.0f}% held "
-                  f"for {actuator.stall_persist_samples} readings. Run "
-                  f"`cli torque-profile` to set those from this machine rather "
-                  f"than from a default."),
-        ).grid(row=0, column=0, sticky="w")
+                    sticky="ew", padx=12, pady=(4, 4))
+        ttk.Label(footer, text="Readings per second:").grid(row=0, column=0,
+                                                            sticky="w")
+        self.rate_var = tk.StringVar(value=self._readings_per_second_text())
+        rate = ttk.Combobox(footer, textvariable=self.rate_var, width=5,
+                            values=READING_RATES, state="readonly")
+        rate.grid(row=0, column=1, sticky="w", padx=(4, 12))
+        rate.bind("<<ComboboxSelected>>",
+                  lambda _event: self._set_readings_per_second(self.rate_var.get()))
         ttk.Button(footer, text="Reset peaks",
-                   command=self._reset_load_peaks).grid(row=0, column=1,
-                                                        padx=12)
+                   command=self._reset_load_peaks).grid(row=0, column=2, padx=4)
+
+        # --- the torque limit, behind the password ---
+        limits = ttk.LabelFrame(window, text="Torque limit (all three motors)")
+        limits.grid(row=3 + len(self.cfg.actuators), column=0, columnspan=6,
+                    sticky="ew", padx=12, pady=(6, 12))
+        actuator = self.cfg.actuators[0]
+        self.warn_limit_var = tk.StringVar(value=f"{actuator.torque_warn_percent:g}")
+        self.stall_limit_var = tk.StringVar(value=f"{actuator.stall_torque_percent:g}")
+        ttk.Label(limits, text="Amber above (%):").grid(row=0, column=0, sticky="e",
+                                                       padx=(8, 4), pady=4)
+        warn_entry = ttk.Entry(limits, textvariable=self.warn_limit_var, width=6,
+                               state="disabled")
+        warn_entry.grid(row=0, column=1, sticky="w")
+        ttk.Label(limits, text="Stop a move above (%):").grid(
+            row=0, column=2, sticky="e", padx=(16, 4))
+        stall_entry = ttk.Entry(limits, textvariable=self.stall_limit_var, width=6,
+                                state="disabled")
+        stall_entry.grid(row=0, column=3, sticky="w")
+        self._limit_entries = (warn_entry, stall_entry)
+        self._limit_status_var = tk.StringVar(value=(
+            f"A move is stopped when torque stays above the limit for "
+            f"{actuator.stall_persist_samples} readings in a row. Changing "
+            "these needs the password."))
+        ttk.Label(limits, textvariable=self._limit_status_var, foreground="#777",
+                  wraplength=520, justify="left").grid(
+            row=1, column=0, columnspan=6, sticky="w", padx=8, pady=(2, 4))
+        buttons = ttk.Frame(limits)
+        buttons.grid(row=2, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 8))
+        self._unlock_limits_btn = ttk.Button(
+            buttons, text="Change...",
+            command=lambda: self._ask_password(
+                "Changing the torque limit needs the password.",
+                self._unlock_torque_limits))
+        self._unlock_limits_btn.grid(row=0, column=0, padx=(0, 6))
+        self._save_limits_btn = ttk.Button(buttons, text="Apply and save",
+                                           command=self._apply_torque_limits,
+                                           state="disabled")
+        self._save_limits_btn.grid(row=0, column=1)
 
         def closed() -> None:
             self._load_window = None
             self._load_rows = {}
+            self._limit_entries = ()
             window.destroy()
 
         window.protocol("WM_DELETE_WINDOW", closed)
+
+    def _readings_per_second_text(self) -> str:
+        return f"{1.0 / self.cfg.idle_poll_interval_s:g}"
+
+    def _set_readings_per_second(self, text: str) -> None:
+        """How often the motors are read while nothing is moving.
+
+        While something moves they are read at least this often, and at
+        least ten times a second. Saved, so it sticks between sessions.
+        """
+        try:
+            rate = float(text)
+        except ValueError:
+            return
+        if not 0.5 <= rate <= 20:
+            return
+        self.cfg.idle_poll_interval_s = 1.0 / rate
+        self.cfg.poll_interval_s = min(0.1, 1.0 / rate)
+        try:
+            save_config(self.cfg, self.config_path)
+        except Exception as exc:  # noqa: BLE001 -- the rate still applies
+            self.log(f"Update rate set to {rate:g}/s for this session; not saved: {exc}")
+            return
+        self.log(f"Readings now {rate:g} per second while idle "
+                 f"({1.0 / self.cfg.poll_interval_s:g} per second while moving).")
+
+    def _unlock_torque_limits(self) -> None:
+        if not self._limit_entries:
+            return
+        for entry in self._limit_entries:
+            entry.configure(state="normal")
+        self._save_limits_btn.configure(state="normal")
+        self._unlock_limits_btn.configure(state="disabled")
+        self._limit_status_var.set("Unlocked. Enter the new limits and press "
+                                   "Apply and save.")
+
+    def _apply_torque_limits(self) -> bool:
+        """Set the warning and stop levels on all three motors, and save."""
+        try:
+            warn = float(self.warn_limit_var.get())
+            stall = float(self.stall_limit_var.get())
+        except ValueError:
+            self._limit_status_var.set("Enter both limits as numbers, e.g. 30 and 45.")
+            return False
+        if not (0 < warn < stall <= 100):
+            self._limit_status_var.set(
+                "The amber level has to be above 0 and below the stop level, "
+                "and the stop level at most 100%.")
+            return False
+        for actuator in self.cfg.actuators:
+            actuator.torque_warn_percent = warn
+            actuator.stall_torque_percent = stall
+        for row in self.rows.values():
+            row.load_bar.set_thresholds(warn, stall)
+        for _now, bar, _peak, _temp, _supply in self._load_rows.values():
+            bar.set_thresholds(warn, stall)
+        try:
+            path = save_config(self.cfg, self.config_path)
+        except Exception as exc:  # noqa: BLE001 -- applied, but say it is not saved
+            self._limit_status_var.set(f"Applied for this session, but not saved: {exc}")
+            return False
+        self.log(f"Torque limit changed: amber above {warn:g}%, a move is stopped "
+                 f"above {stall:g}%. Saved to {path}.")
+        self._limit_status_var.set(f"Saved: amber above {warn:g}%, stop above {stall:g}%.")
+        for entry in self._limit_entries:
+            entry.configure(state="disabled")
+        self._save_limits_btn.configure(state="disabled")
+        self._unlock_limits_btn.configure(state="normal")
+        return True
 
     def _reset_load_peaks(self) -> None:
         for _now, bar, _peak, _temp, _supply in self._load_rows.values():
@@ -1627,10 +1756,6 @@ class MotorApp:
             peak_var.set(f"{bar._peak:.0f}%")
             temp_var.set("--" if status.temperature is None
                          else f"{status.temperature} C")
-            # Volts once `cli supply` has recorded the scale; until then the
-            # raw register value, labelled as raw. Never an invented voltage:
-            # the drive's units are not documented, and a confident-looking
-            # number with nothing behind it is worse than an honest raw count.
             if status.bus_voltage is None:
                 supply_var.set("--")
             elif status.supply_volts is not None:
@@ -1639,27 +1764,31 @@ class MotorApp:
                 supply_var.set(f"{status.bus_voltage} raw")
 
     def on_open_tilt(self) -> None:
-        """Ask for the password, then open the focal plane window.
-
-        The password is asked in a small window of its own rather than a
-        blocking dialog, so nothing else in the application stops while it is
-        up. A wrong password is said in that window, not in a message box.
-        """
+        """Ask for the password, then open the focal plane window."""
         if self._tilt_window is not None and self._tilt_window.winfo_exists():
             self._tilt_window.lift()
             return
+        self._ask_password("Tilt and jog controls are password protected.",
+                           self._open_tilt_window)
+
+    def _ask_password(self, message: str, on_success: Callable[[], None]) -> None:
+        """Ask for the password, then run `on_success`.
+
+        Asked in a small window of its own rather than a blocking dialog, so
+        nothing else in the application stops while it is up. A wrong password
+        is said in that window, not in a message box.
+        """
         if self._password_window is not None and self._password_window.winfo_exists():
-            self._password_window.lift()
-            return
+            self._password_window.destroy()
+        self._password_action = on_success
 
         window = tk.Toplevel(self.root)
         self._password_window = window
         window.title("Password")
         window.transient(self.root)
         window.resizable(False, False)
-        ttk.Label(window, text="Tilt and jog controls are password protected.",
-                  ).grid(row=0, column=0, columnspan=2, sticky="w",
-                         padx=12, pady=(12, 6))
+        ttk.Label(window, text=message).grid(row=0, column=0, columnspan=2,
+                                             sticky="w", padx=12, pady=(12, 6))
         ttk.Label(window, text="Password:").grid(row=1, column=0, sticky="e",
                                                  padx=(12, 4))
         password_var = tk.StringVar()
@@ -1670,7 +1799,7 @@ class MotorApp:
             row=2, column=0, columnspan=2, sticky="w", padx=12)
 
         def submit(_event=None):
-            if self._submit_tilt_password(password_var.get()):
+            if self._submit_password(password_var.get()):
                 return
             password_var.set("")
             status_var.set("Wrong password.")
@@ -1684,20 +1813,26 @@ class MotorApp:
         entry.focus_set()
 
         def forget(event=None):
-            if event is None or event.widget is window:
+            if (event is None or event.widget is window) \
+                    and self._password_window is window:
                 self._password_window = None
         window.bind("<Destroy>", forget)
 
-    def _submit_tilt_password(self, text: str) -> bool:
-        """Open the focal plane window if `text` is the password."""
+    def _submit_password(self, text: str) -> bool:
+        """Carry on with whatever asked, if `text` is the password."""
         if not tilt_password_matches(text):
-            self.log("Focal plane window: wrong password.")
+            self.log("Wrong password.")
             return False
+        action, self._password_action = self._password_action, None
         if self._password_window is not None and self._password_window.winfo_exists():
             self._password_window.destroy()
         self._password_window = None
-        self._open_tilt_window()
+        if action is not None:
+            action()
         return True
+
+    #: The name the tests and older code use.
+    _submit_tilt_password = _submit_password
 
     def _open_tilt_window(self) -> None:
         """The focal plane window: the picture, tip/tilt and actuator jogs.
@@ -3089,13 +3224,14 @@ class MotorApp:
         window.resizable(False, False)
 
         tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=440,
-                 text=("The drives report their supply in their own units, "
-                       "so the supply column says \"raw\" until it is told "
-                       "what those units mean. With the supply on, enter the "
-                       "voltage it is at (MacTalk shows it, or use a meter) "
+                 text=("The drives report their supply in their own units. "
+                       "They are shown in volts using the scale measured on "
+                       "the pSCT motor: 1804 raw = 48.0 V, as MacTalk showed. "
+                       "Only if a motor disagrees with MacTalk or a meter: "
+                       "with the supply on, enter the voltage it is really at "
                        "and press Record. Each motor's reading right now is "
-                       "stored beside that voltage, and from then on the "
-                       "column shows volts.")).grid(
+                       "stored beside that voltage and used for that motor "
+                       "from then on.")).grid(
             row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 8))
 
         readings_var = tk.StringVar(value="")
@@ -3119,10 +3255,13 @@ class MotorApp:
                     lines.append(f"{actuator.name:<6} not read")
                     continue
                 line = f"{actuator.name:<6} reads {reading:>6} raw"
-                if actuator.supply_raw_at_nominal:
+                if actuator.supply_raw_at_nominal and actuator.supply_nominal_v:
                     volts = reading * actuator.supply_nominal_v / actuator.supply_raw_at_nominal
                     line += (f"  = {volts:.1f} V  (recorded {actuator.supply_raw_at_nominal}"
                              f" = {actuator.supply_nominal_v:g} V)")
+                else:
+                    volts = reading / actuator.supply_raw_per_volt
+                    line += f"  = {volts:.1f} V  (measured scale)"
                 lines.append(line)
             readings_var.set("\n".join(lines))
         show()

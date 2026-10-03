@@ -532,57 +532,56 @@ class JVLMotor:
                 return None
         return 100.0 * abs(raw) / limit
 
-    def get_supply_volts(self, raw: Optional[int] = None) -> Optional[float]:
-        """Supply voltage in volts, or None if nobody has said what it is.
+    def supply_scale(self):
+        """(raw per volt, the raw reading of a healthy supply, where from).
 
-        Register 97 is in the drive's own raw units, and this software does not
-        know the scale. It is learned once, by `cli supply`: read the register
-        with the supply known good, and record it beside the voltage a meter
-        or the supply's own display says. After that the conversion is a
-        straight ratio.
-
-        Not guessed, ever. Two registers in raw units cannot be compared unless
-        they are known to share a scale, and an invented scale would put a
-        confident number on the screen with nothing behind it.
+        A reading recorded for this motor wins; otherwise the scale measured
+        on the pSCT bench motor (1804 raw = 48.0 V) and the expected supply.
         """
         nominal_v = self.cfg.supply_nominal_v
         nominal_raw = self.cfg.supply_raw_at_nominal
-        if not nominal_v or not nominal_raw:
-            return None
+        if nominal_v and nominal_raw:
+            return nominal_raw / nominal_v, float(nominal_raw), "recorded"
+        per_volt = self.cfg.supply_raw_per_volt
+        return per_volt, per_volt * self.cfg.supply_expected_v, "measured scale"
+
+    def get_supply_volts(self, raw: Optional[int] = None) -> Optional[float]:
+        """Supply voltage in volts, from register 97.
+
+        Register 97 is in the drive's own units: 1804 of them read 48.0 V on
+        the pSCT motor (MacTalk's own display). A reading recorded for this
+        motor with `cli supply` or Tools -> Supply voltage overrides that.
+        Returns None only when the register cannot be read.
+        """
         if raw is None:
             try:
                 raw = self.read_register("BUS_VOLTAGE")
             except (ModbusError, MotorFault):
                 return None
-        return raw * nominal_v / nominal_raw
+        per_volt, _healthy, _source = self.supply_scale()
+        return raw / per_volt
 
     def supply_is_healthy(self, raw: Optional[int] = None):
-        """(verdict, explanation) for the supply, compared like with like.
+        """(verdict, explanation) for the supply.
 
-        Returns verdict True (healthy), False (too low) or None (nothing to
-        compare against yet). The comparison is register 97 against its *own*
-        recorded healthy value -- same register, same scale, no assumption.
+        Returns verdict True (healthy), False (too low) or None (could not be
+        read). Register 97 is compared against its own scale, never against
+        register 139, whose scale is not known to be the same.
         """
-        nominal_raw = self.cfg.supply_raw_at_nominal
         if raw is None:
             try:
                 raw = self.read_register("BUS_VOLTAGE")
             except (ModbusError, MotorFault) as exc:
                 return None, f"could not read the bus voltage: {exc}"
-        if not nominal_raw:
-            return None, (
-                "no healthy reading has been recorded for this motor, so "
-                f"there is nothing to compare {raw} against. Run "
-                f"`cli supply --motor {self.name}` with the supply on."
-            )
-        floor = nominal_raw * self.cfg.supply_low_fraction
-        volts = self.get_supply_volts(raw)
-        shown = f"{raw}" + (f" ({volts:.1f} V)" if volts is not None else "")
+        per_volt, healthy_raw, source = self.supply_scale()
+        floor = healthy_raw * self.cfg.supply_low_fraction
+        volts = raw / per_volt
+        shown = f"{volts:.1f} V ({raw} raw)"
         if raw < floor:
             return False, (
-                f"the supply reads {shown}, below {floor:.0f} "
-                f"({self.cfg.supply_low_fraction:.0%} of the {nominal_raw} "
-                f"recorded when it was healthy)"
+                f"the supply reads {shown}, below {floor / per_volt:.1f} V "
+                f"({self.cfg.supply_low_fraction:.0%} of the "
+                f"{healthy_raw / per_volt:.1f} V it should be)"
             )
         return True, f"the supply reads {shown}"
 

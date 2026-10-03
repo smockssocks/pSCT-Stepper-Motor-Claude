@@ -110,8 +110,9 @@ python -m psct_motors.cli supply --volts 48
 python -m psct_motors.cli --bench Top supply --motor Top --volts 48
 ```
 
-Register 97 `Bus voltage` is in the drive's own raw units and nothing says what
-they are worth in volts, so this records the pair once. After it, the readouts
+Optional now: register 97 `Bus voltage` is shown in volts on the scale measured
+against MacTalk (1804 raw = 48.0 V). Run this only if a motor disagrees with
+MacTalk or a meter; it records that motor's own pair. After it, the readouts
 report volts, and a supply that has collapsed is refused with a message naming
 it rather than presenting as a motor that accepts targets and ignores them.
 

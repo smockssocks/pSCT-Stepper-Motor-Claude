@@ -97,7 +97,7 @@ nothing -- which is itself worth seeing once.
 With the motors connected and the camera hanging on them:
 
 ```
-python -m psct_motors.cli supply --volts 48     # once, with a meter on it
+python -m psct_motors.cli supply                # volts on each drive; compare with MacTalk
 python -m psct_motors.cli status
 python -m psct_motors.cli diagnose --motor Top
 ```

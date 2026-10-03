@@ -89,6 +89,14 @@ class SimulatedJVLTransport:
         #: settled -- which is how the in-position logic's following-error
         #: condition gets exercised.
         self.follow_error_counts = follow_error_counts
+        #: Bench mode: a callable returning another motor's (encoder,
+        #: projected, target) in THIS axis's counts, or None if it cannot be
+        #: read just now. When set, this axis is a copy of that motor: it is
+        #: wherever that motor is, goes wherever that motor is sent, and
+        #: ignores gravity and its own end stops, so a bench with one real
+        #: motor shows a flat plane that moves only in focus.
+        self.follow: Optional[Callable[[], Optional[tuple]]] = None
+        self._followed_target: Optional[int] = None
 
         #: Mechanical end stops, in counts. The shaft cannot pass them, and
         #: torque climbs while the drive pushes against one -- which is what
@@ -149,7 +157,7 @@ class SimulatedJVLTransport:
             # fraction of what the same drive reads with it on, and that is
             # the only comparison anything here makes. 4485 is "on"; the
             # 1794 below is "off".
-            97: 4485,                 # Bus voltage (P+)
+            97: 1804,                 # Bus voltage (P+): 48.0 V, as on the pSCT motor
             98: 565,                  # Bus Voltage Min
             99: 4,                    # Encoder Type
             110: 100,                 # Position Settling Time
@@ -208,11 +216,17 @@ class SimulatedJVLTransport:
             # Passive and the bus reading collapses. If the brakes are not
             # holding either, a loaded axis then falls.
             self.registers[2] = int(MotorMode.PASSIVE)
-            self.registers[97] = 1794
+            # Not measured on a real drive with its supply off; anything far
+            # below the 1804 of a healthy 48 V shows the failure the same way.
+            self.registers[97] = 300
             self.registers[12] = 0
             if self.gravity_counts_per_s and not self._held():
                 self._position -= self.gravity_counts_per_s * dt
             self._publish_position()
+            return
+
+        if self.follow is not None:
+            self._copy_followed_motor()
             return
 
         mode = self.registers.get(2, 0)
@@ -251,6 +265,24 @@ class SimulatedJVLTransport:
 
         self._publish_position()
 
+    def _copy_followed_motor(self) -> None:
+        """Be wherever the followed motor is. See `follow`."""
+        reading = self.follow()
+        if reading is not None:
+            encoder, projected, target = (int(v) for v in reading)
+            self._position = float(projected)
+            # The same standing lag as the real motor, so the encoder reads
+            # the same and so does the following error.
+            self.follow_error_counts = projected - encoder
+            # Sent where it is sent. Only when ITS target changes, so a target
+            # written to this axis directly is not overwritten on every step.
+            if target != self._followed_target:
+                self._followed_target = target
+                self.registers[3] = target
+        self.registers[12] = 0
+        self.registers[217] = self.idle_torque
+        self._publish_position()
+
     def _held(self) -> bool:
         """True when something mechanical is stopping the shaft turning.
 
@@ -269,7 +301,7 @@ class SimulatedJVLTransport:
         """Turn the main drive supply on or off."""
         self.powered = bool(powered)
         if powered:
-            self.registers[97] = 4485
+            self.registers[97] = 1804
 
     def _publish_position(self) -> None:
         projected = int(round(self._position))

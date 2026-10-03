@@ -232,20 +232,27 @@ class ActuatorConfig:
     stall_protection: bool = True
 
     # --- supply voltage ----------------------------------------------------
-    #: What the supply actually is, in volts, and what register 97 reads when
-    #: it is healthy. Recorded together by `cli supply`.
+    #: What register 97 reads per volt. Measured on the pSCT bench motor:
+    #: 1804 raw with MacTalk showing the supply at exactly 48.0 V (an earlier
+    #: reading, 1794, is 47.7 V on the same scale). Used whenever no reading
+    #: has been recorded for this motor below.
+    supply_raw_per_volt: float = 1804 / 48.0
+    #: The supply the drives are meant to run on. A move is refused when the
+    #: supply reads below `supply_low_fraction` of this.
+    supply_expected_v: float = 48.0
+    #: A recorded pair, optional: what the supply actually was and what
+    #: register 97 read at that moment, from `cli supply` or the GUI's Tools ->
+    #: Supply voltage. When set it overrides both numbers above, for a motor
+    #: whose scale turns out to differ.
     #:
-    #: Register 97 is in the drive's own raw units and nobody here knows the
-    #: scale. Two registers in raw units cannot safely be compared unless they
+    #: Two registers in raw units cannot safely be compared unless they
     #: are known to share a scale -- and 97 against 139 ('Acceptance Voltage')
     #: is exactly that unproven comparison. On the pSCT bench motor they read
     #: 1794 and 2054, which reads as "below acceptance" and would refuse every
     #: move on a motor that is in fact perfectly happy at 48 V.
     #:
-    #: So the check compares register 97 against *its own* recorded healthy
-    #: value instead: same register, same scale, no assumption. Until that
-    #: value is recorded there is nothing trustworthy to compare against, and
-    #: the software says so rather than blocking.
+    #: So the check compares register 97 against its own scale -- measured,
+    #: or recorded here -- never against register 139.
     supply_nominal_v: Optional[float] = None
     supply_raw_at_nominal: Optional[int] = None
     #: How far below the recorded healthy reading counts as a supply failure.
@@ -348,6 +355,10 @@ class ActuatorConfig:
                 f"supply_raw_at_nominal must be set together -- one without "
                 f"the other cannot convert anything. Run `cli supply`."
             )
+        if self.supply_raw_per_volt <= 0:
+            raise ValueError(f"Actuator {self.name}: supply_raw_per_volt must be positive")
+        if self.supply_expected_v <= 0:
+            raise ValueError(f"Actuator {self.name}: supply_expected_v must be positive")
         if self.supply_nominal_v is not None and self.supply_nominal_v <= 0:
             raise ValueError(f"Actuator {self.name}: supply_nominal_v must be positive")
         if self.supply_raw_at_nominal is not None and self.supply_raw_at_nominal <= 0:
@@ -512,17 +523,23 @@ class PlatformConfig:
     #: rehearsing. Raise it to shorten a long rehearsal, lower it to watch
     #: something closely.
     simulated_speed_mm_per_s: float = 2.0
+    #: Bench mode (one real motor, the others stood in): the stand-ins copy
+    #: the real motor, so the plane stays flat and moves only in focus. Off,
+    #: they are independent simulated axes, which can tilt the plane and, with
+    #: the drives off and no brake, sag under gravity.
+    bench_stand_ins_copy_real: bool = True
 
     #: Seconds between live status polls while something is moving.
     #:
-    #: Each poll costs one Modbus round trip per register per motor, so this
-    #: trades responsiveness against traffic. Eight registers times three
-    #: motors at 0.15 s is about 160 reads a second, which a switched LAN
-    #: handles comfortably; going much below this starts to matter.
-    poll_interval_s: float = 0.15
-    #: Seconds between polls when nothing is moving. Nothing changes quickly on
-    #: a stationary axis, so there is no reason to keep hammering the drives.
-    idle_poll_interval_s: float = 0.5
+    #: Each poll costs one Modbus round trip per register per motor. The three
+    #: motors are read in parallel, each over its own connection, so a poll
+    #: takes about as long as one motor's reads; ten a second is about 240
+    #: reads a second in all, which a switched LAN handles comfortably.
+    poll_interval_s: float = 0.1
+    #: Seconds between polls when nothing is moving. Fast enough that the load
+    #: readout follows a hand on the plate; set from the Load and torque
+    #: window ("Readings per second").
+    idle_poll_interval_s: float = 0.2
     #: Refresh temperature and bus voltage only every Nth poll. They move over
     #: minutes, and reading them at the position rate doubles the traffic for
     #: numbers that will not have changed.
@@ -723,6 +740,13 @@ def config_from_dict(data: Dict[str, Any]) -> PlatformConfig:
         if actuator_brake_raw is not None:
             act.brake = _from_dict(BrakeConfig, actuator_brake_raw)
         actuators.append(act)
+
+    # 0.15 s / 0.5 s were the defaults before the motors were read in
+    # parallel, and every saved file carries them. A file that still has
+    # exactly those was never tuned by anyone, so it gets the new defaults.
+    if (data.get("poll_interval_s"), data.get("idle_poll_interval_s")) == (0.15, 0.5):
+        data.pop("poll_interval_s")
+        data.pop("idle_poll_interval_s")
 
     cfg = _from_dict(PlatformConfig, data)
     cfg.actuators = actuators or default_config().actuators

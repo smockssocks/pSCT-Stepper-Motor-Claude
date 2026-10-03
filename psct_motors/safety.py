@@ -98,14 +98,8 @@ def bench_config() -> PlatformConfig:
     # runner, not by a person, and at the default 2 mm/s a single run to the
     # end of travel would take the best part of a minute.
     cfg.simulated_speed_mm_per_s = 30.0
-    # A recorded healthy supply reading, as `cli supply` would write after
-    # being run once against a live motor. Without one the supply check has
-    # nothing to compare against and says so instead of refusing, so the
-    # supply drill would not be exercising the thing it names. 4485 is what
-    # the simulated drive reports on register 97 with its supply on.
-    for actuator in cfg.actuators:
-        actuator.supply_nominal_v = 48.0
-        actuator.supply_raw_at_nominal = 4485
+    # The supply check works from the measured scale (1804 raw = 48 V), which
+    # is also what the simulated drive reports, so nothing needs recording.
     cfg.validate()
     return cfg
 

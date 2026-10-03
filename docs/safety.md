@@ -188,12 +188,11 @@ it. `cli safety-check` drives it through every refusal.
 
 Before any move, the platform also refuses to start when:
 
-- the drive supply has collapsed, judged against the healthy reading recorded
-  for that motor by `cli supply`. A JVL with no main supply still answers
+- the drive supply has collapsed: below 80% of 48 V on the scale measured
+  against MacTalk (1804 raw = 48.0 V), or of a motor's own recorded reading if
+  `cli supply` has recorded one. A JVL with no main supply still answers
   Modbus from its control supply, accepts a target, and does nothing — which
-  presents as the software being broken. Until a healthy reading has been
-  recorded there is nothing trustworthy to compare against, so the software
-  says so once and lets the move proceed rather than blocking on a guess.
+  presents as the software being broken.
 - the brakes read as engaged and will not release, or are commanded to release
   and still read back engaged.
 - the brakes are engaged and the drives are not holding, so releasing them

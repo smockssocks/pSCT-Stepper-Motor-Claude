@@ -100,10 +100,10 @@ drives.
 - Per-actuator position, mode, brake, load and **supply voltage**, with
   Release/Engage for each brake. The brake says **ENGAGED** (blue) or
   **DISENGAGED** (amber), deliberately not green/red: a disengaged brake is
-  not "good", it means the camera is hanging on the drives. Supply shows volts
-  once the scale has been recorded (click a supply reading, or *Tools →
-  Supply voltage*), and the raw register value until then. Jogging a single actuator is not on the main window; it is in
-  *Motion → Focal plane: tilt and jog*.
+  not "good", it means the camera is hanging on the drives. Supply is in volts,
+  using the scale measured against MacTalk (1804 raw = 48.0 V). Jogging a
+  single actuator is not on the main window; it is in *Motion → Focal plane:
+  tilt and jog*.
 - A timestamped log of everything the application did.
 
 Behind the menus, so the main window stays about the job:
@@ -114,11 +114,11 @@ Behind the menus, so the main window stays about the job:
 | **Motion → Save current position / Saved positions** | name the current position, and see, rename, delete or go to the saved ones |
 | **Motion → Go back to the previous position** | return to where the focal plane was before the last move — an ordinary checked move, with confirmation |
 | **View → Position log** | every move, newest first: where the plane was, where it was sent, where it ended up; select a line and go back to it |
-| **View → Load and torque** | how hard each motor is working, big enough to read across a room, with peaks, temperature and supply |
+| **View → Load and torque** | how hard each motor is working, big enough to read across a room, with peaks, temperature and supply; how many readings per second; and the torque limit (changing it needs the password) |
 | **Tools → Connection settings** | edit each motor's IP and port, use now or save |
 | **Tools → Motion limits** | focus, tilt and step limits; set them from the ends of travel that Find hard stop discovered |
 | **Tools → Distances from zero to M1 and M2** | the two numbers the gauge needs to show distance to a mirror instead of distance from zero |
-| **Tools → Supply voltage** | enter the voltage the supply is at (MacTalk shows it) so the supply column reads in volts |
+| **Tools → Supply voltage** | only if a motor's volts disagree with MacTalk: enter what the supply is really at, and that motor uses its own reading from then on |
 | **Tools → Find hard stop** | run the actuators out to the end of travel |
 | **Tools → Run safety drills** | prove the guards still fire (simulated, safe any time) |
 
@@ -131,7 +131,9 @@ only the label would change nothing.
 ### Checking the over-torque protection
 
 The stall limit ships at 45%, which is a guess from one motor's idle reading.
-Measure it on your machine instead:
+Change it in *View → Load and torque* (**Change...**, then the password): the
+amber warning level and the level at which a move is stopped, for all three
+motors, saved to the configuration. Better still, measure it first:
 
 ```
 python -m psct_motors.cli torque-profile --mm 0.5              # safe anywhere
@@ -143,45 +145,42 @@ stop, and recommends a threshold from the gap between them — or says plainly
 that there is no gap, in which case torque alone cannot find the stop and the
 "commanded a step and barely moved" check is what does.
 
-### Telling the software what a healthy supply looks like
+### Supply voltage
 
-Do this once, with the supply on and the motors behaving. In the GUI: click
-any supply reading (or *Tools → Supply voltage*), type the voltage the supply
-is at (MacTalk shows it on its main screen, or use a meter), and press
-**Record**. From the command line:
+The drives report their supply on register 97 in their own units. On the pSCT
+motor 1804 of them read exactly 48.0 V on MacTalk's display (an earlier
+reading, 1794, is 47.7 V on the same scale), so that is the scale used: the
+supply shows in volts with nothing to set up.
+
+A move is refused when the supply reads below 80% of 48 V (about 38 V). A JVL
+with no main supply still answers Modbus from its control supply: it accepts a
+target and quietly does nothing, which presents as the software being broken.
+The check names the supply instead.
+
+It is never compared against the drive's "Acceptance Voltage" register (139),
+which on the bench motor reads 2054 and is not known to be on the same scale.
+
+If a motor ever disagrees with MacTalk or a meter, record its own reading: in
+the GUI, *Tools → Supply voltage* (or click a supply reading), enter the voltage
+the supply is really at, and press **Record**; or from the command line:
 
 ```
 python -m psct_motors.cli supply --volts 48                    # all three
 python -m psct_motors.cli --bench Top supply --motor Top --volts 48
 ```
 
-On the bench, pass `--motor`: a reading taken from a simulated stand-in is not
-a measurement of anything, and writing one into the configuration would give
-the other two axes a baseline nobody measured.
-
-It reads the drive's bus-voltage register and records that raw number beside
-the voltage you measured. Two things then start working: the readouts show
-actual volts instead of a raw count, and a move is refused when that register
-later reads far below what was recorded — which is what a failed supply looks
-like from software. A JVL with no main supply still answers Modbus from its
-control supply: it accepts a target and quietly does nothing, which presents
-as the software being broken.
-
-It is compared against **its own** recorded reading, never against the drive's
-"Acceptance Voltage" register. Both are in the drive's raw units, but nothing
-establishes that they share a scale — and on the pSCT bench motor they read
-1794 and 2054, so comparing them would refuse every move on a motor running
-perfectly well at 48 V.
-
-Until it has been run there is nothing trustworthy to compare against, so the
-software says so once per session and lets moves proceed rather than blocking
-on a guess.
+That motor then uses its own reading instead of the measured scale. On the
+bench, pass `--motor`: a reading from a simulated stand-in measures nothing.
 
 ### How fast the readouts update
 
 Position, torque, mode and following error refresh every `poll_interval_s`
-(0.15 s) while anything is moving and every `idle_poll_interval_s` (0.5 s)
-when nothing is. Bus voltage and temperature change over minutes, so they are
+(0.1 s) while anything is moving and every `idle_poll_interval_s` (0.2 s)
+when nothing is. The three motors are read side by side, each over its own
+connection, so a poll takes about as long as reading one motor. *View → Load
+and torque* has a **Readings per second** setting (2, 5 or 10 while idle),
+which is saved. A configuration still carrying the old 0.15 s / 0.5 s
+defaults gets the new ones automatically. Bus voltage and temperature change over minutes, so they are
 read once every `slow_poll_every` polls and shown from the last reading in
 between — polling them at the position rate would nearly double the traffic
 for numbers that have not moved.
@@ -383,9 +382,15 @@ python -m psct_motors.cli --bench Top safety-check
 
 Everything above the driver then runs for real against your one motor:
 kinematics, coordinated moves, the hard-stop search, the emergency interlocks,
-the load bars. The two stood-in axes answer instantly and truthfully-looking,
-so the title bar says **[BENCH — only Top is real]** and the log says it too.
-Do not read anything into what East and West report.
+the load bars. The title bar says **[BENCH — only Top is real]** and the log
+says it too.
+
+The two stand-ins are **copies of the real motor**: they sit wherever it is
+and go wherever it is sent, so the plane stays flat and moves only in focus,
+and they do not sag with the drives off. Because of that, tip, tilt and
+jogging East or West on their own are refused in bench mode; jog Top and the
+copies follow. To get independent simulated axes back, set
+`"bench_stand_ins_copy_real": false` in the configuration.
 
 The single-motor tools are still there, and need no calibration at all:
 
@@ -454,8 +459,7 @@ line in the Connection box:
   holding the camera.
 - Move or fine adjust focus. The brakes are released first if they are on.
 - **Jog** one actuator (▲/▼ in *Motion → Focal plane: tilt and jog*). Before any brake comes off it checks, in order:
-  no drive reports an error, the supply has not failed (once `cli supply` has
-  recorded a healthy reading), every drive is on and reads back as holding.
+  no drive reports an error, the supply has not failed, every drive is on and reads back as holding.
   Only then is the brake released (just that actuator's, if they are
   separate). If any check fails, nothing is released and the log says which.
 - **Engage all brakes**, then try **EMERGENCY**. It engages the brakes but
