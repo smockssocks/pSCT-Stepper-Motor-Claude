@@ -186,6 +186,32 @@ The out-of-step stop and the big-error stop both leave the drives on and
 holding *and* the brakes on. All of the numbers above are in the
 configuration file; `settle_enabled: false` turns settling off.
 
+### Resting on the brakes (Disable drives)
+
+Once the focal plane is where it should be, **Disable drives** (under the
+actuator table, or *Tools*) leaves it held by the brakes alone, so the motors
+make no small corrections:
+
+1. The brakes are engaged and read back.
+2. The drives are turned off.
+3. For `rest_watch_s` (1.5 s) the encoders are watched. If any motor moves
+   more than `rest_sink_limit_mm` (0.01 mm), the brakes are not holding: the
+   drives are turned straight back on, holding where they are, and the log
+   says which motor moved and how far.
+
+If the brakes cannot be read back as engaged, the drives stay on. When nothing
+senses the brakes themselves (the brake line says "relay state"), "engaged"
+only means the PLC was told to clamp, so the GUI asks once per session whether
+to rely on the relay; the encoder watch in step 3 still applies.
+
+Tick **Disable drives after each move** to do this automatically when every
+move or jog finishes (for this session). The next move turns the drives back on
+and releases the brakes itself, as usual. If resting fails after a move, the
+move still counts as done and the log says why the drives were left on.
+
+From the command line: `python -m psct_motors.cli disable-drives`
+(`--trust-relay` to accept the relay's reading without being asked).
+
 ### Supply voltage
 
 The drives report their supply on register 97 in their own units. On the pSCT

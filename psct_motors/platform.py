@@ -365,6 +365,12 @@ class FocalPlanePlatform:
         #: `saved_positions_path` when one is given, like the history.
         self.saved_positions = SavedPositions(path=saved_positions_path or None,
                                               logger=self._log)
+        #: Rest on the brakes (brakes on, drives off) after every move. Set
+        #: from the configuration, or by the GUI's checkbox.
+        self.rest_after_moves = bool(self.cfg.rest_on_brakes_after_moves)
+        #: Whether a person has accepted the brake relay's word for "engaged"
+        #: when nothing senses the brakes. Never set by this module.
+        self.trust_relay_brakes = False
         #: Said once, not on every move: there is no healthy supply reading to
         #: compare against. Repeating it every time would train people to
         #: ignore it.
@@ -991,6 +997,7 @@ class FocalPlanePlatform:
                 if wait:
                     self._wait_for_all(targets, starts, velocities)
                     self._settle(list(zip(self.motors, targets)))
+                    self._rest_after_move()
             except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised
                 outcome = "failed: " + str(exc).splitlines()[0][:160]
                 raise
@@ -1195,6 +1202,7 @@ class FocalPlanePlatform:
                 self._log(f"{motor.name}: single-axis move to {target:.4f} mm.")
                 if wait and motor.wait_for_in_position():
                     self._settle([(motor, target)])
+                    self._rest_after_move()
                 elif wait:
                     # wait_for_in_position has already halted this axis.
                     outcome = "failed: timed out"
@@ -2255,6 +2263,106 @@ class FocalPlanePlatform:
                 f"{', '.join(missing)} do not."
             )
         return True, "The brakes are engaged and read back engaged."
+
+    def rest_on_brakes(self, trust_relay: bool = False) -> str:
+        """Brakes on, then drives off, then make sure the brakes are holding.
+
+        For a parked focal plane: with the drives off the motors make no small
+        corrections, so the only thing holding the camera is the brakes, which
+        is what people want to rely on once it is in position.
+
+        1. The brakes are engaged and read back. If the reading is a sensor
+           on the brake, that is confirmation. If it is only the relay (the
+           PLC was told to clamp), it is accepted only with `trust_relay`,
+           which the GUI asks a person for.
+        2. The drives are turned off.
+        3. The encoders are watched for `rest_watch_s`. Any motor that moves
+           more than `rest_sink_limit_mm` means the brakes are not holding:
+           the drives are turned straight back on, holding where they are,
+           and this raises.
+
+        Anything short of that leaves the drives on and holding. Returns a
+        sentence saying what was done.
+        """
+        from .external_brake import BrakeError
+        cfg = self.cfg
+        with self._move_lock:
+            self._require_connected()
+            engaged, message = self._engage_brakes_for_emergency()
+            if not engaged:
+                relay_only = False
+                if self.external_brake.available:
+                    try:
+                        relay_only = (
+                            self.external_brake.read_state(fresh=True) is BrakeState.ENGAGED
+                            and not self.external_brake.state_is_measured("all"))
+                    except BrakeError:
+                        relay_only = False
+                if not (relay_only and trust_relay):
+                    raise PlatformError(
+                        f"The drives were left on and holding. {message} Turning "
+                        "them off with nothing confirmed holding would leave the "
+                        "focal plane on screw friction alone.")
+                message = ("The brakes read back engaged from the relay (nothing "
+                           "senses the brake itself); accepted on the operator's "
+                           "say-so, and checked below by watching the encoders.")
+            time.sleep(cfg.actuators[0].brake.settle_s)
+
+            before = {m.name: m.get_position_counts() for m in self.motors}
+            problems = []
+            for motor in self.motors:
+                try:
+                    motor.passivate(engage_brake_first=True, stop_first=False)
+                except (ModbusError, MotorFault) as exc:
+                    problems.append(f"{motor.name}: {exc}")
+            if problems:
+                taken = self._take_hold()
+                raise PlatformError(
+                    "Not every drive turned off (" + "; ".join(problems) + "). "
+                    + (f"{', '.join(taken)} turned back on and holding. " if taken else "")
+                    + "The brakes are on.")
+
+            deadline = time.monotonic() + cfg.rest_watch_s
+            while True:
+                for motor in self.motors:
+                    try:
+                        moved = abs(motor.get_position_counts() - before[motor.name])
+                    except (ModbusError, MotorFault):
+                        continue
+                    moved_mm = moved / motor.cfg.resolved_counts_per_mm
+                    if moved_mm > cfg.rest_sink_limit_mm:
+                        taken = self._take_hold()
+                        self._log(f"{motor.name} moved {moved_mm:.4f} mm with the "
+                                  "drives off: the brakes are not holding. Drives "
+                                  "back on.")
+                        raise PlatformError(
+                            f"The brakes are not holding: {motor.name} moved "
+                            f"{moved_mm:.4f} mm within {cfg.rest_watch_s:g} s of "
+                            "the drives going off. The drives were turned straight "
+                            f"back on ({', '.join(taken) or 'none needed'}) and are "
+                            "holding where they are. Check the brakes before "
+                            "trying again.")
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+
+            done = (f"Resting on the brakes: drives off, nothing moved more than "
+                    f"{cfg.rest_sink_limit_mm:g} mm in {cfg.rest_watch_s:g} s.")
+            self._log(done)
+            return message + " " + done
+
+    def _rest_after_move(self) -> None:
+        """If asked for, rest on the brakes once a move has finished.
+
+        A failure here does not make the move a failure: the plane is where it
+        was sent. It is said loudly, and the drives are left holding.
+        """
+        if not self.rest_after_moves:
+            return
+        try:
+            self.rest_on_brakes(trust_relay=self.trust_relay_brakes)
+        except PlatformError as exc:
+            self._log(f"Move finished, but did NOT rest on the brakes: {exc}")
 
     def passivate_all(self, force: bool = False) -> List[str]:
         """Deliberately remove drive power from all three motors.

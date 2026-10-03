@@ -592,6 +592,8 @@ class MotorApp:
                           command=self.on_edit_brake_controller)
         tools.add_command(label="Enable drives (hold position)",
                           command=self.on_enable_drives)
+        tools.add_command(label="Disable drives (rest on the brakes)",
+                          command=self.on_disable_drives)
         tools.add_separator()
         tools.add_command(label="Clear errors", command=self.on_clear_errors)
         tools.add_command(label="Release all brakes",
@@ -851,10 +853,17 @@ class MotorApp:
         # In the order they are used: drives on and holding, then brakes off.
         ttk.Button(footer, text="Enable drives",
                    command=self.on_enable_drives).grid(row=0, column=0, padx=(0, 4))
+        ttk.Button(footer, text="Disable drives",
+                   command=self.on_disable_drives).grid(row=0, column=1, padx=4)
         ttk.Button(footer, text="Release all brakes",
-                   command=lambda: self.on_brake(None, engage=False)).grid(row=0, column=1, padx=4)
+                   command=lambda: self.on_brake(None, engage=False)).grid(row=0, column=2, padx=(12, 4))
         ttk.Button(footer, text="Engage all brakes",
-                   command=lambda: self.on_brake(None, engage=True)).grid(row=0, column=2, padx=4)
+                   command=lambda: self.on_brake(None, engage=True)).grid(row=0, column=3, padx=4)
+        self.rest_after_var = tk.BooleanVar(value=self.cfg.rest_on_brakes_after_moves)
+        ttk.Checkbutton(footer, text="Disable drives after each move",
+                        variable=self.rest_after_var,
+                        command=self.on_rest_after_moves_changed).grid(
+            row=0, column=4, padx=(16, 0))
 
     #: What the gauge's reference chooser shows for each reference.
     REFERENCE_CHOICES = {
@@ -1541,6 +1550,68 @@ class MotorApp:
                 self.log_threadsafe("All drives were already enabled and holding.")
 
         self.run_async("Enable drives", work)
+
+    def _brakes_are_only_relay(self) -> bool:
+        """True when the brake reading is the PLC's relay, not a sensor."""
+        brake = self.platform.external_brake
+        return bool(brake.available) and not brake.state_is_measured("all")
+
+    def _confirm_relay_brakes(self) -> bool:
+        """Ask once per session to accept the relay's word for "engaged".
+
+        Nothing senses the brakes themselves, so "engaged" means the PLC was
+        told to clamp. A person who knows the brakes work can accept that; the
+        encoders are still watched after the drives go off, and the drives
+        come straight back on if anything moves.
+        """
+        if not self._brakes_are_only_relay() or self.platform.trust_relay_brakes:
+            return True
+        if not messagebox.askyesno(
+                "Rely on the brake relay?",
+                "Nothing senses the brakes themselves: \"engaged\" means the PLC "
+                "was told to clamp them.\n\nThe drives will only go off once the "
+                "relay reads engaged, and for "
+                f"{self.cfg.rest_watch_s:g} s afterwards the encoders are watched. "
+                "If anything moves more than "
+                f"{self.cfg.rest_sink_limit_mm:g} mm the drives come straight "
+                "back on.\n\nRely on the relay for this session?"):
+            return False
+        self.platform.trust_relay_brakes = True
+        self.log("Relying on the brake relay for this session (encoders watched "
+                 "after the drives go off).")
+        return True
+
+    def on_disable_drives(self) -> None:
+        """Brakes on, drives off, and check the brakes hold.
+
+        So a parked focal plane is held by the brakes alone, with no small
+        corrections from the motors. If the brakes cannot be confirmed, or
+        anything moves once the drives are off, the drives stay (or come back)
+        on and holding.
+        """
+        if not self.platform.connected:
+            messagebox.showwarning("Not connected", "Connect first.")
+            return
+        if not self._confirm_relay_brakes():
+            return
+
+        def work():
+            self.log_threadsafe(self.platform.rest_on_brakes(
+                trust_relay=self.platform.trust_relay_brakes))
+
+        self.run_async("Disable drives", work)
+
+    def on_rest_after_moves_changed(self) -> None:
+        wanted = bool(self.rest_after_var.get())
+        if wanted and not self._confirm_relay_brakes():
+            self.rest_after_var.set(False)
+            return
+        # For this session only: whether the relay can be relied on is asked
+        # per session, so a saved "yes" would only fail quietly next time.
+        self.platform.rest_after_moves = wanted
+        self.log("After each move the drives will be turned off and the plane "
+                 "left on the brakes." if wanted else
+                 "After each move the drives stay on and holding.")
 
     # ---------------------------------------------------- focal plane picture
 
@@ -2312,7 +2383,11 @@ class MotorApp:
             self.platform.disconnect()
         except Exception:
             pass
+        trusted = self.platform.trust_relay_brakes
+        rest_after = self.platform.rest_after_moves
         self.platform = self._make_platform()
+        self.platform.trust_relay_brakes = trusted
+        self.platform.rest_after_moves = rest_after
         self._refresh_position_log()
         self._refresh_saved_positions()
         self.connect_btn.config(text="Connect")

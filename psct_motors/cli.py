@@ -842,6 +842,31 @@ def cmd_enable_drives(args) -> int:
         platform.disconnect()
 
 
+def cmd_disable_drives(args) -> int:
+    """Brakes on, drives off, and check the brakes hold (rest on the brakes)."""
+    platform = make_platform(args)
+    try:
+        platform.connect()
+    except PlatformError as exc:
+        out(str(exc))
+        return 1
+    try:
+        trust = args.trust_relay
+        brake = platform.external_brake
+        if brake.available and not brake.state_is_measured("all") and not trust:
+            out("Nothing senses the brakes themselves, so \"engaged\" only means the")
+            out("PLC was told to clamp them. The encoders are watched after the drives")
+            out("go off, and the drives come back on if anything moves.")
+            trust = confirm("Rely on the brake relay?", args.yes)
+        out("  " + platform.rest_on_brakes(trust_relay=trust))
+        return 0
+    except PlatformError as exc:
+        out(str(exc))
+        return 1
+    finally:
+        platform.disconnect()
+
+
 def cmd_plc(args) -> int:
     """Read the brake PLC and print every relay and input.
 
@@ -1893,6 +1918,14 @@ one motor on a bench
                 help="turn every passive drive on, holding where it is (the "
                      "step before releasing the brakes)")
     p.set_defaults(func=cmd_enable_drives)
+
+    p = command("disable-drives",
+                help="brakes on, drives off, then check the brakes hold "
+                     "(drives come back on if anything moves)")
+    p.add_argument("--trust-relay", action="store_true",
+                   help="accept the brake relay's reading when nothing senses "
+                        "the brakes themselves")
+    p.set_defaults(func=cmd_disable_drives)
 
     p = command("plc", help="read the brake PLC and list every relay and "
                             "input (reads only)")

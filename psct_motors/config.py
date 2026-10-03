@@ -532,6 +532,17 @@ class PlatformConfig:
     #: (12.7 um a full step here) has slipped, so 0.1 mm is never normal.
     max_position_error_mm: float = 0.1
 
+    # --- resting on the brakes ------------------------------------------------
+    #: Brakes on, then drives off, so a parked focal plane is held by the
+    #: brakes alone and the motors cannot make small corrections. Done by the
+    #: GUI's Disable drives button, or after every move when this is on.
+    rest_on_brakes_after_moves: bool = False
+    #: After the drives go off, the encoders are watched this long. Any motor
+    #: that moves more than `rest_sink_limit_mm` means the brakes are not
+    #: holding, and the drives are turned straight back on.
+    rest_watch_s: float = 1.5
+    rest_sink_limit_mm: float = 0.01
+
     # --- settling at the target ---------------------------------------------
     #: After a move, each motor's encoder is compared with its target, and one
     #: that is off by more than `settle_deadband_counts` is sent the
@@ -658,6 +669,8 @@ class PlatformConfig:
             raise ValueError("sync_pause_mm must be positive and below sync_abort_mm")
         if self.sync_max_wait_s <= 0:
             raise ValueError("sync_max_wait_s must be positive")
+        if self.rest_watch_s < 0 or self.rest_sink_limit_mm <= 0:
+            raise ValueError("rest_watch_s must be >= 0 and rest_sink_limit_mm positive")
         if self.max_position_error_mm <= 0:
             raise ValueError("max_position_error_mm must be positive")
         if self.settle_deadband_counts < 1 or self.settle_max_tries < 0:

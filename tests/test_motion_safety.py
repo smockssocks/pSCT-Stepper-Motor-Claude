@@ -213,5 +213,77 @@ class TestSettling(_Base):
         self.assertTrue(any(line.startswith("Settled") for line in self.log))
 
 
+
+class TestRestingOnTheBrakes(_Base):
+    """Brakes on, drives off, and a check that the brakes really hold."""
+
+    def _modes(self, platform):
+        return {m.name: m.get_mode() for m in platform.motors}
+
+    def test_the_drives_go_off_with_the_brakes_on_and_nothing_moves(self):
+        from psct_motors.registers import MotorMode
+        platform = self._platform(rest_watch_s=0.5)
+        platform.enable_drives()
+        before = platform.read_actuator_positions_mm()
+        message = platform.rest_on_brakes()
+        self.assertIn("Resting on the brakes", message)
+        self.assertTrue(self._brakes_engaged(platform))
+        self.assertEqual(set(self._modes(platform).values()), {int(MotorMode.PASSIVE)})
+        time.sleep(0.3)
+        self.assertEqual(platform.read_actuator_positions_mm(), before)
+
+    def test_brakes_that_do_not_hold_turn_the_drives_back_on(self):
+        """The relay can say engaged while the brake slips. Watching the
+        encoders is what catches that."""
+        from psct_motors.registers import MotorMode
+        platform = self._platform(rest_watch_s=1.0)
+        platform.enable_drives()
+        for motor in platform.motors:
+            motor._transport.brake_held = lambda: False     # slipping
+        with self.assertRaises(PlatformError) as ctx:
+            platform.rest_on_brakes()
+        self.assertIn("brakes are not holding", str(ctx.exception))
+        self.assertEqual(set(self._modes(platform).values()), {int(MotorMode.POSITION)})
+        # ...and held: it stops sinking once the drives are back on.
+        settled = platform.read_actuator_positions_mm()
+        time.sleep(0.4)
+        for a, b in zip(settled, platform.read_actuator_positions_mm()):
+            self.assertAlmostEqual(a, b, places=3)
+
+    def test_relay_only_brakes_need_a_person_to_accept_them(self):
+        from psct_motors.registers import MotorMode
+        platform = self._platform(rest_watch_s=0.3)
+        platform.enable_drives()
+        platform.external_brake.state_is_measured = lambda name="all": False
+        with self.assertRaises(PlatformError) as ctx:
+            platform.rest_on_brakes()
+        self.assertIn("left on and holding", str(ctx.exception))
+        self.assertEqual(set(self._modes(platform).values()), {int(MotorMode.POSITION)})
+        message = platform.rest_on_brakes(trust_relay=True)
+        self.assertIn("from the relay", message)
+        self.assertEqual(set(self._modes(platform).values()), {int(MotorMode.PASSIVE)})
+
+    def test_after_each_move_when_asked(self):
+        from psct_motors.registers import MotorMode
+        platform = self._platform(rest_watch_s=0.3)
+        platform.rest_after_moves = True
+        start = platform.read_orientation().focus_mm
+        platform.move_to_orientation(Orientation(start + 0.5, 0.0, 0.0))
+        self.assertEqual(set(self._modes(platform).values()), {int(MotorMode.PASSIVE)})
+        self.assertTrue(self._brakes_engaged(platform))
+        # The next move takes the drives back on and the brakes off itself.
+        platform.move_to_orientation(Orientation(start + 1.0, 0.0, 0.0))
+        self.assertAlmostEqual(platform.read_orientation().focus_mm, start + 1.0, places=2)
+        self.assertEqual(set(self._modes(platform).values()), {int(MotorMode.PASSIVE)})
+
+    def test_a_failed_rest_after_a_move_does_not_fail_the_move(self):
+        platform = self._platform(rest_watch_s=0.3)
+        platform.rest_after_moves = True
+        platform.external_brake.state_is_measured = lambda name="all": False
+        start = platform.read_orientation().focus_mm
+        platform.move_to_orientation(Orientation(start + 0.5, 0.0, 0.0))
+        self.assertTrue(platform.history.last().completed)
+        self.assertTrue(any("did NOT rest on the brakes" in line for line in self.log))
+
 if __name__ == "__main__":
     unittest.main()

@@ -820,6 +820,30 @@ class TestGui(unittest.TestCase):
         self.assertEqual(self.app.rows["Top"].supply_var.get(), "24.0 V")
         window.destroy()
 
+    # ---- disable drives --------------------------------------------------------
+
+    def test_disable_drives_rests_on_the_brakes(self):
+        from psct_motors.registers import MotorMode
+        self.app.cfg.rest_watch_s = 0.3
+        self.app._start_polling()
+        self.app.platform.enable_drives()
+        self.app.on_disable_drives()
+        self._wait_idle()
+        self.assertEqual({m.get_mode() for m in self.app.platform.motors},
+                         {int(MotorMode.PASSIVE)})
+        self.assertIn("Resting on the brakes", self.app.log_text.get("1.0", "end"))
+
+    def test_the_checkbox_asks_about_a_relay_and_applies_for_the_session(self):
+        self.app.platform.external_brake.state_is_measured = lambda name="all": False
+        self.app.rest_after_var.set(True)
+        self._answer(False, self.app.on_rest_after_moves_changed)
+        self.assertFalse(self.app.rest_after_var.get())
+        self.assertFalse(self.app.platform.rest_after_moves)
+        self.app.rest_after_var.set(True)
+        self._answer(True, self.app.on_rest_after_moves_changed)
+        self.assertTrue(self.app.platform.rest_after_moves)
+        self.assertTrue(self.app.platform.trust_relay_brakes)
+
     # ---- ends of travel -------------------------------------------------------
 
     def _limits_button(self, text):
