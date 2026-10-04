@@ -7,7 +7,7 @@ there without knowing the numbers.
 
 What is stored is each actuator's *motor* position in raw encoder counts, as
 well as the orientation it meant at the time. The counts are the ground
-truth. Focus, tip and tilt are measured from the zero set by "Set zero here",
+truth. Focus, tip and tilt are measured from the zero (`cli set-zero`),
 and if somebody sets a new zero later, a position stored only as "focus
 +2.0 mm" would quietly start meaning a different physical place. Stored as
 counts, a saved position goes back to the same place however the zero has

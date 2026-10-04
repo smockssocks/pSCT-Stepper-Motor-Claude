@@ -334,12 +334,6 @@ class SingleMotorApp:
                    command=self.on_enable_position).grid(row=1, column=0,
                                                          columnspan=2, padx=8,
                                                          pady=(0, 8), sticky="w")
-        ttk.Button(frame, text="Set zero here",
-                   command=self.on_set_zero).grid(row=1, column=2, pady=(0, 8))
-        ttk.Label(frame, text="Zero is this GUI's reference only; nothing is "
-                              "written to the motor.",
-                  foreground="#777").grid(row=1, column=3, columnspan=7,
-                                          sticky="w", padx=8, pady=(0, 8))
 
     def _build_faults(self) -> None:
         frame = ttk.LabelFrame(
@@ -686,16 +680,6 @@ class SingleMotorApp:
                                      "holding position")
 
         self.run_async("Enable position mode", work)
-
-    def on_set_zero(self) -> None:
-        if not self._require_connection():
-            return
-
-        def work():
-            counts = self.motor.set_zero_here()
-            self.log.info("command", f"Zero reference set at {counts} counts")
-
-        self.run_async("Set zero", work)
 
     def on_stop(self) -> None:
         if not self.motor.connected:

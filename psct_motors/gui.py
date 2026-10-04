@@ -569,7 +569,6 @@ class MotorApp:
         motion.add_command(label="Saved positions...",
                            command=self.on_open_saved_positions)
         motion.add_separator()
-        motion.add_command(label="Set zero here", command=self.on_set_zero)
         motion.add_command(label="Copy current orientation into the boxes",
                            command=self.on_copy_current)
         menubar.add_cascade(label="Motion", menu=motion)
@@ -693,8 +692,6 @@ class MotorApp:
 
         ttk.Button(frame, text="Clear errors",
                    command=self.on_clear_errors).grid(row=0, column=3, padx=6)
-        ttk.Button(frame, text="Set zero here",
-                   command=self.on_set_zero).grid(row=0, column=4, padx=6)
 
         self.addresses_var = tk.StringVar()
         ttk.Label(frame, textvariable=self.addresses_var,
@@ -992,7 +989,7 @@ class MotorApp:
 
         tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=500,
                  text=("Distance along the optical axis from the zero reference "
-                       "(the position set by 'Set zero here') to each mirror, in "
+                       "(focus 0) to each mirror, in "
                        "millimetres. With these entered the gauge can show how "
                        "far the focal plane is from M1 or from M2 instead of "
                        "from zero.\n\n"
@@ -3581,25 +3578,6 @@ class MotorApp:
                     )
 
         self.run_async("Clear errors", work)
-
-    def on_set_zero(self) -> None:
-        if not self.platform.connected:
-            messagebox.showwarning("Not connected", "Connect first.")
-            return
-        if not messagebox.askyesno(
-            "Set the zero reference?",
-            "This defines the CURRENT position as focus 0, tip 0, tilt 0, and "
-            "saves it to the configuration file.\n\nEvery later command is "
-            "measured from here, so only do this with the focal plane at a "
-            "position you have independently established.\n\nSet zero here?",
-        ):
-            return
-
-        def work():
-            result = self.platform.set_zero_here(persist=True)
-            self.log_threadsafe(f"Zero reference set: {result}")
-
-        self.run_async("Set zero", work)
 
     def on_close(self) -> None:
         if self.platform.connected and not messagebox.askyesno(
