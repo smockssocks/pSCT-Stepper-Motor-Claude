@@ -397,6 +397,18 @@ class TestPlatformWithThePlc(unittest.TestCase):
         self.assertIn("relay state", state.brake_summary)
         self.assertTrue(all(m.brake.inferred for m in state.motors))
 
+    def test_a_confirmed_move_goes_ahead_with_the_plc_unreadable(self):
+        platform = self._platform()
+        platform.enable_drives()
+        platform.set_all_brakes(engaged=False)      # released, then the PLC goes
+        platform.read_state()
+        self.plc.stop()
+        with self.assertRaises(PlatformError):
+            platform.move_to_orientation(Orientation(0.5, 0.0, 0.0))
+        platform.allow_unknown_brakes = True        # the GUI's password + yes
+        platform.move_to_orientation(Orientation(0.5, 0.0, 0.0))
+        self.assertAlmostEqual(platform.read_orientation().focus_mm, 0.5, places=2)
+
     def test_a_dead_plc_is_reported_and_does_not_stall_the_poll(self):
         platform = self._platform()
         self.plc.stop()

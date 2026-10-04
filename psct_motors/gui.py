@@ -807,6 +807,7 @@ class MotorApp:
         self._load_rows = {}
         self._limit_entries = ()
         self._stops_unlocked = False
+        self._unknown_brakes_ok = False
         self._password_action = None
         self.plane_view = None
 
@@ -1478,6 +1479,8 @@ class MotorApp:
         if not self.platform.connected:
             messagebox.showwarning("Not connected", "Connect first.")
             return
+        if not self._brake_gate(lambda: self.on_nudge(axis, sign)):
+            return
         if axis == "focus":
             step = self._read_float(self.focus_step_var, "Focus step")
             if step is None:
@@ -1498,6 +1501,8 @@ class MotorApp:
     def on_jog(self, name: str, sign: int) -> None:
         if not self.platform.connected:
             messagebox.showwarning("Not connected", "Connect first.")
+            return
+        if not self._brake_gate(lambda: self.on_jog(name, sign)):
             return
         step = self._read_float(self.jog_step_var, "Jog step")
         if step is None:
@@ -2062,6 +2067,8 @@ class MotorApp:
         self.tilt_var.set("0.0")
         if not self.platform.connected:
             return
+        if not self._brake_gate(self.on_level):
+            return
 
         def work():
             current = self.platform.read_orientation()
@@ -2097,10 +2104,12 @@ class MotorApp:
                         padx=12, pady=(12, 8))
 
         fields = [
-            ("min_focus_mm", "Focus, lowest (mm)",
-             "towards M2 (secondary)"),
-            ("max_focus_mm", "Focus, highest (mm)",
-             "towards M1 (primary)"),
+            ("min_focus_mm", "Lowest position (mm)",
+             "used until the lower end of travel is known"),
+            ("max_focus_mm", "Highest position (mm)",
+             "used until the upper end of travel is known"),
+            ("safety_margin_mm", "Stay inside the ends of travel by (mm)",
+             "how close a move may go to a known end of travel"),
             ("max_tilt_deg", "Max total tilt (deg)",
              "magnitude, from the optical axis"),
             ("max_step_mm", "Max single step (mm)",
@@ -2114,8 +2123,14 @@ class MotorApp:
             ttk.Label(window, text=label).grid(row=1 + index, column=0,
                                                sticky="e", padx=(12, 4), pady=3)
             var = tk.StringVar(value=f"{getattr(limits, attr):g}")
-            ttk.Entry(window, textvariable=var, width=12).grid(
+            # A side whose end of travel is known is set by it, not typed.
+            pinned = ((attr == "min_focus_mm" and limits.hard_stop_low_mm is not None)
+                      or (attr == "max_focus_mm" and limits.hard_stop_high_mm is not None))
+            ttk.Entry(window, textvariable=var, width=12,
+                      state="disabled" if pinned else "normal").grid(
                 row=1 + index, column=1, sticky="w", padx=4)
+            if pinned:
+                note = "set by the end of travel, less the margin"
             if note:
                 ttk.Label(window, text=note, foreground="#777",
                           font=("TkDefaultFont", 8)).grid(
@@ -2183,48 +2198,12 @@ class MotorApp:
                 raise ValueError("The lower end of travel has to be below the upper.")
             return low, high
 
-        margin_var = tk.StringVar(value="1.0")
-        ttk.Label(found, text="keep this much margin (mm):").grid(
-            row=2, column=0, sticky="e", padx=8, pady=4)
-        ttk.Entry(found, textvariable=margin_var, width=8).grid(
-            row=2, column=1, sticky="w")
-
-        def from_stops() -> None:
-            try:
-                margin = float(margin_var.get())
-            except ValueError:
-                messagebox.showerror("Check the number",
-                                     "Margin must be a number.", parent=window)
-                return
-            if margin < 0:
-                messagebox.showerror("Check the number",
-                                     "Margin cannot be negative.", parent=window)
-                return
-            try:
-                low, high = read_stops()
-            except ValueError as exc:
-                messagebox.showerror("Check the number", str(exc), parent=window)
-                return
-            if low is None and high is None:
-                messagebox.showwarning(
-                    "Nothing known yet",
-                    "Run Motion > Find hard stop in each direction first, or "
-                    "enter the ends of travel.",
-                    parent=window)
-                return
-            if low is not None:
-                entries["min_focus_mm"].set(f"{low + margin:g}")
-            if high is not None:
-                entries["max_focus_mm"].set(f"{high - margin:g}")
-
-        ttk.Button(found, text="Set focus limits from these",
-                   command=from_stops).grid(row=2, column=2, padx=8, pady=4)
-        first = self.cfg.actuators[0]
         ttk.Label(found, foreground="#777", font=("TkDefaultFont", 8),
-                  text=(f"Each actuator may travel {first.min_travel_mm:+.3f} to "
-                        f"{first.max_travel_mm:+.3f} mm (motor zero). Once an end "
-                        f"of travel is known this follows it, "
-                        f"{limits.safety_margin_mm:g} mm inside.")).grid(
+                  wraplength=600, justify="left",
+                  text=(f"Allowed now: {limits.min_focus_mm:+.3f} to "
+                        f"{limits.max_focus_mm:+.3f} mm (motor zero), for the "
+                        "focus and every actuator. A known end of travel sets "
+                        "its side of that, less the margin above.")).grid(
             row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6))
 
         def apply(persist: bool) -> None:
@@ -2247,6 +2226,15 @@ class MotorApp:
             stops_changed = self._stops_unlocked and (
                 values["hard_stop_low_mm"] != limits.hard_stop_low_mm
                 or values["hard_stop_high_mm"] != limits.hard_stop_high_mm)
+
+            # A known end of travel sets its side, less the margin.
+            margin = values.get("safety_margin_mm", limits.safety_margin_mm)
+            low = values.get("hard_stop_low_mm", limits.hard_stop_low_mm)
+            high = values.get("hard_stop_high_mm", limits.hard_stop_high_mm)
+            if low is not None:
+                values["min_focus_mm"] = low + margin
+            if high is not None:
+                values["max_focus_mm"] = high - margin
 
             # Validate on a copy, so a rejected edit cannot leave the live
             # limits half-applied.
@@ -2516,7 +2504,9 @@ class MotorApp:
         # --- relays ----------------------------------------------------------
         wiring = ttk.LabelFrame(window, text="Which relay switches the brakes")
         wiring.grid(row=2, column=0, sticky="nsew", padx=(12, 6), pady=4)
-        per_axis = bool(settings.relays) and "all" not in settings.relays
+        # Separate brakes on relays 1, 2 and 3 unless something else has been
+        # set: that is how the site wires them.
+        per_axis = not settings.relays or "all" not in settings.relays
         relay_mode = tk.StringVar(value="each" if per_axis else "one")
         one_relay = tk.StringVar(value=str(settings.relays.get("all", 1))
                                  if not per_axis else "1")
@@ -2532,7 +2522,8 @@ class MotorApp:
         for index, name in enumerate(names):
             ttk.Label(wiring, text=name).grid(row=2 + index, column=0, sticky="e",
                                               padx=(8, 4))
-            var = tk.StringVar(value=str(settings.relays.get(name, ""))
+            default = str(index + 1) if not settings.relays else ""
+            var = tk.StringVar(value=str(settings.relays.get(name, default))
                                if per_axis else "")
             ttk.Entry(wiring, textvariable=var, width=5).grid(
                 row=2 + index, column=1, sticky="w", pady=1)
@@ -2877,6 +2868,10 @@ class MotorApp:
 
     def _run_hard_stop_together(self, direction: int, budget_mm: float,
                                 speed: float) -> None:
+        if not self._brake_gate(lambda: self._run_hard_stop_together(
+                direction, budget_mm, speed)):
+            return
+
         def work():
             self.log_threadsafe(
                 f"Hard-stop search on all three actuators, {direction:+d} "
@@ -3491,6 +3486,80 @@ class MotorApp:
                 self._supply_window = None
         window.bind("<Destroy>", forget)
 
+    def _brakes_known(self) -> bool:
+        """Whether the brake PLC is set up and answering."""
+        controller = self.platform.external_brake
+        if not controller.available:
+            return False
+        state = self._last_state
+        return not (state is not None and "NOT READABLE" in (state.brake_summary or ""))
+
+    def _brake_gate(self, retry: Callable[[], None]) -> bool:
+        """True to go ahead now.
+
+        With the brake PLC set up and answering, always. Otherwise the brakes
+        are not known to this software (something else may be switching
+        them), so moving needs the password and a confirmation, once; after
+        that `retry` is called and moves go ahead for the session without
+        touching the brakes, until the PLC is back.
+        """
+        if self._brakes_known():
+            self._unknown_brakes_ok = False
+            self.platform.allow_unknown_brakes = False
+            return True
+        if self._unknown_brakes_ok:
+            self.platform.allow_unknown_brakes = True     # survives a rebuild
+            return True
+
+        def confirmed():
+            why = ("is not set up (Setup > Brake controller)"
+                   if not self.platform.external_brake.available
+                   else "is not answering")
+            if not messagebox.askyesno(
+                    "Move with the brakes not known?",
+                    f"The brake PLC {why}, so this software does not know whether "
+                    "the brakes are on or off, and will not switch them.\n\n"
+                    "Only go ahead if you are sure the brakes are RELEASED by "
+                    "whatever is controlling them. Driving the motors against an "
+                    "engaged brake can damage the actuators; moving with nothing "
+                    "holding the plate can drop it.\n\n"
+                    "Are you sure? (This is asked again whenever the PLC comes "
+                    "back and then drops out.)"):
+                return
+            self._unknown_brakes_ok = True
+            self.platform.allow_unknown_brakes = True
+            self.log("Moving with the brakes not known, on the operator's "
+                     "confirmation. The brakes are not being switched.")
+            retry()
+
+        self._ask_password("Moving with the brakes not known needs the password.",
+                           confirmed)
+        return False
+
+    def _closest_allowed(self, target: Orientation,
+                         current: Optional[Orientation]) -> Optional[Orientation]:
+        """The nearest allowed focus to a target that is past a limit but not
+        past the end of travel itself; None if that does not apply, or if the
+        move would still be refused for some other reason."""
+        limits = self.cfg.limits
+        focus = target.focus_mm
+        if focus > limits.max_focus_mm and (
+                limits.hard_stop_high_mm is None
+                or focus <= limits.hard_stop_high_mm + 1e-6):
+            focus = limits.max_focus_mm
+        elif focus < limits.min_focus_mm and (
+                limits.hard_stop_low_mm is None
+                or focus >= limits.hard_stop_low_mm - 1e-6):
+            focus = limits.min_focus_mm
+        else:
+            return None
+        closer = Orientation(focus, target.tip_deg, target.tilt_deg)
+        try:
+            self.platform.check_orientation(closer, current=current)
+        except PlatformError:
+            return None
+        return closer
+
     def _move_with_confirmation(self, target: Orientation, kind: str,
                                 note: str, reason: str) -> None:
         """The one path every absolute move takes: check, show, confirm, go.
@@ -3503,6 +3572,9 @@ class MotorApp:
         if not self.platform.connected:
             messagebox.showwarning("Not connected", "Connect first.")
             return
+        if not self._brake_gate(lambda: self._move_with_confirmation(
+                target, kind, note, reason)):
+            return
         try:
             current = self.platform.read_orientation()
         except Exception as exc:  # noqa: BLE001 -- refuse, do not guess
@@ -3512,8 +3584,20 @@ class MotorApp:
         try:
             self.platform.check_orientation(target, current=current)
         except PlatformError as exc:
-            messagebox.showerror("Move refused", str(exc))
-            return
+            closer = self._closest_allowed(target, current)
+            if closer is None:
+                messagebox.showerror("Move refused", str(exc))
+                return
+            limits = self.cfg.limits
+            if not messagebox.askyesno(
+                "Closest allowed position",
+                f"{self._shown(target.focus_mm):+.4f} mm{self._ref_words()} is "
+                f"past the limit: moves stay {limits.safety_margin_mm:g} mm "
+                "inside the end of travel (Motion > Motion settings).\n\n"
+                f"The closest allowed is {self._shown(closer.focus_mm):+.4f} mm"
+                f"{self._ref_words()}. Go there instead?"):
+                return
+            target = closer
         preview = self.platform.preview(target)
         detail = "\n".join(f"   {n}: {self._shown(mm):10.4f} mm"
                             for n, mm in preview.items())

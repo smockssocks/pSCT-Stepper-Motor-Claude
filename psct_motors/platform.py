@@ -377,6 +377,10 @@ class FocalPlanePlatform:
         #: here uses them.
         self.shown_offset_mm = 0.0
         self.shown_from = ""
+        #: Set by the GUI once a person has confirmed (with the password) that
+        #: moving is fine while the brake controller cannot be read: the move
+        #: then goes ahead without touching the brakes.
+        self.allow_unknown_brakes = False
         #: Whether a person has accepted the brake relay's word for "engaged"
         #: when nothing senses the brakes. Never set by this module.
         self.trust_relay_brakes = False
@@ -1033,36 +1037,42 @@ class FocalPlanePlatform:
         return notes
 
     def sync_travel_to_stops(self) -> List[str]:
-        """Make every actuator's own travel limit follow the ends of travel.
+        """One set of limits: pin them to the ends of travel, and make every
+        actuator use them.
 
-        Each actuator has a travel limit of its own as well as the focus
-        limits. They ship as a guess (-24..+24 mm) and nothing used to update
-        them, so once a hard stop was found further out, the focus limit moved
-        out to it but every actuator still refused anything past 24 mm: a move
-        to 1 mm from the stop was "outside its travel limits". Once an end of
-        travel is known, each actuator may go to within `safety_margin_mm` of
-        it, the same as the focus limit. Returns lines for the log (empty if
-        nothing changed).
+        There used to be three overlapping sets -- focus limits, a travel
+        limit per actuator (shipped at -24..+24 mm and never updated), and the
+        ends of travel -- and they disagreed: with the stop found further out,
+        a move near it passed one check and failed another. Now:
+
+        * where an end of travel is known, the limit on that side is the stop
+          less `safety_margin_mm`;
+        * where it is not known yet, the configured focus limit stands;
+        * each actuator's travel limit is that same range.
+
+        Returns lines for the log (empty if nothing changed).
         """
         limits = self.cfg.limits
         margin = limits.safety_margin_mm
-        changed = []
+        before = (limits.min_focus_mm, limits.max_focus_mm,
+                  [(a.min_travel_mm, a.max_travel_mm) for a in self.cfg.actuators])
+        if limits.hard_stop_low_mm is not None:
+            limits.min_focus_mm = limits.hard_stop_low_mm + margin
+        if limits.hard_stop_high_mm is not None:
+            limits.max_focus_mm = limits.hard_stop_high_mm - margin
+        if limits.min_focus_mm >= limits.max_focus_mm:
+            raise PlatformError(
+                f"The ends of travel and the {margin:g} mm margin leave no room: "
+                f"{limits.min_focus_mm:+.4f}..{limits.max_focus_mm:+.4f} mm.")
         for actuator in self.cfg.actuators:
-            low, high = actuator.min_travel_mm, actuator.max_travel_mm
-            if limits.hard_stop_low_mm is not None:
-                low = limits.hard_stop_low_mm + margin
-            if limits.hard_stop_high_mm is not None:
-                high = limits.hard_stop_high_mm - margin
-            if low < high and (low, high) != (actuator.min_travel_mm,
-                                              actuator.max_travel_mm):
-                actuator.min_travel_mm, actuator.max_travel_mm = low, high
-                changed.append(actuator.name)
-        if not changed:
+            actuator.min_travel_mm = limits.min_focus_mm
+            actuator.max_travel_mm = limits.max_focus_mm
+        after = (limits.min_focus_mm, limits.max_focus_mm,
+                 [(a.min_travel_mm, a.max_travel_mm) for a in self.cfg.actuators])
+        if after == before:
             return []
-        a = self.cfg.actuators[0]
-        return [f"Actuator travel limits now follow the ends of travel: "
-                f"{a.min_travel_mm:+.4f}..{a.max_travel_mm:+.4f} mm "
-                f"({margin:.3f} mm inside them) for {', '.join(changed)}."]
+        return [f"Limits: {limits.min_focus_mm:+.4f} to {limits.max_focus_mm:+.4f} mm "
+                f"(motor zero), for the focus and every actuator."]
 
     def _focus_within_limits(self, focus_mm: float) -> bool:
         limits = self.cfg.limits
@@ -1491,6 +1501,10 @@ class FocalPlanePlatform:
             # whether the motors are about to push against a clamped brake.
             state = controller.read_state(target, fresh=True)
         except BrakeError as exc:
+            if self.allow_unknown_brakes:
+                self._log(f"The brake controller could not be read ({exc}); "
+                          "moving without touching the brakes, as confirmed.")
+                return
             raise PlatformError(
                 f"Not moving: the brake controller could not be read ({exc}). "
                 "Moving without knowing whether the brakes are off risks driving "

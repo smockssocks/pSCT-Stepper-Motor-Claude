@@ -124,7 +124,7 @@ each thing in one place:
 | **Motion → Go back to the previous position** | return to where the focal plane was before the last move — an ordinary checked move, with confirmation |
 | **Motion → Copy current position into Go to** | fill the Go to box (and the tilt boxes) with where the plane is now |
 | **Motion → Find hard stop** | run the actuators out to the end of travel |
-| **Motion → Motion settings** | where 0 is (motor zero, top stop or bottom stop); focus, tilt and step limits; the ends of travel (found by Find hard stop, or typed in behind the password); set the focus limits from the ends of travel with a margin |
+| **Motion → Motion settings** | where 0 is (motor zero, top stop or bottom stop); the limits (see below); tilt and step limits; the ends of travel (found by Find hard stop, or typed in behind the password) |
 | **View → Position log** | every move, newest first: where the plane was, where it was sent, where it ended up; select a line and go back to it |
 | **View → Load and torque** | how hard each motor is working, big enough to read across a room, with peaks, temperature and supply; how many readings per second; and the torque limit (changing it needs the password) |
 | **Setup → Motor connections** | edit each motor's IP and port, use now or save |
@@ -135,6 +135,28 @@ each thing in one place:
 Saved positions (**Save current as...**, **All saved...**), Clear errors, the
 brakes and the drives are buttons on the window. The safety drills are run from
 the command line: `python -m psct_motors.cli safety-check`.
+
+**Limits.** There is one set, used for the focus and for every actuator:
+
+- Where an **end of travel** is known (found by *Find hard stop*, or entered in
+  Motion settings), the limit on that side is the stop less **Stay inside the
+  ends of travel by** (`safety_margin_mm`, editable in Motion settings).
+- Where it is not known yet, the **Lowest / Highest position** typed in
+  Motion settings is used instead.
+- The **max single step** (10 mm) and the tilt limits still apply on top.
+
+Asking for a position between the limit and the end of travel (the stop
+itself, say) offers the closest allowed position instead of just refusing.
+The torque limit and the falling watch protect the rest of the way.
+
+**When the brakes are not known.** If the brake PLC is not set up or is not
+answering, a move, fine adjust, jog, Level, saved position, go-back or hard-stop
+search first asks for the password, then asks you to confirm the brakes are
+released by whatever is controlling them. After that, moves go ahead without
+touching the brakes for the rest of the session, until the PLC is back. A new
+configuration expects **separate brakes on relays 1, 2 and 3** (Top, East,
+West); change it under *Setup → Brake controller (PLC)* if they are wired
+otherwise.
 
 **Addresses change.** *Setup → Motor connections* edits each motor's IP and
 port. "Use for this session" applies them until you close the window; "Use and

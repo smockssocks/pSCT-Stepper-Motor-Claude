@@ -205,7 +205,7 @@ class TestGui(unittest.TestCase):
         self.app._start_polling()
         self.app._open_tilt_window()
         self.pump(0.3)
-        self.app.platform.move_to_orientation(Orientation(1.0, 0.1, -0.05))
+        self.app.platform.move_to_orientation(Orientation(3.0, 0.1, -0.05))
         self.pump(0.6)
         self.assertIsNotNone(self.app.plane_view)
         self.assertEqual(len(self.app.plane_view._z), 3)
@@ -863,19 +863,29 @@ class TestGui(unittest.TestCase):
         self.assertTrue(self.app._submit_password("11328pixels!"))
         self.assertEqual(str(high_entry.cget("state")), "normal")
 
-        # Inside the focus limits is refused: a limit beyond a stop drives
-        # into it.
-        self.app.stop_low_var.set(f"{limits.min_focus_mm - 0.5:g}")
-        self.app.stop_high_var.set(f"{limits.max_focus_mm - 1.0:g}")
-        self._answer(True, self._limits_button("Use and save").invoke)
-        self.assertIsNone(limits.hard_stop_high_mm)
-
-        high = limits.max_focus_mm + 0.5
+        # The limits follow the stops, less the margin: one set of limits,
+        # for the focus and every actuator.
+        self.app.stop_low_var.set("")
+        high = limits.max_focus_mm - 1.0
         self.app.stop_high_var.set(f"{high:g}")
         self._answer(True, self._limits_button("Use and save").invoke)
         self.assertEqual(limits.hard_stop_high_mm, high)
+        self.assertAlmostEqual(limits.max_focus_mm, high - limits.safety_margin_mm)
+        for actuator in self.app.cfg.actuators:
+            self.assertAlmostEqual(actuator.max_travel_mm, limits.max_focus_mm)
         self.assertEqual(load_config(self.app.config_path).limits.hard_stop_high_mm, high)
         self.assertIn("Ends of travel changed by hand", self.app.log_text.get("1.0", "end"))
+
+        # A stop below the other one is refused.
+        self.app.on_edit_limits()
+        self.pump(0.2)
+        self._limits_button("Change ends of travel...").invoke()
+        self.app._submit_password("11328pixels!")
+        self.app.stop_low_var.set("30")
+        self.app.stop_high_var.set("20")
+        self._answer(True, self._limits_button("Use and save").invoke)
+        self.assertEqual(limits.hard_stop_high_mm, high)
+        self.app._limits_window.destroy()
 
     # ---- where 0 is -----------------------------------------------------------
 
@@ -943,6 +953,66 @@ class TestGui(unittest.TestCase):
         self._answer(True, self._limits_button("Use for this session").invoke)
         self.assertEqual(self.app.cfg.position_reference, "zero")
         self.app._limits_window.destroy()
+
+    # ---- moving with the brakes not known ---------------------------------------
+
+    def _no_brake_controller(self):
+        from psct_motors.external_brake import BrakeController, ExternalBrakeConfig
+        self.app.platform.external_brake = BrakeController(ExternalBrakeConfig())
+
+    def test_unknown_brakes_need_the_password_and_a_yes(self):
+        self._no_brake_controller()
+        start = self.app.platform.read_orientation().focus_mm
+        self.app.focus_var.set(f"{start + 0.5:.4f}")
+        self.app.on_move()
+        self.pump(0.2)
+        self.assertIsNotNone(self.app._password_window)    # asked, not moved
+        self._answer(True, lambda: self.app._submit_password("11328pixels!"))
+        self._wait_idle()
+        self.pump(1.0)
+        self.assertAlmostEqual(self.app.platform.read_orientation().focus_mm,
+                               start + 0.5, places=2)
+        self.assertTrue(self.app.platform.allow_unknown_brakes)
+        # Asked once: the next move goes straight to its own confirmation.
+        self.app.focus_var.set(f"{start:.4f}")
+        self._answer(True, self.app.on_move)
+        self.assertIsNone(self.app._password_window)
+
+    def test_saying_no_does_not_move(self):
+        self._no_brake_controller()
+        start = self.app.platform.read_orientation().focus_mm
+        self.app.focus_var.set(f"{start + 0.5:.4f}")
+        self.app.on_move()
+        self._answer(False, lambda: self.app._submit_password("11328pixels!"))
+        self.pump(0.5)
+        self.assertAlmostEqual(self.app.platform.read_orientation().focus_mm,
+                               start, places=3)
+        self.assertFalse(self.app.platform.allow_unknown_brakes)
+
+    def test_known_brakes_are_not_asked_about(self):
+        self.assertTrue(self.app._brakes_known())
+        self.assertTrue(self.app._brake_gate(lambda: None))
+        self.assertIsNone(self.app._password_window)
+
+    # ---- the closest allowed -----------------------------------------------------
+
+    def test_asking_for_the_stop_offers_the_closest_allowed(self):
+        limits = self.app.cfg.limits
+        limits.hard_stop_high_mm = limits.max_focus_mm + limits.safety_margin_mm
+        self.app.platform.sync_travel_to_stops()
+        current = self.app.platform.read_orientation()
+        target = Orientation(limits.hard_stop_high_mm, 0.0, 0.0)
+        closer = self.app._closest_allowed(target, None)
+        self.assertAlmostEqual(closer.focus_mm, limits.max_focus_mm)
+        # Past the stop itself, nothing is offered.
+        self.assertIsNone(self.app._closest_allowed(
+            Orientation(limits.hard_stop_high_mm + 1.0, 0.0, 0.0), None))
+
+    def test_the_brake_dialog_defaults_to_separate_relays(self):
+        from psct_motors.config import default_config
+        cfg = default_config()
+        self.assertEqual(cfg.external_brake.relays, {"Top": 1, "East": 2, "West": 3})
+        self.assertFalse(cfg.external_brake.all_or_nothing)
 
     # ---- torque limit and update rate ----------------------------------------
 

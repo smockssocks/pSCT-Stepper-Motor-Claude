@@ -520,7 +520,7 @@ class TestTheFoundStopBecomesTheLimit(unittest.TestCase):
         with self.assertRaises(PlatformError):
             platform.check_orientation(Orientation(24.4, 0.0, 0.0))
         notes = " ".join(platform.adopt_hard_stop(+1, 25.4))
-        self.assertIn("Actuator travel limits now follow", notes)
+        self.assertIn("for the focus and every actuator", notes)
         platform.check_orientation(Orientation(24.4, 0.0, 0.0))       # 1 mm off
         platform.check_orientation(Orientation(24.9, 0.0, 0.0))       # the margin
         with self.assertRaises(PlatformError) as ctx:

@@ -788,7 +788,11 @@ def default_config() -> PlatformConfig:
                            counts_per_mm=MEASURED_COUNTS_PER_MM),
             ActuatorConfig(name="West", ip="192.168.0.54", azimuth_deg=210.0,
                            counts_per_mm=MEASURED_COUNTS_PER_MM),
-        ]
+        ],
+        # Separate brakes, one relay each, as the site wires them. Inert until
+        # the brake controller is set up (mode "none").
+        external_brake=ExternalBrakeSettings(
+            relays={"Top": 1, "East": 2, "West": 3}, all_or_nothing=False),
     )
 
 
