@@ -130,7 +130,7 @@ Register 97 `Bus voltage` reads in the drive's own raw units, and nothing in
 the register map says what they are worth. It was measured instead: on the
 pSCT motor 1804 raw read exactly 48.0 V on MacTalk's display. That scale is
 the default, so the readouts show volts and a collapsed supply is recognised
-with nothing to set up. `cli supply` (or the GUI's Tools -> Supply voltage)
+with nothing to set up. `cli supply` (or the GUI's Setup -> Supply voltage)
 records a motor's own pair if one ever reads differently.
 
 The interesting part is what it deliberately does **not** do. There is a

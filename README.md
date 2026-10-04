@@ -93,7 +93,7 @@ drives.
   travel limits and ends of travel marked, target shown while moving. Under
   it, the distance to M1 and to M2 once those are entered (*Distances to
   M1 / M2...*; nothing is shown until they are known).
-- **Where 0 is** is set in *Tools → Motion settings* → *Show positions from*:
+- **Where 0 is** is set in *Motion → Motion settings* → *Show positions from*:
   **motor zero**, **top stop = 0** or **bottom stop = 0**. Everything in the
   window then reads from there: the focus readout, the gauge, the actuator
   positions, **Go to**, previews and confirmations, saved positions, the
@@ -115,21 +115,28 @@ drives.
 
 Behind the menus, so the main window stays about the job:
 
+Everyday controls are on the window itself. The menus hold everything else,
+each thing in one place:
+
 | where | what |
 |---|---|
 | **Motion → Focal plane: tilt and jog** | password protected. One window with a live drawing of the plate on its three actuators, the two tilt angles with fine adjust buttons and Level, and a jog for each actuator |
-| **Motion → Save current position / Saved positions** | name the current position, and see, rename, delete or go to the saved ones |
 | **Motion → Go back to the previous position** | return to where the focal plane was before the last move — an ordinary checked move, with confirmation |
+| **Motion → Copy current position into Go to** | fill the Go to box (and the tilt boxes) with where the plane is now |
+| **Motion → Find hard stop** | run the actuators out to the end of travel |
+| **Motion → Motion settings** | where 0 is (motor zero, top stop or bottom stop); focus, tilt and step limits; the ends of travel (found by Find hard stop, or typed in behind the password); set the focus limits from the ends of travel with a margin |
 | **View → Position log** | every move, newest first: where the plane was, where it was sent, where it ended up; select a line and go back to it |
 | **View → Load and torque** | how hard each motor is working, big enough to read across a room, with peaks, temperature and supply; how many readings per second; and the torque limit (changing it needs the password) |
-| **Tools → Connection settings** | edit each motor's IP and port, use now or save |
-| **Tools → Motion settings** | where 0 is (motor zero, top stop or bottom stop); focus, tilt and step limits; the ends of travel (found by Find hard stop, or typed in behind the password); set the focus limits from the ends of travel with a margin |
-| **Tools → Distances from zero to M1 and M2** | the two numbers the gauge needs to show distance to a mirror instead of distance from zero |
-| **Tools → Supply voltage** | only if a motor's volts disagree with MacTalk: enter what the supply is really at, and that motor uses its own reading from then on |
-| **Tools → Find hard stop** | run the actuators out to the end of travel |
-| **Tools → Run safety drills** | prove the guards still fire (simulated, safe any time) |
+| **Setup → Motor connections** | edit each motor's IP and port, use now or save |
+| **Setup → Brake controller (PLC)** | the PLC's address, which relays drive the brakes, and a live view of every relay and input |
+| **Setup → Supply voltage** | only if a motor's volts disagree with MacTalk: enter what the supply is really at, and that motor uses its own reading from then on (clicking a supply reading opens it too) |
+| **Setup → Distances to M1 and M2** | how far motor zero is from each mirror, so the distance to each is shown under the gauge |
 
-**Addresses change.** *Tools → Connection settings* edits each motor's IP and
+Saved positions (**Save current as...**, **All saved...**), Clear errors, the
+brakes and the drives are buttons on the window. The safety drills are run from
+the command line: `python -m psct_motors.cli safety-check`.
+
+**Addresses change.** *Setup → Motor connections* edits each motor's IP and
 port. "Use for this session" applies them until you close the window; "Use and
 save" writes them to the configuration file. Either way the connection is
 rebuilt, because a motor object holds the address it was created with — editing
@@ -201,7 +208,7 @@ configuration file; `settle_enabled: false` turns settling off.
 ### Resting on the brakes (Disable drives)
 
 Once the focal plane is where it should be, **Disable drives** (under the
-actuator table, or *Tools*) leaves it held by the brakes alone, so the motors
+actuator table) leaves it held by the brakes alone, so the motors
 make no small corrections:
 
 1. The brakes are engaged and read back.
@@ -239,7 +246,7 @@ It is never compared against the drive's "Acceptance Voltage" register (139),
 which on the bench motor reads 2054 and is not known to be on the same scale.
 
 If a motor ever disagrees with MacTalk or a meter, record its own reading: in
-the GUI, *Tools → Supply voltage* (or click a supply reading), enter the voltage
+the GUI, *Setup → Supply voltage* (or click a supply reading), enter the voltage
 the supply is really at, and press **Record**; or from the command line:
 
 ```
@@ -326,7 +333,7 @@ python -m psct_motors.cli positions go "Window open"
 ### Finding the end of travel
 
 The site calibrates by running the actuators out until they stop.
-*Tools → Find hard stop*, or:
+*Motion → Find hard stop*, or:
 
 ```
 python -m psct_motors.cli find-stop                    # all three, together
@@ -422,7 +429,7 @@ Worth trying:
   and the orange posts are each actuator's extension. Vertical travel is
   exaggerated by the labelled factor: the plate is about a metre across and
   moves millimetres, so a true 1:1 drawing would be a flat line.
-- **Tools → Find hard stop** — the simulated actuators have end stops a little
+- **Motion → Find hard stop** — the simulated actuators have end stops a little
   past their soft limits and torque climbs against them, so the calibration
   can be rehearsed exactly as it will be run.
 - **The brakes** — they start engaged, as spring-applied brakes do. Try a move
@@ -440,8 +447,7 @@ and checking the software refuses it, with a message an operator can act on:
 EMERGENCY over a camera nothing else is holding, brakes on, brake supply off,
 no drive power, a brake released with nothing holding the load, focus and tilt
 and step limits, an obstruction, a hard stop, and a motor unplugged mid-move. It runs against its own simulated
-platform, so it is safe to run while connected to the telescope — and
-*Tools → Run safety drills* does the same from the window.
+platform, so it is safe to run while connected to the telescope.
 
 What it does not prove: the brakes it uses are simulated, because the real
 brake device's protocol is not known yet. It shows the interlock logic is
@@ -511,8 +517,7 @@ says which parts are real.
 1. Open `http://<PLC IP>/state.json` in a browser. You should see `relay1` to
    `relay16` and `digitalInput1` to `digitalInput18`. Anything missing has no
    "Local I/O Number" set on the PLC and has to be given one there first.
-2. In the GUI, *Tools → Brake controller (PLC)* (or **Brakes…** in the
-   Connection box): enter the IP, and which relay drives the brakes: one relay
+2. In the GUI, *Setup → Brake controller (PLC)*: enter the IP, and which relay drives the brakes: one relay
    for all three, or one per actuator. With a relay per actuator the brakes
    are **separate**: each row's Release/Engage switches only that brake, and a
    jog releases only the brake of the actuator it moves (a focus move still

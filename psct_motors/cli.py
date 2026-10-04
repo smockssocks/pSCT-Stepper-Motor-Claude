@@ -880,7 +880,7 @@ def cmd_plc(args) -> int:
     if settings.mode != "controlbyweb":
         out("The brake controller is not set to a ControlByWeb PLC "
             f"(external_brake.mode is {settings.mode!r}).")
-        out("Set it up in the GUI under Tools > Brake controller (PLC), or in")
+        out("Set it up in the GUI under Setup > Brake controller (PLC), or in")
         out("the configuration file:")
         out('  "external_brake": {"mode": "controlbyweb", "host": "<PLC IP>",')
         out('                     "relays": {"all": <relay number>}}')

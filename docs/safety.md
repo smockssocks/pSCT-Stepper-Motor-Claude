@@ -112,7 +112,7 @@ The check runs during coordinated moves as well as single-axis ones. Without
 it, an obstruction was only caught by the move timeout, with the drive pushing
 against it the whole time and the other two axes still travelling.
 
-`cli find-stop` and **Tools → Find hard stop** turn that into the calibration
+`cli find-stop` and **Motion → Find hard stop** turn that into the calibration
 procedure itself: walk out in small steps, stop when torque rises *or* a step
 barely moves, then back the command off so nothing is left pressed against the
 end. Each step ends when the axis stops making progress rather than after a
@@ -151,7 +151,7 @@ with nothing behind it would be worse than showing none.
 
 That device is a **ControlByWeb X-432** web PLC. `external_brake.mode =
 "controlbyweb"` drives it over HTTP (`state.json`, `?relayN=0|1`); set it up
-from *Tools → Brake controller (PLC)*. Modbus-coil and fixed-URL devices are
+from *Setup → Brake controller (PLC)*. Modbus-coil and fixed-URL devices are
 also supported. Until it is configured, the GUI says the brakes are not under
 software control rather than showing a state it cannot read.
 

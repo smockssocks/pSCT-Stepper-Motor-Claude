@@ -560,60 +560,41 @@ class MotorApp:
         """
         menubar = tk.Menu(self.root)
 
+        # Everyday controls are on the window itself; the menus hold what is
+        # not, each thing in one place. Motion: moving and how moves behave.
+        # View: windows to look at. Setup: done once, or when something
+        # changes.
         motion = tk.Menu(menubar, tearoff=0)
         motion.add_command(label="Focal plane: tilt and jog...",
                            command=self.on_open_tilt)
-        motion.add_separator()
         motion.add_command(label="Go back to the previous position",
                            command=self.on_go_back)
-        motion.add_command(label="Position log...",
-                           command=self.on_open_position_log)
-        motion.add_separator()
-        motion.add_command(label="Save current position...",
-                           command=self.on_save_position)
-        motion.add_command(label="Saved positions...",
-                           command=self.on_open_saved_positions)
-        motion.add_separator()
-        motion.add_command(label="Copy current orientation into the boxes",
+        motion.add_command(label="Copy current position into Go to",
                            command=self.on_copy_current)
+        motion.add_separator()
+        motion.add_command(label="Find hard stop (calibration)...",
+                           command=self.on_find_hard_stop)
+        motion.add_command(label="Motion settings...",
+                           command=self.on_edit_limits)
         menubar.add_cascade(label="Motion", menu=motion)
 
         view = tk.Menu(menubar, tearoff=0)
         view.add_command(label="Position log...",
                          command=self.on_open_position_log)
-        view.add_command(label="Saved positions...",
-                         command=self.on_open_saved_positions)
         view.add_command(label="Load and torque...",
                          command=self.on_open_load_view)
         menubar.add_cascade(label="View", menu=view)
 
-        tools = tk.Menu(menubar, tearoff=0)
-        tools.add_command(label="Connection settings...",
+        setup = tk.Menu(menubar, tearoff=0)
+        setup.add_command(label="Motor connections...",
                           command=self.on_edit_connection)
-        tools.add_command(label="Motion settings...",
-                          command=self.on_edit_limits)
-        tools.add_command(label="Distances from zero to M1 and M2...",
-                          command=self.on_edit_reference_distances)
-        tools.add_command(label="Supply voltage (set the scale)...",
-                          command=self.on_set_supply_scale)
-        tools.add_command(label="Find hard stop (calibration)...",
-                          command=self.on_find_hard_stop)
-        tools.add_command(label="Run safety drills (simulated)...",
-                          command=self.on_safety_drills)
-        tools.add_separator()
-        tools.add_command(label="Brake controller (PLC)...",
+        setup.add_command(label="Brake controller (PLC)...",
                           command=self.on_edit_brake_controller)
-        tools.add_command(label="Enable drives (hold position)",
-                          command=self.on_enable_drives)
-        tools.add_command(label="Disable drives (rest on the brakes)",
-                          command=self.on_disable_drives)
-        tools.add_separator()
-        tools.add_command(label="Clear errors", command=self.on_clear_errors)
-        tools.add_command(label="Release all brakes",
-                          command=lambda: self.on_brake(None, engage=False))
-        tools.add_command(label="Engage all brakes",
-                          command=lambda: self.on_brake(None, engage=True))
-        menubar.add_cascade(label="Tools", menu=tools)
+        setup.add_command(label="Supply voltage...",
+                          command=self.on_set_supply_scale)
+        setup.add_command(label="Distances to M1 and M2...",
+                          command=self.on_edit_reference_distances)
+        menubar.add_cascade(label="Setup", menu=setup)
 
         self.root.config(menu=menubar)
         self.menubar = menubar
@@ -701,8 +682,6 @@ class MotorApp:
         self.addresses_var = tk.StringVar()
         ttk.Label(frame, textvariable=self.addresses_var,
                   foreground="#555").grid(row=0, column=5, padx=10, sticky="w")
-        ttk.Button(frame, text="Edit...",
-                   command=self.on_edit_connection).grid(row=0, column=6, padx=4)
         self._refresh_addresses()
 
         # The brake controller, on its own line: which device, what it says,
@@ -715,16 +694,13 @@ class MotorApp:
                                           anchor="w", justify="left")
         self.brake_ctrl_label.grid(row=1, column=2, columnspan=4, sticky="w",
                                    pady=(0, 6))
-        ttk.Button(frame, text="Brakes...",
-                   command=self.on_edit_brake_controller).grid(
-            row=1, column=6, padx=4, pady=(0, 6))
-        self._wrap_to_width(frame, self.brake_ctrl_label, margin=260)
+        self._wrap_to_width(frame, self.brake_ctrl_label, margin=160)
 
     def _brake_controller_text(self) -> str:
         """What the brake line says before anything has been read."""
         controller = self.platform.external_brake
         if not controller.available:
-            return "Brakes: not under software control (Brakes... to set up the PLC)"
+            return "Brakes: not under software control (Setup > Brake controller to set up the PLC)"
         return f"Brakes: {controller.describe()} -- not read yet"
 
     def _refresh_addresses(self) -> None:
@@ -758,7 +734,7 @@ class MotorApp:
             row=1, column=0, columnspan=10, sticky="ew", padx=6, pady=6)
 
         # --- absolute focus command ---
-        # In the chosen position reference (Tools > Motion settings), so with
+        # In the chosen position reference (Motion > Motion settings), so with
         # the top stop as 0, "-10" is 10 mm below the top stop.
         ttk.Label(frame, text="Go to focus (mm):").grid(
             row=2, column=0, padx=(8, 2), sticky="e")
@@ -894,10 +870,7 @@ class MotorApp:
         self.mirror_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.mirror_var, foreground="#555",
                   font=("TkDefaultFont", 8), justify="center").grid(
-            row=2, column=0, pady=(0, 2))
-        ttk.Button(frame, text="Distances to M1 / M2...",
-                   command=self.on_edit_reference_distances).grid(
-            row=3, column=0, pady=(0, 8))
+            row=2, column=0, pady=(0, 8))
 
         self._refresh_gauge_limits()
 
@@ -2235,7 +2208,7 @@ class MotorApp:
             if low is None and high is None:
                 messagebox.showwarning(
                     "Nothing known yet",
-                    "Run Tools > Find hard stop in each direction first, or "
+                    "Run Motion > Find hard stop in each direction first, or "
                     "enter the ends of travel.",
                     parent=window)
                 return
@@ -2286,7 +2259,7 @@ class MotorApp:
                 messagebox.showerror(
                     "That end of travel is not known",
                     f"To show positions from the {POSITION_REFERENCES[reference]}, "
-                    "it has to be known: run Tools > Find hard stop, or enter "
+                    "it has to be known: run Motion > Find hard stop, or enter "
                     "it under Ends of travel.", parent=window)
                 return
 
@@ -2373,7 +2346,7 @@ class MotorApp:
         that a text-file edit means someone has to find the text file.
         """
         window = tk.Toplevel(self.root)
-        window.title("Connection settings")
+        window.title("Motor connections")
         window.transient(self.root)
 
         tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=460,
@@ -2423,7 +2396,7 @@ class MotorApp:
 
             self._refresh_addresses()
             self._rebuild_platform()
-            self.log("Connection settings updated. Press Connect to use them.")
+            self.log("Motor connections updated. Press Connect to use them.")
             if persist:
                 path = save_config(self.cfg, self.config_path)
                 self.log(f"Saved to {path}")
@@ -2967,40 +2940,6 @@ class MotorApp:
                 self.log(f"Saved to {self.platform.save()}")
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror("Could not save", str(exc))
-
-    def on_safety_drills(self) -> None:
-        """Provoke each dangerous situation and check the software refuses it.
-
-        Safe to run at any time, including while connected to the telescope:
-        every drill builds its own simulated platform and never touches these
-        motors. What it proves is that the guards still fire -- a check nobody
-        has seen fire is a check nobody should trust.
-        """
-        def work():
-            from .safety import run_all
-
-            self.log_threadsafe(
-                "Safety drills: provoking each dangerous situation in "
-                "simulation. Nothing here touches the real motors.")
-
-            def report(result):
-                self.log_threadsafe(f"  [{result.verdict}] {result.name}")
-                self.log_threadsafe(f"        did:    {result.what_was_done}")
-                self.log_threadsafe(f"        result: {result.what_happened}")
-
-            outcome = run_all(report=report)
-            passed = len(outcome.results) - len(outcome.failures)
-            self.log_threadsafe(
-                f"Safety drills: {passed} of {len(outcome.results)} passed.")
-            if outcome.failures:
-                self.log_threadsafe(
-                    "  A failing drill means a guard is missing or has stopped "
-                    "working. Do not rely on the software to refuse that "
-                    "situation until it is fixed.")
-
-        self.run_async("Safety drills", work)
-
-    # --------------------------------------------------------- position log
 
     def on_open_position_log(self) -> None:
         """Where the focal plane has been, one line per move.

@@ -175,7 +175,7 @@ class TestGui(unittest.TestCase):
                 pass
         self.assertIn("Motion", labels)
         self.assertIn("View", labels)
-        self.assertIn("Tools", labels)
+        self.assertIn("Setup", labels)
         # The variables exist whether or not the dialog is open, so a move
         # command can always read them.
         self.assertEqual(self.app.tip_var.get(), "0.0")
@@ -675,6 +675,24 @@ class TestGui(unittest.TestCase):
         self.pump(0.5)
         for row in self.app.rows.values():
             self.assertEqual(row.supply_var.get(), "48.0 V")
+
+    def test_no_menu_entry_appears_twice(self):
+        """Each thing in one place: no label repeated across the menus."""
+        seen = []
+        bar = self.app.menubar
+        for index in range(bar.index("end") + 1):
+            try:
+                submenu = self.root.nametowidget(bar.entrycget(index, "menu"))
+            except Exception:
+                continue
+            for entry in range(submenu.index("end") + 1):
+                if submenu.type(entry) == "command":
+                    seen.append(submenu.entrycget(entry, "label"))
+        self.assertEqual(len(seen), len(set(seen)), seen)
+        for front_panel_only in ("Clear errors", "Release all brakes",
+                                 "Engage all brakes", "Saved positions...",
+                                 "Run safety drills (simulated)..."):
+            self.assertNotIn(front_panel_only, seen)
 
     # ---- mirrors ------------------------------------------------------------
 

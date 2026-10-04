@@ -556,7 +556,7 @@ class JVLMotor:
 
         Register 97 is in the drive's own units: 1804 of them read 48.0 V on
         the pSCT motor (MacTalk's own display). A reading recorded for this
-        motor with `cli supply` or Tools -> Supply voltage overrides that.
+        motor with `cli supply` or Setup -> Supply voltage overrides that.
         Returns None only when the register cannot be read.
         """
         if raw is None:

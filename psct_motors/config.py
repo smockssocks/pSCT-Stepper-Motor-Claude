@@ -241,7 +241,7 @@ class ActuatorConfig:
     #: supply reads below `supply_low_fraction` of this.
     supply_expected_v: float = 48.0
     #: A recorded pair, optional: what the supply actually was and what
-    #: register 97 read at that moment, from `cli supply` or the GUI's Tools ->
+    #: register 97 read at that moment, from `cli supply` or the GUI's Setup ->
     #: Supply voltage. When set it overrides both numbers above, for a motor
     #: whose scale turns out to differ.
     #:

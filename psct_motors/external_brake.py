@@ -309,7 +309,7 @@ NOT_CONFIGURED_MESSAGE = (
     "On this telescope they are switched by a separate device with its own web "
     "page, not by the motors -- which is why the motor's Brake Output register "
     "(179) reads 0. That device is a ControlByWeb X-432 PLC. To drive it from "
-    "here, open Tools > Brake controller (PLC) and enter its IP address and "
+    "here, open Setup > Brake controller (PLC) and enter its IP address and "
     "which relay switches the brakes (or set external_brake.mode to "
     "'controlbyweb' in the configuration). Other devices can be driven over "
     "Modbus TCP coils or fixed HTTP URLs.\n\n"
