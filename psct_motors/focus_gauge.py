@@ -470,9 +470,5 @@ class FocusGauge(tk.Canvas):
             ticks.append((self.display_value(0.0), 0.0))
         return sorted(ticks, key=lambda t: t[1])
 
-    def _tick_values(self):
-        """Focus positions of the ticks, for callers that only want those."""
-        return [mm for _value, mm in self._ticks()]
-
 
 __all__ = ["FocusGauge", "REFERENCES", "REFERENCE_TITLES", "REFERENCE_CAPTIONS"]

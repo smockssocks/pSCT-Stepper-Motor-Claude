@@ -285,3 +285,86 @@ what the output looks like before pointing it at hardware.
 
 ---
 
+
+
+---
+
+## The PLC drops out now and then
+
+The GUI reads the PLC in the background and keeps the last good reading for up
+to 3 s, so a slow or missed reply does not show as the brakes going
+unreadable, and never holds up the motor readouts. Anything that acts on the
+brakes (a move, a release, EMERGENCY) asks the PLC there and then. The log only
+mentions it if the PLC has not answered for 3 s, and again when it is back.
+To find the cause, close the GUI and run:
+
+```
+python -m psct_motors.cli plc --watch 600        # ten minutes, reads only
+```
+
+It reads the PLC every 0.4 s (what the GUI does), times every reply, prints
+every failure with its reason, and ends with a summary that says what the
+pattern points to. Run `ping -t <PLC address>` in a second window at the same
+time. Then:
+
+- **Ping drops too:** the network or the PLC's power. Check the cable and
+  switch port, turn off power saving on the laptop's Ethernet adapter
+  (Device Manager → adapter → Power Management, and "Energy Efficient
+  Ethernet" under Advanced), and check the PLC's supply. If it happens when
+  relays switch, a supply that sags when the coils pull in will reboot it.
+- **Ping is clean but reads time out or are refused:** the PLC is busy or
+  out of connections. Close any browser tab showing the PLC's own page (it
+  refreshes itself constantly) and make sure only one copy of the GUI is
+  running.
+- **Two IP addresses on the laptop's adapter** (one for the motors, one for
+  the PLC) works, but moving the PLC onto the motors' network (for example
+  192.168.0.60) is simpler and removes one thing that can go wrong.
+
+## Supply voltage
+
+The drives report their supply on register 97 in their own units. On the pSCT
+motor 1804 of them read exactly 48.0 V on MacTalk's display (an earlier
+reading, 1794, is 47.7 V on the same scale), so that is the scale used: the
+supply shows in volts with nothing to set up.
+
+A move is refused when the supply reads below 80% of 48 V (about 38 V). A JVL
+with no main supply still answers Modbus from its control supply: it accepts a
+target and quietly does nothing, which presents as the software being broken.
+The check names the supply instead.
+
+It is never compared against the drive's "Acceptance Voltage" register (139),
+which on the bench motor reads 2054 and is not known to be on the same scale.
+
+If a motor ever disagrees with MacTalk or a meter, record its own reading: in
+the GUI, *Setup → Supply voltage* (or click a supply reading), enter the voltage
+the supply is really at, and press **Record**; or from the command line:
+
+```
+python -m psct_motors.cli supply --volts 48                    # all three
+python -m psct_motors.cli --bench Top supply --motor Top --volts 48
+```
+
+That motor then uses its own reading instead of the measured scale. On the
+bench, pass `--motor`: a reading from a simulated stand-in measures nothing.
+
+## How fast the readouts update
+
+Position, torque, mode and following error refresh every `poll_interval_s`
+(0.1 s) while anything is moving and every `idle_poll_interval_s` (0.2 s)
+when nothing is. The three motors are read side by side, each over its own
+connection, so a poll takes about as long as reading one motor. *View → Load
+and torque* has a **Readings per second** setting (2, 5 or 10 while idle),
+which is saved. A configuration still carrying the old 0.15 s / 0.5 s
+defaults gets the new ones automatically. Bus voltage and temperature change over minutes, so they are
+read once every `slow_poll_every` polls and shown from the last reading in
+between — polling them at the position rate would nearly double the traffic
+for numbers that have not moved.
+
+```
+python -m psct_motors.cli --poll 0.1 gui       # faster, for this run only
+```
+
+Faster is not free: every poll is a set of Modbus TCP transactions per motor,
+three motors at a time on the telescope. If the event log starts reporting
+slow transactions, ease it back — a poll that takes longer than the interval
+is not giving you fresher numbers, it is queueing.

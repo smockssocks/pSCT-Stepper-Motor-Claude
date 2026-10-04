@@ -47,7 +47,7 @@ from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
 from .config import load_config, save_config, default_config_path
-from .focus_gauge import REFERENCE_TITLES, REFERENCES, FocusGauge
+from .focus_gauge import REFERENCE_TITLES, FocusGauge
 from .history import MoveRecord, default_history_path
 from .saved_positions import SUGGESTED_NAMES, default_saved_positions_path
 from .plane_view import FocalPlaneView
@@ -793,6 +793,8 @@ class MotorApp:
         self.angle_step_var = tk.StringVar(value="0.010")
         self.jog_step_var = tk.StringVar(value="0.050")
         self._tilt_window = None
+        self._distances_window = None
+        self._connection_window = None
         self._password_window = None
         self._saved_window = None
         self._save_dialog = None
@@ -962,7 +964,10 @@ class MotorApp:
         both, and a re-survey moves either -- so they are edited here rather
         than typed into a file.
         """
+        if self._lift_if_open("_distances_window"):
+            return
         window = tk.Toplevel(self.root)
+        self._distances_window = window
         window.title("Distances from zero to the mirrors")
         window.transient(self.root)
 
@@ -2080,6 +2085,15 @@ class MotorApp:
 
     # -------------------------------------------------- connection settings
 
+    def _lift_if_open(self, attr: str) -> bool:
+        """Bring an already-open dialog to the front instead of opening a
+        second copy, which would fight the first over the same settings."""
+        window = getattr(self, attr, None)
+        if window is not None and window.winfo_exists():
+            window.lift()
+            return True
+        return False
+
     def on_edit_limits(self) -> None:
         """Edit the motion limits without going to the configuration file.
 
@@ -2089,6 +2103,8 @@ class MotorApp:
         window. Making that a text-file edit means somebody has to find the
         text file, in the dark, on a telescope.
         """
+        if self._lift_if_open("_limits_window"):
+            return
         window = tk.Toplevel(self.root)
         window.title("Motion settings")
         window.transient(self.root)
@@ -2342,7 +2358,10 @@ class MotorApp:
         the bench and the telescope are simply not the same network. Making
         that a text-file edit means someone has to find the text file.
         """
+        if self._lift_if_open("_connection_window"):
+            return
         window = tk.Toplevel(self.root)
+        self._connection_window = window
         window.title("Motor connections")
         window.transient(self.root)
 
@@ -2455,6 +2474,8 @@ class MotorApp:
         """
         settings = self.cfg.external_brake
         names = [a.name for a in self.cfg.actuators]
+        if self._lift_if_open("_brake_window"):
+            return
         window = tk.Toplevel(self.root)
         window.title("Brake controller (PLC)")
         window.transient(self.root)
@@ -2796,6 +2817,8 @@ class MotorApp:
             messagebox.showwarning("Not connected", "Connect first.")
             return
 
+        if self._lift_if_open("_hard_stop_window"):
+            return
         window = tk.Toplevel(self.root)
         window.title("Find hard stop")
         window.transient(self.root)
@@ -3543,13 +3566,13 @@ class MotorApp:
         move would still be refused for some other reason."""
         limits = self.cfg.limits
         focus = target.focus_mm
-        if focus > limits.max_focus_mm and (
-                limits.hard_stop_high_mm is None
-                or focus <= limits.hard_stop_high_mm + 1e-6):
+        # Only just past the limit: up to the stop itself, or 1 mm where no
+        # stop is known. Anything further is more likely a typo (900 for 9.00)
+        # than a request for the end of travel.
+        reach = max(limits.safety_margin_mm, 1.0) + 1e-6
+        if limits.max_focus_mm < focus <= limits.max_focus_mm + reach:
             focus = limits.max_focus_mm
-        elif focus < limits.min_focus_mm and (
-                limits.hard_stop_low_mm is None
-                or focus >= limits.hard_stop_low_mm - 1e-6):
+        elif limits.min_focus_mm - reach <= focus < limits.min_focus_mm:
             focus = limits.min_focus_mm
         else:
             return None

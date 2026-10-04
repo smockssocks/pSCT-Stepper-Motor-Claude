@@ -292,3 +292,132 @@ target would command a step equal to that standing error.
 
 ---
 
+
+
+---
+
+# Motion guards in detail
+
+Moved here from the README, which now only summarises them.
+
+## Checking the over-torque protection
+
+The stall limit ships at 45%, which is a guess from one motor's idle reading.
+Change it in *View → Load and torque* (**Change...**, then the password): the
+amber warning level and the level at which a move is stopped, for all three
+motors, saved to the configuration. Better still, measure it first:
+
+```
+python -m psct_motors.cli torque-profile --mm 0.5              # safe anywhere
+python -m psct_motors.cli torque-profile --to-stop             # drives to the end
+```
+
+It reports what torque reads at rest, moving freely and pressed against the
+stop, and recommends a threshold from the gap between them — or says plainly
+that there is no gap, in which case torque alone cannot find the stop and the
+"commanded a step and barely moved" check is what does.
+
+## Keeping the three together, settling, and the big-error stop
+
+Every coordinated move is watched while it runs, and checked when it ends.
+
+- **Staying in step.** The three speeds are scaled so they arrive together,
+  but a motor under more load can fall behind, and the plate tilts on the way.
+  Each actuator's progress along its own move is compared every tenth of a
+  second. One more than `sync_pause_mm` (0.05 mm) ahead of the slowest is held
+  where it is until the slowest catches up, then sent on a fifth slower. If
+  they get `sync_abort_mm` (0.5 mm) out of step, or the slow one has not caught
+  up after `sync_max_wait_s` (5 s), the move is stopped.
+- **Settling.** Under load a stepper sits slightly behind its command (the
+  bench motor sat 231 counts, about 1.4 µm, short). After a move each motor's
+  encoder is compared with its target; one more than `settle_deadband_counts`
+  (50 counts, 0.3 µm) off is sent the difference, up to `settle_max_tries`
+  (3) times. The log says what it did: `Settled at the target (Top +231 -> +4
+  counts, ...)`. The motor takes commands in 1/409,600 of a turn (2,048 per
+  full step, about 6 nm of travel here), but it does not land that finely,
+  which is why there is a deadband and a try limit rather than chasing every
+  count. Single-actuator jogs settle too.
+- **The big-error stop.** An actuator more than `max_position_error_mm`
+  (0.1 mm) from where it is being driven, during the move or after it, means
+  it has slipped or is blocked: a stepper that is more than a step or two
+  (12.7 µm a full step) behind has lost its grip. All three are halted,
+  holding, and the brakes are applied; the message says which motor and by
+  how much.
+
+- **Falling watch.** On every status poll, any axis the drive is not
+  driving (passive, any mode other than Position, or holding with its move
+  finished) is watched. If it moves more than `fall_limit_mm` (0.05 mm) on its
+  own, it is falling or slipping: every brake is engaged at once, anything
+  being driven is stopped, every passive drive takes hold where it now is, and
+  the red bar says which motor moved and how far. It resets whenever a drive
+  is driving its axis, so moves, STOP and the hard-stop search never trip it.
+  It needs nobody at the controls, only the GUI (or anything polling) running.
+- **Already straining.** A move or jog is refused before anything happens
+  if any motor is already at or over its torque stop level while standing
+  still: something is pushing against it, and forcing a move could damage the
+  telescope. Nothing is commanded and the brakes are not touched. The check
+  is made with the drives on and holding, just before the brakes would come
+  off.
+
+The out-of-step stop and the big-error stop both leave the drives on and
+holding *and* the brakes on. All of the numbers above are in the
+configuration file; `settle_enabled: false` turns settling off.
+
+## Resting on the brakes (Disable drives)
+
+Once the focal plane is where it should be, **Disable drives** (under the
+actuator table) leaves it held by the brakes alone, so the motors
+make no small corrections:
+
+1. The brakes are engaged and read back.
+2. The drives are turned off.
+3. For `rest_watch_s` (1.5 s) the encoders are watched. If any motor moves
+   more than `rest_sink_limit_mm` (0.01 mm), the brakes are not holding: the
+   drives are turned straight back on, holding where they are, and the log
+   says which motor moved and how far.
+
+If the PLC does not report the brakes engaged, the drives stay on. (With
+`trust_relay_state` set to false, the GUI also asks once per session before
+relying on the relay reading.)
+
+Tick **Disable drives after each move** to do this automatically when every
+move or jog finishes (for this session). The next move turns the drives back on
+and releases the brakes itself, as usual. If resting fails after a move, the
+move still counts as done and the log says why the drives were left on.
+
+From the command line: `python -m psct_motors.cli disable-drives`
+(`--trust-relay` to accept the relay's reading without being asked).
+
+## Finding the end of travel
+
+The site calibrates by running the actuators out until they stop.
+*Motion → Find hard stop*, or:
+
+```
+python -m psct_motors.cli find-stop                    # all three, together
+python -m psct_motors.cli find-stop --direction -      # the other way
+```
+
+All three run out **together and continuously**, at a speed matched in
+millimetres per second so the plate stays flat the whole way. Torque and
+progress are watched throughout; the first axis to reach its stop halts the
+other two in the same instant, they are backed off to match it, and then all
+three retreat half a millimetre so nothing is left resting on the stop.
+
+There is no way to do this with one actuator. Driving one into its end stop
+tilts the focal plane about the other two ball joints.
+
+**The end it finds becomes the limit.** The soft limits ship as a guess; a hard
+stop is a measurement, so the upper focus limit is set to the stop less
+`safety_margin_mm` (0.5 mm). If `total_travel_mm` is configured — 50.8 mm is the
+published pSCT figure — the far end follows from it, clearly marked as derived
+rather than measured until you run the search downwards too.
+
+Both ends are drawn on the gauge as solid red lines outside the dashed soft
+limits, so you can see how much room is left.
+
+A move that brings the focal plane **back inside** the limits is never blocked
+for being too large. The search leaves the plate just outside the limit by
+construction, and without that rule every move home is a step bigger than the
+single-step limit — which stranded the plate with no way back except editing the
+configuration file.

@@ -1000,13 +1000,12 @@ class TestGui(unittest.TestCase):
         limits = self.app.cfg.limits
         limits.hard_stop_high_mm = limits.max_focus_mm + limits.safety_margin_mm
         self.app.platform.sync_travel_to_stops()
-        current = self.app.platform.read_orientation()
         target = Orientation(limits.hard_stop_high_mm, 0.0, 0.0)
         closer = self.app._closest_allowed(target, None)
         self.assertAlmostEqual(closer.focus_mm, limits.max_focus_mm)
-        # Past the stop itself, nothing is offered.
+        # Well past it (a typo, say), nothing is offered.
         self.assertIsNone(self.app._closest_allowed(
-            Orientation(limits.hard_stop_high_mm + 1.0, 0.0, 0.0), None))
+            Orientation(limits.max_focus_mm + 5.0, 0.0, 0.0), None))
 
     def test_the_brake_dialog_defaults_to_separate_relays(self):
         from psct_motors.config import default_config
@@ -1169,7 +1168,7 @@ class TestGui(unittest.TestCase):
         self.assertEqual(self.app.platform.external_brake.cfg.relays, {"all": 1})
 
     def test_choosing_a_relay_per_actuator_makes_the_brakes_separate(self):
-        plc = self._use_fake_plc()
+        self._use_fake_plc()
         self._answer(False, self.app.on_edit_brake_controller)
         self.pump(0.2)
         window = self.app._brake_window

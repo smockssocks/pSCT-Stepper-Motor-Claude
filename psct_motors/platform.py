@@ -403,7 +403,12 @@ class FocalPlanePlatform:
         self.copied_names: List[str] = []
         self.copy_source: Optional[str] = None
         self._attach_copies()
-        self.sync_travel_to_stops()
+        try:
+            self.sync_travel_to_stops()
+        except PlatformError as exc:
+            # Never stop the program starting: say so, and leave the limits
+            # as they were so they can be fixed in Motion settings.
+            self._log(f"Limits not updated from the ends of travel: {exc}")
 
     def _build_real_motor(self, a) -> JVLMotor:
         return JVLMotor(a, timeout_s=self.cfg.modbus_timeout_s,
