@@ -87,6 +87,15 @@ BRAKE_WORDS = {
 }
 
 
+#: The Go to box's label and the hint beside it, for each gauge reference.
+GOTO_LABELS = {
+    "zero": ("Go to focus (mm):", "+ towards M1,  − towards M2"),
+    "top": ("Go to, mm from top stop:", "0 = top stop,  − is below it"),
+    "bottom": ("Go to, mm from bottom stop:", "0 = bottom stop,  + is above it"),
+    "m1": ("Go to, mm to M1:", "smaller = closer to M1"),
+    "m2": ("Go to, mm to M2:", "smaller = closer to M2"),
+}
+
 #: Offered in the Load and torque window, readings per second while idle.
 READING_RATES = ("2", "5", "10")
 
@@ -747,8 +756,11 @@ class MotorApp:
             row=1, column=0, columnspan=10, sticky="ew", padx=6, pady=6)
 
         # --- absolute focus command ---
-        ttk.Label(frame, text="Go to focus (mm):").grid(row=2, column=0, padx=(8, 2),
-                                                        sticky="e")
+        # Measured from whatever the gauge measures from, so "-10" with the
+        # gauge on the top stop is 10 mm below the top stop.
+        self.goto_label_var = tk.StringVar(value=GOTO_LABELS["zero"][0])
+        ttk.Label(frame, textvariable=self.goto_label_var).grid(
+            row=2, column=0, padx=(8, 2), sticky="e")
         self.focus_var = tk.StringVar(value="0.0")
         ttk.Entry(frame, textvariable=self.focus_var, width=12,
                   font=("TkDefaultFont", 11)).grid(row=2, column=1, padx=2, pady=4)
@@ -756,7 +768,8 @@ class MotorApp:
                    command=self.on_preview).grid(row=2, column=2, padx=(6, 2))
         self.move_btn = ttk.Button(frame, text="Move", command=self.on_move)
         self.move_btn.grid(row=2, column=3, padx=2)
-        ttk.Label(frame, text="+ towards M1,  − towards M2",
+        self.goto_note_var = tk.StringVar(value=GOTO_LABELS["zero"][1])
+        ttk.Label(frame, textvariable=self.goto_note_var,
                   foreground="#777").grid(row=2, column=4, padx=(12, 4), sticky="w")
 
         # --- fine adjustment ---
@@ -924,6 +937,9 @@ class MotorApp:
         self.gauge.set_reference(reference,
                                  zero_to_m1_mm=self.cfg.zero_to_m1_mm,
                                  zero_to_m2_mm=self.cfg.zero_to_m2_mm)
+        label, note = GOTO_LABELS[reference]
+        self.goto_label_var.set(label)
+        self.goto_note_var.set(note)
         title = self.gauge.reference_title
         if not self.gauge.reference_available:
             title += f"  ({self.gauge.missing_text})"
@@ -938,8 +954,17 @@ class MotorApp:
         chosen = self.gauge_reference_var.get()
         reference = next((k for k, v in self.REFERENCE_CHOICES.items()
                           if v == chosen), "zero")
+        # Keep the Go to box pointing at the same place in the new terms.
+        try:
+            focus = self.gauge.focus_for_display(float(self.focus_var.get()))
+        except ValueError:
+            focus = None
         self.cfg.gauge_reference = reference
         self._apply_gauge_reference(reference)
+        if focus is not None:
+            shown = self.gauge.display_value(focus)
+            if shown is not None:
+                self.focus_var.set(f"{shown:.4f}")
         if not self.gauge.reference_available:
             if reference in ("top", "bottom"):
                 which = "upper" if reference == "top" else "lower"
@@ -1410,16 +1435,31 @@ class MotorApp:
     # ----------------------------------------------------------------- moves
 
     def _read_orientation_fields(self) -> Optional[Orientation]:
+        """The boxes as an orientation, with the Go to number converted from
+        the gauge's reference into focus from zero."""
         try:
-            return Orientation(
-                focus_mm=float(self.focus_var.get()),
-                tip_deg=float(self.tip_var.get()),
-                tilt_deg=float(self.tilt_var.get()),
-            )
+            value = float(self.focus_var.get())
+            tip, tilt = float(self.tip_var.get()), float(self.tilt_var.get())
         except ValueError as exc:
             messagebox.showerror("Check the numbers",
                                  f"focus, tip and tilt must all be numbers.\n\n{exc}")
             return None
+        focus = self.gauge.focus_for_display(value)
+        if focus is None:
+            messagebox.showerror(
+                "Reference not set",
+                f"Go to is measured {self.REFERENCE_CHOICES[self.gauge.reference]}, "
+                f"and that is not known yet ({self.gauge.missing_text}). Set it, "
+                "or switch the gauge back to \"from zero\".")
+            return None
+        return Orientation(focus_mm=focus, tip_deg=tip, tilt_deg=tilt)
+
+    def _in_reference(self, focus_mm: float) -> str:
+        """"  (= -10.0000 mm from top stop)" when not measuring from zero."""
+        if self.gauge.reference == "zero":
+            return ""
+        return (f"   (= {self.gauge.format_value(focus_mm)} "
+                f"{self.REFERENCE_CHOICES[self.gauge.reference].split(' (')[0]})")
 
     def _read_float(self, var: tk.StringVar, label: str) -> Optional[float]:
         try:
@@ -1436,7 +1476,8 @@ class MotorApp:
         def work():
             o = self.platform.read_orientation()
             def apply():
-                self.focus_var.set(f"{o.focus_mm:.4f}")
+                shown = self.gauge.display_value(o.focus_mm)
+                self.focus_var.set(f"{o.focus_mm if shown is None else shown:.4f}")
                 self.tip_var.set(f"{o.tip_deg:.5f}")
                 self.tilt_var.set(f"{o.tilt_deg:.5f}")
             self.post(apply)
@@ -1448,7 +1489,8 @@ class MotorApp:
         target = self._read_orientation_fields()
         if target is None:
             return
-        lines = [f"Target: {target.describe()}", "", "Actuator targets:"]
+        lines = [f"Target: {target.describe()}"
+                 + self._in_reference(target.focus_mm), "", "Actuator targets:"]
         for name, mm in self.platform.preview(target).items():
             actuator = self.cfg.actuator(name)
             inside = actuator.min_travel_mm <= mm <= actuator.max_travel_mm
@@ -3507,7 +3549,7 @@ class MotorApp:
         detail = "\n".join(f"   {n}: {mm:10.4f} mm" for n, mm in preview.items())
         if not messagebox.askyesno(
             "Confirm move",
-            f"{reason}\n\n{target.describe()}\n\n"
+            f"{reason}\n\n{target.describe()}{self._in_reference(target.focus_mm)}\n\n"
             f"Actuator targets:\n{detail}\n\nProceed?",
         ):
             return

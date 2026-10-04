@@ -901,6 +901,35 @@ class TestGui(unittest.TestCase):
         self.assertEqual(gauge.format_value(0.0), "+25.0000 mm")
         self.assertAlmostEqual(gauge.focus_for_display(25.0), 0.0)
 
+    def test_go_to_is_measured_from_the_chosen_reference(self):
+        limits = self.app.cfg.limits
+        limits.hard_stop_low_mm, limits.hard_stop_high_mm = -25.0, 25.4
+        self.app._refresh_gauge_limits()
+
+        self.app.focus_var.set("2.0")                       # from zero
+        self.app.gauge_reference_var.set(self.app.REFERENCE_CHOICES["top"])
+        self.app.on_gauge_reference_changed()
+        # Same place, said from the top stop.
+        self.assertEqual(self.app.focus_var.get(), "-23.4000")
+        self.assertEqual(self.app.goto_label_var.get(), "Go to, mm from top stop:")
+
+        self.app.focus_var.set("-10")
+        self.assertAlmostEqual(self._silent(self.app._read_orientation_fields).focus_mm,
+                               15.4)
+
+        self.app.gauge_reference_var.set(self.app.REFERENCE_CHOICES["bottom"])
+        self.app.on_gauge_reference_changed()
+        self.assertEqual(self.app.focus_var.get(), "40.4000")   # still 15.4 from zero
+        self.app.focus_var.set("10")
+        self.assertAlmostEqual(self._silent(self.app._read_orientation_fields).focus_mm,
+                               -15.0)
+        self.assertIn("from bottom stop", self.app._in_reference(-15.0))
+
+    def test_go_to_refuses_a_reference_that_is_not_known(self):
+        self.app._apply_gauge_reference("top")             # no top stop yet
+        self.app.focus_var.set("-10")
+        self.assertIsNone(self._silent(self.app._read_orientation_fields))
+
     # ---- torque limit and update rate ----------------------------------------
 
     def test_the_torque_limit_needs_the_password_and_is_saved(self):

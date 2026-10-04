@@ -98,8 +98,13 @@ drives.
   (or the button under the gauge) once it is known; until then the gauge says
   "distance not set" rather than showing a made-up number. **From top stop**
   makes the upper end of travel read 0 (everything below it negative), and
-  **from bottom stop** the lower end. These only change the labels; every
-  command is still in the same zero, so nothing moves.
+  **from bottom stop** the lower end. **Go to** uses the same reference: with
+  the gauge on *from top stop*, `-10` means 10 mm below the top stop; on
+  *from bottom stop*, `10` means 10 mm above the bottom stop. The label beside
+  the box says which, switching the reference converts the number in the box
+  so it still means the same place, and the confirm dialog shows both. Inside,
+  everything (limits, saved positions, the log) stays in the one zero, so
+  changing the reference never moves anything.
 - Per-actuator position, mode, brake, load and **supply voltage**, with
   Release/Engage for each brake. The brake says **ENGAGED** (blue) or
   **DISENGAGED** (amber), deliberately not green/red: a disengaged brake is
