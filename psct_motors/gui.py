@@ -2219,6 +2219,13 @@ class MotorApp:
 
         ttk.Button(found, text="Set focus limits from these",
                    command=from_stops).grid(row=2, column=2, padx=8, pady=4)
+        first = self.cfg.actuators[0]
+        ttk.Label(found, foreground="#777", font=("TkDefaultFont", 8),
+                  text=(f"Each actuator may travel {first.min_travel_mm:+.3f} to "
+                        f"{first.max_travel_mm:+.3f} mm (motor zero). Once an end "
+                        f"of travel is known this follows it, "
+                        f"{limits.safety_margin_mm:g} mm inside.")).grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6))
 
         def apply(persist: bool) -> None:
             values = {}
@@ -2276,6 +2283,8 @@ class MotorApp:
                 self.log(f"Ends of travel changed by hand: lower "
                          f"{say(limits.hard_stop_low_mm)}, upper "
                          f"{say(limits.hard_stop_high_mm)}.")
+            for line in self.platform.sync_travel_to_stops():
+                self.log(line)
             if reference != self.cfg.position_reference:
                 self._set_reference(reference)
             else:

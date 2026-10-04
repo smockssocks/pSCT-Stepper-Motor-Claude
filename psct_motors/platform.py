@@ -399,6 +399,7 @@ class FocalPlanePlatform:
         self.copied_names: List[str] = []
         self.copy_source: Optional[str] = None
         self._attach_copies()
+        self.sync_travel_to_stops()
 
     def _build_real_motor(self, a) -> JVLMotor:
         return JVLMotor(a, timeout_s=self.cfg.modbus_timeout_s,
@@ -1028,7 +1029,40 @@ class FocalPlanePlatform:
                 f"{limits.min_focus_mm:+.4f}..{limits.max_focus_mm:+.4f} mm. "
                 f"Check limits.total_travel_mm and the zero reference."
             )
+        notes.extend(self.sync_travel_to_stops())
         return notes
+
+    def sync_travel_to_stops(self) -> List[str]:
+        """Make every actuator's own travel limit follow the ends of travel.
+
+        Each actuator has a travel limit of its own as well as the focus
+        limits. They ship as a guess (-24..+24 mm) and nothing used to update
+        them, so once a hard stop was found further out, the focus limit moved
+        out to it but every actuator still refused anything past 24 mm: a move
+        to 1 mm from the stop was "outside its travel limits". Once an end of
+        travel is known, each actuator may go to within `safety_margin_mm` of
+        it, the same as the focus limit. Returns lines for the log (empty if
+        nothing changed).
+        """
+        limits = self.cfg.limits
+        margin = limits.safety_margin_mm
+        changed = []
+        for actuator in self.cfg.actuators:
+            low, high = actuator.min_travel_mm, actuator.max_travel_mm
+            if limits.hard_stop_low_mm is not None:
+                low = limits.hard_stop_low_mm + margin
+            if limits.hard_stop_high_mm is not None:
+                high = limits.hard_stop_high_mm - margin
+            if low < high and (low, high) != (actuator.min_travel_mm,
+                                              actuator.max_travel_mm):
+                actuator.min_travel_mm, actuator.max_travel_mm = low, high
+                changed.append(actuator.name)
+        if not changed:
+            return []
+        a = self.cfg.actuators[0]
+        return [f"Actuator travel limits now follow the ends of travel: "
+                f"{a.min_travel_mm:+.4f}..{a.max_travel_mm:+.4f} mm "
+                f"({margin:.3f} mm inside them) for {', '.join(changed)}."]
 
     def _focus_within_limits(self, focus_mm: float) -> bool:
         limits = self.cfg.limits

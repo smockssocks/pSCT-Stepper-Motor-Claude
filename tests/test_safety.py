@@ -510,6 +510,36 @@ class TestTheFoundStopBecomesTheLimit(unittest.TestCase):
         self.assertAlmostEqual(limits.max_focus_mm,
                                25.4 - limits.safety_margin_mm)
 
+    def test_a_move_near_the_found_stop_is_allowed(self):
+        """The bug: the stop was found at +25.4, the focus limit followed it,
+        but each actuator kept its shipped +24 mm travel limit, so a move to
+        1 mm from the stop was refused as outside the actuator's travel."""
+        from psct_motors.config import default_config
+        from psct_motors.kinematics import Orientation
+        platform = FocalPlanePlatform(cfg=default_config(), simulate=True)
+        with self.assertRaises(PlatformError):
+            platform.check_orientation(Orientation(24.4, 0.0, 0.0))
+        notes = " ".join(platform.adopt_hard_stop(+1, 25.4))
+        self.assertIn("Actuator travel limits now follow", notes)
+        platform.check_orientation(Orientation(24.4, 0.0, 0.0))       # 1 mm off
+        platform.check_orientation(Orientation(24.9, 0.0, 0.0))       # the margin
+        with self.assertRaises(PlatformError) as ctx:
+            platform.check_orientation(Orientation(25.2, 0.0, 0.0))   # inside it
+        self.assertIn("outside the allowed", str(ctx.exception))
+        for actuator in platform.cfg.actuators:
+            self.assertAlmostEqual(actuator.max_travel_mm, 24.9)
+
+    def test_a_saved_config_with_stops_is_put_right_on_start(self):
+        """A configuration saved before the fix has the stop but the old
+        actuator limits; starting up brings them into line."""
+        from psct_motors.config import default_config
+        cfg = default_config()
+        cfg.limits.hard_stop_low_mm, cfg.limits.hard_stop_high_mm = -25.4, 25.4
+        platform = FocalPlanePlatform(cfg=cfg, simulate=True)
+        for actuator in platform.cfg.actuators:
+            self.assertAlmostEqual(actuator.min_travel_mm, -24.9)
+            self.assertAlmostEqual(actuator.max_travel_mm, 24.9)
+
     def test_the_far_end_follows_from_the_known_travel(self):
         """Saves running the search downwards, which is the run that drives
         towards M2 with the camera's weight behind it."""
