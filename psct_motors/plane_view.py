@@ -58,6 +58,9 @@ class FocalPlaneView(tk.Canvas):
         self._tip = 0.0
         self._tilt = 0.0
         self._message = "not connected"
+        #: Added to every position the picture labels, so they read from the
+        #: same 0 as the rest of the window. The drawing itself is unchanged.
+        self.label_offset_mm = 0.0
         self.bind("<Configure>", lambda _e: self._redraw())
         self._redraw()
 
@@ -136,7 +139,7 @@ class FocalPlaneView(tk.Canvas):
             self.create_oval(sx - 4, sy - 4, sx + 4, sy + 4,
                              fill=COLOR_PLANE, outline="white", width=1)
             taken.append(self.bbox(self.create_text(
-                sx, sy - 14, text=f"{name}  {z:+.3f}",
+                sx, sy - 14, text=f"{name}  {z + self.label_offset_mm:+.3f}",
                 fill=COLOR_LABEL, font=("TkDefaultFont", 8, "bold"))))
 
         # --- centre of the plate ----------------------------------------------
@@ -152,7 +155,7 @@ class FocalPlaneView(tk.Canvas):
         if self._focus is not None:
             taken.append(self.bbox(self.create_text(
                 width / 2, height - 26, anchor="c",
-                text=f"focus {self._focus:+.4f} mm",
+                text=f"focus {self._focus + self.label_offset_mm:+.4f} mm",
                 fill=COLOR_PLANE, font=("TkDefaultFont", 11, "bold"))))
             taken.append(self.bbox(self.create_text(
                 width / 2, height - 10, anchor="c",

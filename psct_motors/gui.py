@@ -87,13 +87,18 @@ BRAKE_WORDS = {
 }
 
 
-#: The Go to box's label and the hint beside it, for each gauge reference.
-GOTO_LABELS = {
-    "zero": ("Go to focus (mm):", "+ towards M1,  − towards M2"),
-    "top": ("Go to, mm from top stop:", "0 = top stop,  − is below it"),
-    "bottom": ("Go to, mm from bottom stop:", "0 = bottom stop,  + is above it"),
-    "m1": ("Go to, mm to M1:", "smaller = closer to M1"),
-    "m2": ("Go to, mm to M2:", "smaller = closer to M2"),
+#: Where 0 can be, everywhere the window shows or takes a position, and what
+#: to call it.
+POSITION_REFERENCES = {
+    "zero": "motor zero",
+    "top": "top stop",
+    "bottom": "bottom stop",
+}
+#: The hint beside the Go to box for each.
+GOTO_HINTS = {
+    "zero": "+ towards M1,  − towards M2",
+    "top": "from the top stop: 0 = top stop,  − is below it",
+    "bottom": "from the bottom stop: 0 = bottom stop,  + is above it",
 }
 
 #: Offered in the Load and torque window, readings per second while idle.
@@ -325,7 +330,7 @@ class MotorRow:
             self.error_var.set(status.comms_error[:60])
             return
 
-        self.position_var.set(f"{status.position_mm:+10.4f} mm")
+        self.position_var.set(f"{self.app._shown(status.position_mm):+10.4f} mm")
         self.counts_var.set(f"{status.position_counts} ct")
         self.mode_var.set(status.mode_text.split(" (")[0])
         # Green only when the drive is enabled AND settled; amber while moving.
@@ -585,7 +590,7 @@ class MotorApp:
         tools = tk.Menu(menubar, tearoff=0)
         tools.add_command(label="Connection settings...",
                           command=self.on_edit_connection)
-        tools.add_command(label="Motion limits...",
+        tools.add_command(label="Motion settings...",
                           command=self.on_edit_limits)
         tools.add_command(label="Distances from zero to M1 and M2...",
                           command=self.on_edit_reference_distances)
@@ -753,10 +758,9 @@ class MotorApp:
             row=1, column=0, columnspan=10, sticky="ew", padx=6, pady=6)
 
         # --- absolute focus command ---
-        # Measured from whatever the gauge measures from, so "-10" with the
-        # gauge on the top stop is 10 mm below the top stop.
-        self.goto_label_var = tk.StringVar(value=GOTO_LABELS["zero"][0])
-        ttk.Label(frame, textvariable=self.goto_label_var).grid(
+        # In the chosen position reference (Tools > Motion settings), so with
+        # the top stop as 0, "-10" is 10 mm below the top stop.
+        ttk.Label(frame, text="Go to focus (mm):").grid(
             row=2, column=0, padx=(8, 2), sticky="e")
         self.focus_var = tk.StringVar(value="0.0")
         ttk.Entry(frame, textvariable=self.focus_var, width=12,
@@ -765,7 +769,7 @@ class MotorApp:
                    command=self.on_preview).grid(row=2, column=2, padx=(6, 2))
         self.move_btn = ttk.Button(frame, text="Move", command=self.on_move)
         self.move_btn.grid(row=2, column=3, padx=2)
-        self.goto_note_var = tk.StringVar(value=GOTO_LABELS["zero"][1])
+        self.goto_note_var = tk.StringVar(value=GOTO_HINTS["zero"])
         ttk.Label(frame, textvariable=self.goto_note_var,
                   foreground="#777").grid(row=2, column=4, padx=(12, 4), sticky="w")
 
@@ -875,48 +879,27 @@ class MotorApp:
                         command=self.on_rest_after_moves_changed).grid(
             row=0, column=4, padx=(16, 0))
 
-    #: What the gauge's reference chooser shows for each reference.
-    REFERENCE_CHOICES = {
-        "zero": "from zero",
-        "m1": "to M1 (primary)",
-        "m2": "to M2 (secondary)",
-        "top": "from top stop",
-        "bottom": "from bottom stop",
-    }
-
     def _build_gauge(self, parent) -> None:
         frame = ttk.LabelFrame(parent, text=REFERENCE_TITLES["zero"])
         frame.grid(row=0, column=1, rowspan=3, sticky="ns", padx=(6, 0))
         frame.rowconfigure(1, weight=1)
         self.gauge_frame = frame
 
-        # Which reference the labels use. Commands are always in focus mm
-        # from zero; this only changes what the gauge says.
-        chooser = ttk.Frame(frame)
-        chooser.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 0))
-        ttk.Label(chooser, text="measure", foreground="#555",
-                  font=("TkDefaultFont", 8)).grid(row=0, column=0, padx=(0, 4))
-        self.gauge_reference_var = tk.StringVar(
-            value=self.REFERENCE_CHOICES.get(self.cfg.gauge_reference,
-                                             self.REFERENCE_CHOICES["zero"]))
-        self.gauge_reference_box = ttk.Combobox(
-            chooser, textvariable=self.gauge_reference_var, state="readonly",
-            width=16, values=list(self.REFERENCE_CHOICES.values()))
-        self.gauge_reference_box.grid(row=0, column=1)
-        self.gauge_reference_box.bind("<<ComboboxSelected>>",
-                                      lambda _e: self.on_gauge_reference_changed())
-
         self.gauge = FocusGauge(frame,
                                 min_mm=self.cfg.limits.min_focus_mm,
                                 max_mm=self.cfg.limits.max_focus_mm)
-        self.gauge.grid(row=1, column=0, sticky="ns", padx=8, pady=(4, 4))
+        self.gauge.grid(row=1, column=0, sticky="ns", padx=8, pady=(6, 4))
 
+        # How far it is to each mirror, once those distances are entered.
+        self.mirror_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.mirror_var, foreground="#555",
+                  font=("TkDefaultFont", 8), justify="center").grid(
+            row=2, column=0, pady=(0, 2))
         ttk.Button(frame, text="Distances to M1 / M2...",
                    command=self.on_edit_reference_distances).grid(
-            row=2, column=0, pady=(0, 8))
+            row=3, column=0, pady=(0, 8))
 
         self._refresh_gauge_limits()
-        self._apply_gauge_reference(self.cfg.gauge_reference)
 
     def _refresh_gauge_limits(self) -> None:
         """Push the current limits and any found hard stops onto the gauge."""
@@ -924,56 +907,78 @@ class MotorApp:
         self.gauge.set_limits(limits.min_focus_mm, limits.max_focus_mm,
                               hard_stop_low_mm=limits.hard_stop_low_mm,
                               hard_stop_high_mm=limits.hard_stop_high_mm)
-        # Measuring from an end of travel depends on these, so the title has
-        # to follow them.
+        # Measuring from an end of travel depends on these.
         if getattr(self, "gauge_frame", None) is not None:
-            self._apply_gauge_reference(self.gauge.reference)
+            self._apply_reference()
 
-    def _apply_gauge_reference(self, reference: str) -> None:
-        """Point the gauge at a reference and retitle the frame to match."""
-        self.gauge.set_reference(reference,
-                                 zero_to_m1_mm=self.cfg.zero_to_m1_mm,
-                                 zero_to_m2_mm=self.cfg.zero_to_m2_mm)
-        label, note = GOTO_LABELS[reference]
-        self.goto_label_var.set(label)
-        self.goto_note_var.set(note)
-        title = self.gauge.reference_title
-        if not self.gauge.reference_available:
-            title += f"  ({self.gauge.missing_text})"
-        self.gauge_frame.configure(text=title)
-        choice = self.REFERENCE_CHOICES[reference]
-        if self.gauge_reference_var.get() != choice:
-            self.gauge_reference_var.set(choice)
+    # ------------------------------------------------- position reference
 
-    def on_gauge_reference_changed(self) -> None:
-        """The chooser on the gauge. Remembered for the session; the distances
-        dialog is where it gets saved, alongside the numbers it depends on."""
-        chosen = self.gauge_reference_var.get()
-        reference = next((k for k, v in self.REFERENCE_CHOICES.items()
-                          if v == chosen), "zero")
-        # Keep the Go to box pointing at the same place in the new terms.
+    def _reference(self) -> str:
+        """Where 0 is: "zero", "top" or "bottom". The motors' zero while the
+        chosen end of travel is not known."""
+        ref = self.cfg.position_reference
+        limits = self.cfg.limits
+        if ref == "top" and limits.hard_stop_high_mm is None:
+            return "zero"
+        if ref == "bottom" and limits.hard_stop_low_mm is None:
+            return "zero"
+        return ref
+
+    def _offset(self) -> float:
+        ref = self._reference()
+        if ref == "top":
+            return -self.cfg.limits.hard_stop_high_mm
+        if ref == "bottom":
+            return -self.cfg.limits.hard_stop_low_mm
+        return 0.0
+
+    def _shown(self, mm: float) -> float:
+        """A focus or actuator position in the motors' zero, as shown."""
+        return mm + self._offset()
+
+    def _from_shown(self, value: float) -> float:
+        """A position typed in the chosen reference, in the motors' zero."""
+        return value - self._offset()
+
+    def _ref_words(self) -> str:
+        """" from the top stop", or nothing for the motors' zero."""
+        ref = self._reference()
+        return "" if ref == "zero" else f" from the {POSITION_REFERENCES[ref]}"
+
+    def _describe(self, o: Orientation) -> str:
+        """Orientation.describe(), with focus in the chosen reference."""
+        return (f"focus {self._shown(o.focus_mm):+.4f} mm{self._ref_words()}, "
+                f"tip {o.tip_deg:+.5f} deg, tilt {o.tilt_deg:+.5f} deg "
+                f"(total {o.total_tilt_arcmin:.3f} arcmin "
+                f"towards {o.tilt_azimuth_deg:.1f} deg)")
+
+    def _apply_reference(self) -> None:
+        """Make everything show positions from the chosen reference."""
+        ref = self._reference()
+        self.platform.shown_offset_mm = self._offset()
+        self.platform.shown_from = self._ref_words()
+        self.gauge.set_reference(ref)
+        self.gauge_frame.configure(text=REFERENCE_TITLES[ref])
+        self.goto_note_var.set(GOTO_HINTS[ref])
+        if self.plane_view is not None:
+            self.plane_view.label_offset_mm = self._offset()
+        if self._history_tree is not None:
+            self._refresh_position_log()
+        if self._saved_tree is not None:
+            self._refresh_saved_positions()
+
+    def _set_reference(self, ref: str) -> None:
+        """Change where 0 is, keeping the Go to box on the same place."""
         try:
-            focus = self.gauge.focus_for_display(float(self.focus_var.get()))
+            focus = self._from_shown(float(self.focus_var.get()))
         except ValueError:
             focus = None
-        self.cfg.gauge_reference = reference
-        self._apply_gauge_reference(reference)
+        self.cfg.position_reference = ref
+        self._apply_reference()
         if focus is not None:
-            shown = self.gauge.display_value(focus)
-            if shown is not None:
-                self.focus_var.set(f"{shown:.4f}")
-        if not self.gauge.reference_available:
-            if reference in ("top", "bottom"):
-                which = "upper" if reference == "top" else "lower"
-                self.log(f"The gauge cannot measure from the {which} end of "
-                         "travel until it is known: run Tools > Find hard stop, "
-                         "or enter it in Tools > Motion limits.")
-                return
-            self.log(f"The gauge cannot show the distance to "
-                     f"{reference.upper()} until the distance from zero to "
-                     f"{reference.upper()} has been entered. Use the button "
-                     f"under the gauge, or Tools > Distances.")
-            self.on_edit_reference_distances()
+            self.focus_var.set(f"{self._shown(focus):.4f}")
+        self.log("Positions are now shown from the "
+                 + POSITION_REFERENCES[self._reference()] + ".")
 
     def on_edit_reference_distances(self) -> None:
         """Enter how far the zero reference is from each mirror.
@@ -990,14 +995,11 @@ class MotorApp:
         tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=500,
                  text=("Distance along the optical axis from the zero reference "
                        "(focus 0) to each mirror, in "
-                       "millimetres. With these entered the gauge can show how "
-                       "far the focal plane is from M1 or from M2 instead of "
-                       "from zero.\n\n"
-                       "Commands are still given in millimetres from zero; only "
-                       "the gauge's labels change. Leave a box empty if the "
-                       "distance is not known -- the gauge will say so rather "
-                       "than show a made-up number. Re-enter them after moving "
-                       "the zero reference.")
+                       "millimetres. With these entered, the distance from "
+                       "the focal plane to each mirror is shown under the "
+                       "gauge.\n\n"
+                       "Leave a box empty if the distance is not known -- "
+                       "nothing is shown rather than a made-up number.")
                  ).grid(row=0, column=0, columnspan=3, sticky="w",
                         padx=12, pady=(12, 8))
 
@@ -1021,13 +1023,6 @@ class MotorApp:
                   foreground="#777", font=("TkDefaultFont", 8)).grid(
             row=2, column=2, sticky="w", padx=(4, 12))
 
-        ttk.Label(window, text="show the gauge as").grid(
-            row=3, column=0, sticky="e", padx=(12, 4), pady=(10, 4))
-        reference_var = tk.StringVar(
-            value=self.REFERENCE_CHOICES[self.cfg.gauge_reference])
-        ttk.Combobox(window, textvariable=reference_var, state="readonly",
-                     width=16, values=list(self.REFERENCE_CHOICES.values())
-                     ).grid(row=3, column=1, sticky="w", pady=(10, 4))
 
         def parse(var, label):
             text = var.get().strip()
@@ -1054,16 +1049,11 @@ class MotorApp:
             m2, ok2 = parse(m2_var, "zero to M2")
             if not ok2:
                 return
-            reference = next((k for k, v in self.REFERENCE_CHOICES.items()
-                              if v == reference_var.get()), "zero")
             self.cfg.zero_to_m1_mm = m1
             self.cfg.zero_to_m2_mm = m2
-            self.cfg.gauge_reference = reference
-            self._apply_gauge_reference(reference)
             self.log("Zero-to-mirror distances: "
                      f"M1 {as_text(m1) or 'not set'} mm, "
-                     f"M2 {as_text(m2) or 'not set'} mm. Gauge shows "
-                     f"{self.gauge.reference_title.lower()}.")
+                     f"M2 {as_text(m2) or 'not set'} mm.")
             if persist:
                 path = save_config(self.cfg, self.config_path)
                 self.log(f"Saved to {path}")
@@ -1241,12 +1231,23 @@ class MotorApp:
 
         if state.orientation_valid and state.orientation:
             o = state.orientation
-            towards = ("towards M1" if o.focus_mm > 0
-                       else "towards M2" if o.focus_mm < 0 else "at zero")
+            shown = self._shown(o.focus_mm)
+            if self._reference() == "zero":
+                where = ("towards M1" if shown > 0
+                         else "towards M2" if shown < 0 else "at zero")
+            else:
+                where = POSITION_REFERENCES[self._reference()].replace(
+                    "stop", "stop = 0")
             self.focus_readout_var.set(
-                f"focus  {o.focus_mm:+9.4f} mm   ({o.focus_mm * 1000:+.0f} um, {towards})"
+                f"focus  {shown:+9.4f} mm   ({shown * 1000:+.0f} um, {where})"
                 + ("   [MOVING]" if state.moving else "")
             )
+            mirrors = []
+            if self.cfg.zero_to_m1_mm is not None:
+                mirrors.append(f"to M1 {self.cfg.zero_to_m1_mm - o.focus_mm:.3f} mm")
+            if self.cfg.zero_to_m2_mm is not None:
+                mirrors.append(f"to M2 {self.cfg.zero_to_m2_mm + o.focus_mm:.3f} mm")
+            self.mirror_var.set("\n".join(mirrors))
             self.orientation_var.set(
                 f"tip {o.tip_deg:+8.5f} deg   tilt {o.tilt_deg:+8.5f} deg"
             )
@@ -1268,6 +1269,7 @@ class MotorApp:
                     target = None
             self.gauge.update_position(o.focus_mm, target, valid=True)
             if self.plane_view is not None:
+                self.plane_view.label_offset_mm = self._offset()
                 self.plane_view.update_plane(
                     [m.position_mm for m in state.motors],
                     focus_mm=o.focus_mm, tip_deg=o.tip_deg, tilt_deg=o.tilt_deg)
@@ -1432,31 +1434,18 @@ class MotorApp:
     # ----------------------------------------------------------------- moves
 
     def _read_orientation_fields(self) -> Optional[Orientation]:
-        """The boxes as an orientation, with the Go to number converted from
-        the gauge's reference into focus from zero."""
+        """The boxes as an orientation. Go to is in the chosen position
+        reference, and converted to the motors' zero here."""
         try:
-            value = float(self.focus_var.get())
-            tip, tilt = float(self.tip_var.get()), float(self.tilt_var.get())
+            return Orientation(
+                focus_mm=self._from_shown(float(self.focus_var.get())),
+                tip_deg=float(self.tip_var.get()),
+                tilt_deg=float(self.tilt_var.get()),
+            )
         except ValueError as exc:
             messagebox.showerror("Check the numbers",
                                  f"focus, tip and tilt must all be numbers.\n\n{exc}")
             return None
-        focus = self.gauge.focus_for_display(value)
-        if focus is None:
-            messagebox.showerror(
-                "Reference not set",
-                f"Go to is measured {self.REFERENCE_CHOICES[self.gauge.reference]}, "
-                f"and that is not known yet ({self.gauge.missing_text}). Set it, "
-                "or switch the gauge back to \"from zero\".")
-            return None
-        return Orientation(focus_mm=focus, tip_deg=tip, tilt_deg=tilt)
-
-    def _in_reference(self, focus_mm: float) -> str:
-        """"  (= -10.0000 mm from top stop)" when not measuring from zero."""
-        if self.gauge.reference == "zero":
-            return ""
-        return (f"   (= {self.gauge.format_value(focus_mm)} "
-                f"{self.REFERENCE_CHOICES[self.gauge.reference].split(' (')[0]})")
 
     def _read_float(self, var: tk.StringVar, label: str) -> Optional[float]:
         try:
@@ -1473,8 +1462,7 @@ class MotorApp:
         def work():
             o = self.platform.read_orientation()
             def apply():
-                shown = self.gauge.display_value(o.focus_mm)
-                self.focus_var.set(f"{o.focus_mm if shown is None else shown:.4f}")
+                self.focus_var.set(f"{self._shown(o.focus_mm):.4f}")
                 self.tip_var.set(f"{o.tip_deg:.5f}")
                 self.tilt_var.set(f"{o.tilt_deg:.5f}")
             self.post(apply)
@@ -1486,12 +1474,12 @@ class MotorApp:
         target = self._read_orientation_fields()
         if target is None:
             return
-        lines = [f"Target: {target.describe()}"
-                 + self._in_reference(target.focus_mm), "", "Actuator targets:"]
+        lines = [f"Target: {self._describe(target)}", "", "Actuator targets:"]
         for name, mm in self.platform.preview(target).items():
             actuator = self.cfg.actuator(name)
             inside = actuator.min_travel_mm <= mm <= actuator.max_travel_mm
-            lines.append(f"   {name}: {mm:10.4f} mm" + ("" if inside else "   OUT OF RANGE"))
+            lines.append(f"   {name}: {self._shown(mm):10.4f} mm"
+                         + ("" if inside else "   OUT OF RANGE"))
         try:
             self.platform.check_orientation(target)
             lines.append("")
@@ -2122,16 +2110,16 @@ class MotorApp:
         text file, in the dark, on a telescope.
         """
         window = tk.Toplevel(self.root)
-        window.title("Motion limits")
+        window.title("Motion settings")
         window.transient(self.root)
         self._limits_window = window
         limits = self.cfg.limits
 
         tk.Label(window, justify="left", anchor="w", fg="#555", wraplength=520,
-                 text=("What the software will refuse. These are soft limits: "
-                       "they must sit INSIDE the mechanism's own end stops, "
-                       "with margin. Changes apply immediately and can be "
-                       "saved to the configuration file.")
+                 text=("Where 0 is, and what the software will refuse. The "
+                       "limits and ends of travel below are in the motors' "
+                       "own zero; the soft limits must sit INSIDE the ends of "
+                       "travel, with margin.")
                  ).grid(row=0, column=0, columnspan=3, sticky="w",
                         padx=12, pady=(12, 8))
 
@@ -2291,11 +2279,21 @@ class MotorApp:
                 messagebox.showerror("These limits will not do", str(exc),
                                      parent=window)
                 return
+            reference = self.reference_choice_var.get()
+            needed = {"top": candidate.hard_stop_high_mm,
+                      "bottom": candidate.hard_stop_low_mm}.get(reference, 0.0)
+            if needed is None:
+                messagebox.showerror(
+                    "That end of travel is not known",
+                    f"To show positions from the {POSITION_REFERENCES[reference]}, "
+                    "it has to be known: run Tools > Find hard stop, or enter "
+                    "it under Ends of travel.", parent=window)
+                return
 
             for attr, value in values.items():
                 setattr(limits, attr, value)
             self._refresh_gauge_limits()
-            self.log(f"Motion limits updated: focus "
+            self.log(f"Motion settings updated: focus "
                      f"{limits.min_focus_mm:+g} to {limits.max_focus_mm:+g} mm, "
                      f"max tilt {limits.max_tilt_deg:g} deg, max step "
                      f"{limits.max_step_mm:g} mm.")
@@ -2305,14 +2303,38 @@ class MotorApp:
                 self.log(f"Ends of travel changed by hand: lower "
                          f"{say(limits.hard_stop_low_mm)}, upper "
                          f"{say(limits.hard_stop_high_mm)}.")
+            if reference != self.cfg.position_reference:
+                self._set_reference(reference)
+            else:
+                self._apply_reference()      # the stop it measures from may have moved
             if persist:
                 path = save_config(self.cfg, self.config_path)
                 self.log(f"Saved to {path}")
             window.destroy()
             self._limits_window = None
 
+        # --- where 0 is, everywhere in the window ----------------------------
+        where = ttk.LabelFrame(window, text="Show positions from")
+        where.grid(row=row + 1, column=0, columnspan=3, sticky="ew",
+                   padx=12, pady=(6, 4))
+        self.reference_choice_var = tk.StringVar(value=self.cfg.position_reference)
+        for column, (key, text) in enumerate((
+                ("zero", "motor zero"),
+                ("top", "top stop = 0  (below it is negative)"),
+                ("bottom", "bottom stop = 0  (above it is positive)"))):
+            ttk.Radiobutton(where, text=text, value=key,
+                            variable=self.reference_choice_var).grid(
+                row=0, column=column, sticky="w", padx=8, pady=(4, 2))
+        ttk.Label(where, foreground="#777", font=("TkDefaultFont", 8),
+                  wraplength=600, justify="left",
+                  text=("Every position in the window (the focus readout, the "
+                        "gauge, the actuators, Go to, saved positions, the "
+                        "log) is then shown from there. A stop has to be known "
+                        "(found, or entered above) to be used.")).grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+
         buttons = ttk.Frame(window)
-        buttons.grid(row=row + 1, column=0, columnspan=3, pady=(6, 12))
+        buttons.grid(row=row + 2, column=0, columnspan=3, pady=(6, 12))
         ttk.Button(buttons, text="Use for this session",
                    command=lambda: apply(False)).grid(row=0, column=0, padx=6)
         ttk.Button(buttons, text="Use and save",
@@ -2433,6 +2455,8 @@ class MotorApp:
         trusted = self.platform.trust_relay_brakes
         rest_after = self.platform.rest_after_moves
         self.platform = self._make_platform()
+        self.platform.shown_offset_mm = self._offset()
+        self.platform.shown_from = self._ref_words()
         self.platform.trust_relay_brakes = trusted
         self.platform.rest_after_moves = rest_after
         self._refresh_position_log()
@@ -3053,13 +3077,13 @@ class MotorApp:
         window.protocol("WM_DELETE_WINDOW", closed)
         self._refresh_position_log()
 
-    @staticmethod
-    def _orientation_cell(o: Optional[Orientation]) -> str:
+    def _orientation_cell(self, o: Optional[Orientation]) -> str:
         if o is None:
             return "--"
+        focus = self._shown(o.focus_mm)
         if abs(o.tip_deg) < 5e-6 and abs(o.tilt_deg) < 5e-6:
-            return f"{o.focus_mm:+.4f} mm"
-        return f"{o.focus_mm:+.4f} mm  {o.tip_deg:+.4f}/{o.tilt_deg:+.4f}°"
+            return f"{focus:+.4f} mm"
+        return f"{focus:+.4f} mm  {o.tip_deg:+.4f}/{o.tilt_deg:+.4f}°"
 
     def _refresh_position_log(self) -> None:
         """Redraw the log window from the platform's history. UI thread."""
@@ -3150,7 +3174,7 @@ class MotorApp:
         for position in self.platform.saved_positions.all():
             o = position.orientation
             tree.insert("", "end", iid=position.name, values=(
-                position.name, f"{o.focus_mm:+.4f}", f"{o.tip_deg:+.5f}",
+                position.name, f"{self._shown(o.focus_mm):+.4f}", f"{o.tip_deg:+.5f}",
                 f"{o.tilt_deg:+.5f}", position.when, position.note))
         if selected and tree.exists(selected[0]):
             tree.selection_set(selected[0])
@@ -3179,7 +3203,7 @@ class MotorApp:
 
         ttk.Label(window, text="The focal plane is now at:").grid(
             row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 0))
-        ttk.Label(window, text=current.describe(), font=("TkFixedFont", 10)).grid(
+        ttk.Label(window, text=self._describe(current), font=("TkFixedFont", 10)).grid(
             row=1, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 8))
 
         form = ttk.Frame(window)
@@ -3359,8 +3383,8 @@ class MotorApp:
             self._saved_detail_var.set(str(exc))
             return
         preview = self.platform.preview(target)
-        lines = [f"Goes to:  {target.describe()}",
-                 "          " + "   ".join(f"{n} {mm:+.4f} mm"
+        lines = [f"Goes to:  {self._describe(target)}",
+                 "          " + "   ".join(f"{n} {self._shown(mm):+.4f} mm"
                                            for n, mm in preview.items())]
         o = position.orientation
         if (abs(target.focus_mm - o.focus_mm) > 1e-4
@@ -3543,10 +3567,11 @@ class MotorApp:
             messagebox.showerror("Move refused", str(exc))
             return
         preview = self.platform.preview(target)
-        detail = "\n".join(f"   {n}: {mm:10.4f} mm" for n, mm in preview.items())
+        detail = "\n".join(f"   {n}: {self._shown(mm):10.4f} mm"
+                            for n, mm in preview.items())
         if not messagebox.askyesno(
             "Confirm move",
-            f"{reason}\n\n{target.describe()}{self._in_reference(target.focus_mm)}\n\n"
+            f"{reason}\n\n{self._describe(target)}\n\n"
             f"Actuator targets:\n{detail}\n\nProceed?",
         ):
             return

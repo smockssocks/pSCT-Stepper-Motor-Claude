@@ -676,43 +676,18 @@ class TestGui(unittest.TestCase):
         for row in self.app.rows.values():
             self.assertEqual(row.supply_var.get(), "48.0 V")
 
-    # ---- gauge reference ---------------------------------------------------
+    # ---- mirrors ------------------------------------------------------------
 
-    def test_the_gauge_can_measure_from_m1_or_m2(self):
-        gauge = self.app.gauge
+    def test_the_distance_to_each_mirror_is_shown_once_entered(self):
+        self.app._start_polling()
+        self.pump(0.4)
+        self.assertEqual(self.app.mirror_var.get(), "")
+        focus = self.app.platform.read_orientation().focus_mm
         self.app.cfg.zero_to_m1_mm = 1000.0
-        self.app._apply_gauge_reference("m1")
-        self.assertEqual(gauge.format_value(3.0), "997.0000 mm")
-        self.assertEqual(self.app.gauge_frame.cget("text"), "Distance to M1")
-        # Ticks are round numbers in the units shown, not in focus mm.
-        values = [value for value, _mm in gauge._ticks()]
-        self.assertTrue(all(abs(v - round(v)) < 1e-9 for v in values), values)
-        self.assertTrue(all(abs(v - gauge.display_value(mm)) < 1e-9
-                            for v, mm in gauge._ticks()))
-
         self.app.cfg.zero_to_m2_mm = 500.0
-        self.app._apply_gauge_reference("m2")
-        self.assertEqual(gauge.format_value(-2.0), "498.0000 mm")
-
-        self.app._apply_gauge_reference("zero")
-        self.assertEqual(gauge.format_value(-2.0), "-2.0000 mm")
-
-    def test_the_gauge_says_so_when_a_distance_is_not_known(self):
-        """No invented numbers: until the distance is entered, the reference
-        is shown as unavailable rather than measured from a guess."""
-        self.app.cfg.zero_to_m1_mm = None
-        self.app._apply_gauge_reference("m1")
-        self.assertFalse(self.app.gauge.reference_available)
-        self.assertIn("distance not set", self.app.gauge_frame.cget("text"))
-        self.assertIsNone(self.app.gauge.display_value(1.0))
-        self.assertEqual(self.app.gauge.format_value(1.0), "distance not set")
-
-    def test_the_reference_chooser_drives_the_gauge(self):
-        self.app.cfg.zero_to_m1_mm = 800.0
-        self.app.gauge_reference_var.set(self.app.REFERENCE_CHOICES["m1"])
-        self.app.on_gauge_reference_changed()
-        self.assertEqual(self.app.gauge.reference, "m1")
-        self.assertEqual(self.app.cfg.gauge_reference, "m1")
+        self.pump(0.5)
+        self.assertEqual(self.app.mirror_var.get(),
+                         f"to M1 {1000.0 - focus:.3f} mm\nto M2 {500.0 + focus:.3f} mm")
 
     # ---- position log ------------------------------------------------------
 
@@ -884,51 +859,72 @@ class TestGui(unittest.TestCase):
         self.assertEqual(load_config(self.app.config_path).limits.hard_stop_high_mm, high)
         self.assertIn("Ends of travel changed by hand", self.app.log_text.get("1.0", "end"))
 
-    def test_the_gauge_can_measure_from_either_end_of_travel(self):
-        gauge = self.app.gauge
-        self.app._apply_gauge_reference("top")
-        self.assertFalse(gauge.reference_available)
-        self.assertIn("end of travel not set", self.app.gauge_frame.cget("text"))
-        self.app.cfg.limits.hard_stop_low_mm = -25.0
-        self.app.cfg.limits.hard_stop_high_mm = 25.4
-        self.app._refresh_gauge_limits()
-        self.assertEqual(self.app.gauge_frame.cget("text"),
-                         "Distance from top stop")
-        self.assertEqual(gauge.format_value(25.4), "+0.0000 mm")
-        self.assertEqual(gauge.format_value(20.4), "-5.0000 mm")
-        self.app._apply_gauge_reference("bottom")
-        self.assertEqual(gauge.format_value(-25.0), "+0.0000 mm")
-        self.assertEqual(gauge.format_value(0.0), "+25.0000 mm")
-        self.assertAlmostEqual(gauge.focus_for_display(25.0), 0.0)
+    # ---- where 0 is -----------------------------------------------------------
 
-    def test_go_to_is_measured_from_the_chosen_reference(self):
+    def _stops(self, low=-25.0, high=25.4):
         limits = self.app.cfg.limits
-        limits.hard_stop_low_mm, limits.hard_stop_high_mm = -25.0, 25.4
+        limits.hard_stop_low_mm, limits.hard_stop_high_mm = low, high
         self.app._refresh_gauge_limits()
 
-        self.app.focus_var.set("2.0")                       # from zero
-        self.app.gauge_reference_var.set(self.app.REFERENCE_CHOICES["top"])
-        self.app.on_gauge_reference_changed()
-        # Same place, said from the top stop.
-        self.assertEqual(self.app.focus_var.get(), "-23.4000")
-        self.assertEqual(self.app.goto_label_var.get(), "Go to, mm from top stop:")
-
+    def test_with_the_top_stop_as_zero_everything_reads_from_it(self):
+        self._stops()
+        self.app._start_polling()
+        self.pump(0.4)
+        focus = self.app.platform.read_orientation().focus_mm      # motor terms
+        self.app.focus_var.set(f"{focus:.4f}")
+        self.app._set_reference("top")
+        self.pump(0.5)
+        shown = focus - 25.4
+        self.assertIn(f"{shown:+9.4f} mm", self.app.focus_readout_var.get())
+        self.assertIn("top stop = 0", self.app.focus_readout_var.get())
+        self.assertEqual(self.app.gauge_frame.cget("text"), "Distance from top stop")
+        self.assertEqual(self.app.gauge.format_value(25.4), "+0.0000 mm")
+        top_mm = self.app.platform.motor("Top").get_position_mm()
+        self.assertEqual(self.app.rows["Top"].position_var.get(),
+                         f"{top_mm - 25.4:+10.4f} mm")
+        # Go to kept pointing at the same place, now said from the stop.
+        self.assertEqual(self.app.focus_var.get(), f"{shown:.4f}")
+        # ...and typing -10 means 10 mm below the top stop.
         self.app.focus_var.set("-10")
         self.assertAlmostEqual(self._silent(self.app._read_orientation_fields).focus_mm,
                                15.4)
+        self.assertIn("from the top stop", self.app._describe(
+            self.app.platform.read_orientation()))
 
-        self.app.gauge_reference_var.set(self.app.REFERENCE_CHOICES["bottom"])
-        self.app.on_gauge_reference_changed()
-        self.assertEqual(self.app.focus_var.get(), "40.4000")   # still 15.4 from zero
+    def test_with_the_bottom_stop_as_zero(self):
+        self._stops()
+        self.app._set_reference("bottom")
         self.app.focus_var.set("10")
         self.assertAlmostEqual(self._silent(self.app._read_orientation_fields).focus_mm,
                                -15.0)
-        self.assertIn("from bottom stop", self.app._in_reference(-15.0))
+        self.assertEqual(self.app.gauge.format_value(-25.0), "+0.0000 mm")
+        self.assertEqual(self.app._orientation_cell(Orientation(-15.0)), "+10.0000 mm")
 
-    def test_go_to_refuses_a_reference_that_is_not_known(self):
-        self.app._apply_gauge_reference("top")             # no top stop yet
-        self.app.focus_var.set("-10")
-        self.assertIsNone(self._silent(self.app._read_orientation_fields))
+    def test_an_unknown_stop_falls_back_to_motor_zero(self):
+        self.app.cfg.position_reference = "top"         # no top stop known
+        self.app._apply_reference()
+        self.assertEqual(self.app._reference(), "zero")
+        self.app.focus_var.set("2")
+        self.assertAlmostEqual(self._silent(self.app._read_orientation_fields).focus_mm, 2.0)
+
+    def test_motion_settings_sets_the_reference_and_saves_it(self):
+        from psct_motors.config import load_config
+        self._stops(0.0, 50.0)          # around this config's 0.5..49.5 limits
+        self.app.on_edit_limits()
+        self.pump(0.2)
+        self.assertEqual(self.app._limits_window.title(), "Motion settings")
+        self.app.reference_choice_var.set("bottom")
+        self._answer(True, self._limits_button("Use and save").invoke)
+        self.assertEqual(self.app._reference(), "bottom")
+        self.assertEqual(load_config(self.app.config_path).position_reference, "bottom")
+
+    def test_motion_settings_refuses_a_stop_that_is_not_known(self):
+        self.app.on_edit_limits()
+        self.pump(0.2)
+        self.app.reference_choice_var.set("top")
+        self._answer(True, self._limits_button("Use for this session").invoke)
+        self.assertEqual(self.app.cfg.position_reference, "zero")
+        self.app._limits_window.destroy()
 
     # ---- torque limit and update rate ----------------------------------------
 

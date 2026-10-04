@@ -363,7 +363,7 @@ class FocusGauge(tk.Canvas):
         if self.reference != "zero" and self.reference_available:
             label_y = self._place(zero_y, placed, required=False)
             if label_y is not None:
-                self.create_text(right + 12, label_y, anchor="w", text="zero",
+                self.create_text(right + 12, label_y, anchor="w", text="motor 0",
                                  fill=COLOR_ZERO, font=("TkDefaultFont", 7))
 
         # --- where we are ----------------------------------------------------

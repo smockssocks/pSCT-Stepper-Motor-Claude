@@ -90,21 +90,20 @@ drives.
   and press **Go to**, or **Save current as...** to remember where the plane
   is now. See [Saved positions](#saved-positions).
 - A **position gauge** down the right: + towards M1 above, − towards M2 below,
-  travel limits and found ends of travel marked, target shown while moving.
-  The chooser above it sets what the numbers are measured **from**: the zero
-  set by `set-zero` (the default, and what every command is expressed in),
-  or the distance to M1 or to M2. The last two need the distance from zero
-  to that mirror, which nobody has yet — enter it under *Tools → Distances*
-  (or the button under the gauge) once it is known; until then the gauge says
-  "distance not set" rather than showing a made-up number. **From top stop**
-  makes the upper end of travel read 0 (everything below it negative), and
-  **from bottom stop** the lower end. **Go to** uses the same reference: with
-  the gauge on *from top stop*, `-10` means 10 mm below the top stop; on
-  *from bottom stop*, `10` means 10 mm above the bottom stop. The label beside
-  the box says which, switching the reference converts the number in the box
-  so it still means the same place, and the confirm dialog shows both. Inside,
-  everything (limits, saved positions, the log) stays in the one zero, so
-  changing the reference never moves anything.
+  travel limits and ends of travel marked, target shown while moving. Under
+  it, the distance to M1 and to M2 once those are entered (*Distances to
+  M1 / M2...*; nothing is shown until they are known).
+- **Where 0 is** is set in *Tools → Motion settings* → *Show positions from*:
+  **motor zero**, **top stop = 0** or **bottom stop = 0**. Everything in the
+  window then reads from there: the focus readout, the gauge, the actuator
+  positions, **Go to**, previews and confirmations, saved positions, the
+  position log, the plane picture and the move lines in the log. With the top
+  stop as 0, sitting on the top stop reads 0 everywhere and 10 mm below it reads
+  −10; typing −10 in Go to goes there. With the bottom stop as 0, typing 10
+  goes 10 mm above it. A stop has to be known (found by Find hard stop, or
+  entered in Motion settings) to be used. Only what is shown and typed changes:
+  the motors, the limits, saved positions and the record on disk stay in the
+  motors' own zero, so changing it never moves anything.
 - Per-actuator position, mode, brake, load and **supply voltage**, with
   Release/Engage for each brake. The brake says **ENGAGED** (blue) or
   **DISENGAGED** (amber), deliberately not green/red: a disengaged brake is
@@ -124,7 +123,7 @@ Behind the menus, so the main window stays about the job:
 | **View → Position log** | every move, newest first: where the plane was, where it was sent, where it ended up; select a line and go back to it |
 | **View → Load and torque** | how hard each motor is working, big enough to read across a room, with peaks, temperature and supply; how many readings per second; and the torque limit (changing it needs the password) |
 | **Tools → Connection settings** | edit each motor's IP and port, use now or save |
-| **Tools → Motion limits** | focus, tilt and step limits; the ends of travel (found by Find hard stop, or typed in behind the password); set the focus limits from the ends of travel with a margin |
+| **Tools → Motion settings** | where 0 is (motor zero, top stop or bottom stop); focus, tilt and step limits; the ends of travel (found by Find hard stop, or typed in behind the password); set the focus limits from the ends of travel with a margin |
 | **Tools → Distances from zero to M1 and M2** | the two numbers the gauge needs to show distance to a mirror instead of distance from zero |
 | **Tools → Supply voltage** | only if a motor's volts disagree with MacTalk: enter what the supply is really at, and that motor uses its own reading from then on |
 | **Tools → Find hard stop** | run the actuators out to the end of travel |

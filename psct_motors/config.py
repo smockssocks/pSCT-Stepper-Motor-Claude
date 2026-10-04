@@ -632,10 +632,20 @@ class PlatformConfig:
     #: only change what the gauge's labels say.
     zero_to_m1_mm: Optional[float] = None
     zero_to_m2_mm: Optional[float] = None
-    #: Which reference the gauge opens showing: "zero", "m1" or "m2".
+    #: Kept so older files still load; no longer used.
     gauge_reference: str = "zero"
+    #: Where 0 is, everywhere the GUI shows or takes a position: "zero" (the
+    #: motors' own zero), "top" (the upper end of travel) or "bottom" (the
+    #: lower end). Only what is shown and typed changes; the motors, the
+    #: limits, saved positions and the log are always in the motors' zero.
+    #: Falls back to "zero" while the chosen end of travel is not known.
+    position_reference: str = "zero"
 
     def validate(self) -> None:
+        if self.position_reference not in ("zero", "top", "bottom"):
+            raise ValueError(
+                f"position_reference must be 'zero', 'top' or 'bottom', got "
+                f"{self.position_reference!r}")
         if self.gauge_reference not in ("zero", "m1", "m2", "top", "bottom"):
             raise ValueError(
                 f"gauge_reference must be 'zero', 'm1', 'm2', 'top' or 'bottom', got "
@@ -816,6 +826,11 @@ def config_from_dict(data: Dict[str, Any]) -> PlatformConfig:
     if (data.get("poll_interval_s"), data.get("idle_poll_interval_s")) == (0.15, 0.5):
         data.pop("poll_interval_s")
         data.pop("idle_poll_interval_s")
+
+    # A file saved while the gauge had its own top/bottom chooser carries
+    # that choice there; it is now the whole window's.
+    if "position_reference" not in data and data.get("gauge_reference") in ("top", "bottom"):
+        data["position_reference"] = data["gauge_reference"]
 
     cfg = _from_dict(PlatformConfig, data)
     cfg.actuators = actuators or default_config().actuators

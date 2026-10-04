@@ -372,6 +372,11 @@ class FocalPlanePlatform:
         #: it, and the last alarm raised, for the GUI to show.
         self._fall_ref: Dict[str, tuple] = {}
         self._fall_alarm: Optional[str] = None
+        #: How the GUI shows positions (see its position reference): added to
+        #: positions in log lines, with words saying where 0 is. Nothing else
+        #: here uses them.
+        self.shown_offset_mm = 0.0
+        self.shown_from = ""
         #: Whether a person has accepted the brake relay's word for "engaged"
         #: when nothing senses the brakes. Never set by this module.
         self.trust_relay_brakes = False
@@ -1063,8 +1068,9 @@ class FocalPlanePlatform:
             targets = self.check_orientation(orientation, current=current)
 
             self._log(
-                f"Move to {orientation.describe()} -> "
-                + ", ".join(f"{m.name} {t:.4f} mm" for m, t in zip(self.motors, targets))
+                f"Move to {self._shown_describe(orientation)} -> "
+                + ", ".join(f"{m.name} {t + self.shown_offset_mm:.4f} mm"
+                            for m, t in zip(self.motors, targets))
             )
 
             # Nothing has moved yet. From here on, whatever happens is
@@ -1101,6 +1107,12 @@ class FocalPlanePlatform:
                                       (note + " (commanded, not waited for)").strip(),
                                       started)
             return self.read_state()
+
+    def _shown_describe(self, o: Orientation) -> str:
+        if not self.shown_offset_mm and not self.shown_from:
+            return o.describe()
+        return (f"focus {o.focus_mm + self.shown_offset_mm:+.4f} mm{self.shown_from}, "
+                f"tip {o.tip_deg:+.5f} deg, tilt {o.tilt_deg:+.5f} deg")
 
     def move_relative(self, d_focus_mm: float = 0.0, d_tip_deg: float = 0.0,
                       d_tilt_deg: float = 0.0, wait: bool = True) -> PlatformState:
