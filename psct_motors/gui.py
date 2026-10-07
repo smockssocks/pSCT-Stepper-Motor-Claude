@@ -47,6 +47,7 @@ from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
 from .config import load_config, save_config, default_config_path
+from .easter_egg import IdentityDiskButton
 from .focus_gauge import REFERENCE_TITLES, FocusGauge
 from .history import MoveRecord, default_history_path
 from .saved_positions import SUGGESTED_NAMES, default_saved_positions_path
@@ -1062,6 +1063,8 @@ class MotorApp:
 
         ttk.Button(frame, text="Clear log", command=self.on_clear_log).grid(
             row=1, column=0, columnspan=2, sticky="e", padx=6, pady=(0, 6))
+        self.identity_disk = IdentityDiskButton(frame, self.root)
+        self.identity_disk.grid(row=1, column=0, sticky="w", padx=8, pady=(0, 6))
 
     # --------------------------------------------------------------- logging
 

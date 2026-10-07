@@ -694,6 +694,21 @@ class TestGui(unittest.TestCase):
                                  "Run safety drills (simulated)..."):
             self.assertNotIn(front_panel_only, seen)
 
+    def test_the_little_square_in_the_log(self):
+        from psct_motors.easter_egg import QUOTE_LINES, disk_lit
+        self.assertTrue(disk_lit(0.0, 0.93))          # outer ring
+        self.assertFalse(disk_lit(0.0, 0.0))          # the dark centre
+        self.assertFalse(disk_lit(1.2, 0.0))          # outside
+        window = self.app.identity_disk.open()
+        self.assertIs(self.app.identity_disk.open(), window)   # one at a time
+        self.pump(1.8)
+        lit = [d for d in window.dots
+               if window.canvas.itemcget(d, "state") == "normal"]
+        self.assertEqual(len(lit), len(window.dots))
+        self.assertEqual(QUOTE_LINES[-1], "Out there... is our destiny.")
+        window.destroy()                              # mid-typing, cleanly
+        self.pump(0.3)
+
     # ---- mirrors ------------------------------------------------------------
 
     def test_the_distance_to_each_mirror_is_shown_once_entered(self):
